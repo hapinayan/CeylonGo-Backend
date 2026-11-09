@@ -1,5 +1,4 @@
 import os
-from typing import List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -16,7 +15,7 @@ app = FastAPI(
 )
 
 
-def get_allowed_origins() -> List[str]:
+def get_allowed_origins() -> list[str]:
     # Default Angular development origins
     origins = [
         "http://localhost:4200",

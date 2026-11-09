@@ -1,4 +1,3 @@
-
 import os
 
 from dotenv import load_dotenv
@@ -13,13 +12,9 @@ DATABASE_URL = URL.create(
     host=os.getenv("DB_SERVER", r".\SQLEXPRESS"),
     database=os.getenv("DB_NAME", "CeylonGoDB"),
     query={
-        "driver": os.getenv(
-            "DB_DRIVER", "ODBC Driver 18 for SQL Server"
-        ),
+        "driver": os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server"),
         "Trusted_Connection": "yes",
-        "TrustServerCertificate": os.getenv(
-            "DB_TRUST_CERTIFICATE", "no"
-        ),
+        "TrustServerCertificate": os.getenv("DB_TRUST_CERTIFICATE", "no"),
     },
 )
 

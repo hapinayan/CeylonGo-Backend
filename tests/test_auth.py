@@ -1,18 +1,6 @@
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-import jwt
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-# Ensure test JWT environment variables before importing app
-os.environ["JWT_SECRET_KEY"] = "test-secret-key-32-characters-long-example!!"
-os.environ["JWT_ALGORITHM"] = "HS256"
-os.environ["JWT_ACCESS_TOKEN_EXPIRE_MINUTES"] = "30"
-
 from app.core.security import (
     create_access_token,
     decode_access_token,
@@ -22,6 +10,10 @@ from app.core.security import (
 from app.database.connection import get_db
 from app.main import app
 from app.models.user import Base, User
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # Create isolated in-memory SQLite database
 test_engine = create_engine(
@@ -33,11 +25,11 @@ test_engine = create_engine(
 
 @event.listens_for(test_engine, "connect")
 def configure_sqlite_connection(dbapi_connection, connection_record):
-    # Provide MSSQL's sysutcdatetime() function inside SQLite for model compatibility
+    # Provide MSSQL's sysutcdatetime() function inside SQLite
     dbapi_connection.create_function(
         "sysutcdatetime",
         0,
-        lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        lambda: datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
     )
 
 
@@ -126,19 +118,35 @@ def test_register_duplicate_email(client: TestClient):
     "payload,expected_error_field",
     [
         (
-            {"full_name": "A", "email": "valid@example.com", "password": "TestPassword123!"},
+            {
+                "full_name": "A",
+                "email": "valid@example.com",
+                "password": "TestPassword123!",
+            },
             "full_name",
         ),
         (
-            {"full_name": "   ", "email": "valid@example.com", "password": "TestPassword123!"},
+            {
+                "full_name": "   ",
+                "email": "valid@example.com",
+                "password": "TestPassword123!",
+            },
             "full_name",
         ),
         (
-            {"full_name": "Valid Name", "email": "invalid-email", "password": "TestPassword123!"},
+            {
+                "full_name": "Valid Name",
+                "email": "invalid-email",
+                "password": "TestPassword123!",
+            },
             "email",
         ),
         (
-            {"full_name": "Valid Name", "email": "valid@example.com", "password": "short"},
+            {
+                "full_name": "Valid Name",
+                "email": "valid@example.com",
+                "password": "short",
+            },
             "password",
         ),
     ],
@@ -167,7 +175,10 @@ def test_login_success(client: TestClient, db_session):
 
     response = client.post(
         "/api/v1/auth/login",
-        json={"email": "LOGIN.TEST@example.com", "password": "CorrectPassword123!"},
+        json={
+            "email": "LOGIN.TEST@example.com",
+            "password": "CorrectPassword123!",
+        },
     )
 
     assert response.status_code == 200
@@ -201,7 +212,10 @@ def test_login_incorrect_password(client: TestClient, db_session):
 def test_login_unknown_email(client: TestClient):
     response = client.post(
         "/api/v1/auth/login",
-        json={"email": "nonexistent@example.com", "password": "AnyPassword123!"},
+        json={
+            "email": "nonexistent@example.com",
+            "password": "AnyPassword123!",
+        },
     )
 
     assert response.status_code == 401
@@ -243,9 +257,7 @@ def test_password_stored_as_argon2_hash(client: TestClient, db_session):
     assert response.status_code == 201
 
     saved_user = (
-        db_session.query(User)
-        .filter(User.email == "argon@example.com")
-        .first()
+        db_session.query(User).filter(User.email == "argon@example.com").first()
     )
     assert saved_user is not None
     assert saved_user.password_hash != "PlainSecretPassword123!"
@@ -275,8 +287,8 @@ def test_jwt_payload_contents(client: TestClient, db_session):
     payload = decode_access_token(token)
     assert payload["sub"] == str(user.id)
     assert "exp" in payload
-    exp_datetime = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
-    assert exp_datetime > datetime.now(timezone.utc)
+    exp_datetime = datetime.fromtimestamp(payload["exp"], tz=UTC)
+    assert exp_datetime > datetime.now(UTC)
 
 
 def test_responses_never_expose_passwords(client: TestClient, db_session):
@@ -299,7 +311,10 @@ def test_responses_never_expose_passwords(client: TestClient, db_session):
     # Login response check
     login_response = client.post(
         "/api/v1/auth/login",
-        json={"email": "security@example.com", "password": "SecurePassword123!"},
+        json={
+            "email": "security@example.com",
+            "password": "SecurePassword123!",
+        },
     )
     assert login_response.status_code == 200
     login_data = login_response.json()
@@ -310,7 +325,7 @@ def test_responses_never_expose_passwords(client: TestClient, db_session):
 
 
 # ==========================================
-# Protected /me Endpoint Tests (Task 1 & Task 3)
+# Protected /me Endpoint Tests
 # ==========================================
 
 
@@ -436,7 +451,7 @@ def test_me_never_exposes_password_hash(client: TestClient, db_session):
 
 
 # ==========================================
-# CORS Tests (Task 2 & Task 3)
+# CORS Tests
 # ==========================================
 
 
@@ -458,8 +473,9 @@ def test_cors_preflight_allowed_origins(client: TestClient, origin):
     )
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == origin
-    assert "Authorization" in response.headers.get("access-control-allow-headers", "")
-    assert "Content-Type" in response.headers.get("access-control-allow-headers", "")
+    allow_headers = response.headers.get("access-control-allow-headers", "")
+    assert "Authorization" in allow_headers
+    assert "Content-Type" in allow_headers
 
 
 def test_cors_disallowed_origin_no_allow_header(client: TestClient):

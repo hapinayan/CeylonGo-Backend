@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Annotated
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -27,14 +27,14 @@ router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
 security_scheme = HTTPBearer(
     scheme_name="HTTPBearer",
-    description="JWT Bearer token. Enter your access token in the format: <token>",
+    description="JWT Bearer token. Enter your token in format: <token>",
     auto_error=True,
 )
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
-    db: Session = Depends(get_db),
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security_scheme)],
+    db: Annotated[Session, Depends(get_db)],
 ) -> User:
     token = credentials.credentials
     try:
@@ -45,7 +45,7 @@ def get_current_user(
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except (jwt.InvalidTokenError, Exception):
+    except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
@@ -94,16 +94,14 @@ def get_current_user(
 )
 def register(
     request: RegisterRequest,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ):
     trimmed_full_name = request.full_name.strip()
     normalized_email = request.email.strip().lower()
 
     # Check for existing user by normalized email
     existing_user = (
-        db.query(User)
-        .filter(func.lower(User.email) == normalized_email)
-        .first()
+        db.query(User).filter(func.lower(User.email) == normalized_email).first()
     )
     if existing_user:
         raise HTTPException(
@@ -148,16 +146,12 @@ def register(
 )
 def login(
     request: LoginRequest,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ):
     normalized_email = request.email.strip().lower()
 
     # Query user by normalized email
-    user = (
-        db.query(User)
-        .filter(func.lower(User.email) == normalized_email)
-        .first()
-    )
+    user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
 
     # Verify user exists and password matches
     if not user or not verify_password(request.password, user.password_hash):
@@ -189,5 +183,5 @@ def login(
     status_code=status.HTTP_200_OK,
     summary="Get profile of the currently authenticated traveler",
 )
-def get_me(current_user: User = Depends(get_current_user)):
+def get_me(current_user: Annotated[User, Depends(get_current_user)]):
     return current_user

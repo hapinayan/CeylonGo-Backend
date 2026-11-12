@@ -1,4 +1,6 @@
+import hashlib
 import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,8 +25,7 @@ def get_jwt_secret_key() -> str:
     secret_key = os.getenv("JWT_SECRET_KEY")
     if not secret_key:
         raise RuntimeError(
-            "Configuration error: "
-            "JWT_SECRET_KEY environment variable is not set."
+            "Configuration error: JWT_SECRET_KEY environment variable is not set."
         )
     return secret_key
 
@@ -39,8 +40,7 @@ def get_jwt_access_token_expire_minutes() -> int:
         return int(expire_minutes_raw)
     except ValueError:
         raise RuntimeError(
-            "Configuration error: "
-            "JWT_ACCESS_TOKEN_EXPIRE_MINUTES must be an integer."
+            "Configuration error: JWT_ACCESS_TOKEN_EXPIRE_MINUTES must be an integer."
         )
 
 
@@ -66,3 +66,13 @@ def decode_access_token(token: str) -> dict[str, Any]:
     secret_key = get_jwt_secret_key()
     algorithm = get_jwt_algorithm()
     return jwt.decode(token, secret_key, algorithms=[algorithm])
+
+
+def generate_password_reset_token() -> str:
+    """Generate a cryptographically secure URL-safe token (32 bytes)."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_reset_token(token: str) -> str:
+    """Compute SHA-256 hex digest of the raw token for safe storage."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()

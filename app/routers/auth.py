@@ -1,26 +1,39 @@
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.email import send_password_reset_email
+from app.core.rate_limiter import check_email_limiter, forgot_password_limiter
 from app.core.security import (
     create_access_token,
     decode_access_token,
+    generate_password_reset_token,
     hash_password,
+    hash_reset_token,
     verify_password,
 )
 from app.database.connection import get_db
+from app.models.password_reset import PasswordReset
 from app.models.user import User
 from app.schemas.auth import (
+    CheckEmailRequest,
+    CheckEmailResponse,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     TokenResponse,
     UserResponse,
+    VerifyResetTokenResponse,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
@@ -84,6 +97,51 @@ def get_current_user(
         )
 
     return user
+
+
+def rate_limit_check_email(request: Request) -> None:
+    check_email_limiter.check(request)
+
+
+def rate_limit_forgot_password(request: Request) -> None:
+    forgot_password_limiter.check(request)
+
+
+@router.post(
+    "/check-email",
+    response_model=CheckEmailResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(rate_limit_check_email)],
+    summary="Check if an email address is already registered",
+)
+def check_email(
+    request: CheckEmailRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Check whether a traveler account with the specified email address exists.
+
+    Security Note (Account Enumeration):
+    This endpoint directly returns `is_registered: true` or `false` to support
+    the email-first authentication flow. Returning this boolean inherently
+    reveals account existence to the caller. While rate limiting is enforced
+    to hinder automated bulk enumeration, returning existence status cannot
+    completely prevent enumeration of targeted email addresses.
+    """
+    normalized_email = request.email.strip().lower()
+
+    try:
+        user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while verifying the email address. Please try again later.",
+        )
+
+    return CheckEmailResponse(
+        email=normalized_email,
+        is_registered=user is not None,
+    )
 
 
 @router.post(
@@ -185,3 +243,189 @@ def login(
 )
 def get_me(current_user: Annotated[User, Depends(get_current_user)]):
     return current_user
+
+
+@router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(rate_limit_forgot_password)],
+    summary="Request a password reset link",
+)
+def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Request a password reset link for the provided email address.
+
+    Security Note (Anti-Enumeration):
+    This endpoint returns an identical generic response whether the email exists
+    in the database or not. If registered and active, a single-use token expiring
+    in 30 minutes is created, its SHA-256 hash is saved to the database, and an email
+    is safely dispatched via SMTP.
+    """
+    normalized_email = request.email.strip().lower()
+
+    try:
+        user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+        if user and user.is_active:
+            # Invalidate any previously active unused tokens for this user
+            db.query(PasswordReset).filter(
+                PasswordReset.user_id == user.id,
+                PasswordReset.is_used.is_(False),
+            ).update({"is_used": True})
+
+            raw_token = generate_password_reset_token()
+            token_hash = hash_reset_token(raw_token)
+            expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
+
+            reset_record = PasswordReset(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                is_used=False,
+            )
+            db.add(reset_record)
+            db.commit()
+
+            # Safely dispatch email without leaking failures to user
+            send_password_reset_email(
+                to_email=user.email,
+                token=raw_token,
+                user_name=user.full_name,
+            )
+    except SQLAlchemyError:
+        db.rollback()
+
+    return ForgotPasswordResponse(
+        message="If an account with that email exists, a password reset link has been sent."
+    )
+
+
+@router.get(
+    "/verify-reset-token",
+    response_model=VerifyResetTokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Verify if a password reset token is valid and unexpired",
+)
+def verify_reset_token(
+    token: Annotated[str, Query(min_length=1, description="Password reset token")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Verify the validity, usage status, and expiration of a password reset token.
+    """
+    token_hash = hash_reset_token(token)
+    reset_record = (
+        db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
+    )
+
+    if not reset_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    if reset_record.is_used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has already been used.",
+        )
+
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    record_expires = reset_record.expires_at
+    if record_expires.tzinfo is not None:
+        record_expires = record_expires.replace(tzinfo=None)
+
+    if now_utc > record_expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has expired.",
+        )
+
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    return VerifyResetTokenResponse(
+        valid=True,
+        email=user.email,
+        message="Password reset token is valid.",
+    )
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reset password using a valid reset token",
+)
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Atomically update user password using Argon2 and consume the single-use reset token.
+    """
+    token_hash = hash_reset_token(request.token)
+    reset_record = (
+        db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
+    )
+
+    if not reset_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    if reset_record.is_used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has already been used.",
+        )
+
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    record_expires = reset_record.expires_at
+    if record_expires.tzinfo is not None:
+        record_expires = record_expires.replace(tzinfo=None)
+
+    if now_utc > record_expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has expired.",
+        )
+
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    hashed_password = hash_password(request.new_password)
+
+    try:
+        user.password_hash = hashed_password
+        reset_record.is_used = True
+        reset_record.used_at = now_utc
+
+        db.query(PasswordReset).filter(
+            PasswordReset.user_id == user.id,
+            PasswordReset.is_used.is_(False),
+        ).update({"is_used": True})
+
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while resetting the password. Please try again later.",
+        )
+
+    return ResetPasswordResponse(
+        message="Password has been reset successfully. You can now sign in with your new password."
+    )

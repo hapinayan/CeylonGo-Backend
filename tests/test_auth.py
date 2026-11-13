@@ -1,6 +1,15 @@
+import smtplib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app.core.email import (
+    build_password_reset_email_message,
+    build_password_reset_url,
+    get_smtp_port,
+    get_smtp_timeout,
+    is_smtp_configured,
+    send_password_reset_email,
+)
 from app.core.rate_limiter import reset_all_limiters
 from app.core.security import (
     create_access_token,
@@ -62,6 +71,43 @@ def db_session():
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture
+def mock_smtp_success(monkeypatch):
+    class MockSMTP:
+        last_sent_msg = None
+
+        def __init__(self, host, port, timeout=10):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self):
+            pass
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, msg):
+            MockSMTP.last_sent_msg = msg
+
+    MockSMTP.last_sent_msg = None
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("SMTP_PORT", "587")
+    monkeypatch.setenv("SMTP_USERNAME", "traveler@ceylongo.com")
+    monkeypatch.setenv("SMTP_PASSWORD", "mock-app-password")
+    monkeypatch.setattr(smtplib, "SMTP", MockSMTP)
+    return MockSMTP
 
 
 @pytest.fixture
@@ -651,7 +697,9 @@ def test_check_email_database_error_generic(client: TestClient, monkeypatch):
 # ==========================================
 
 
-def test_forgot_password_registered_user(client: TestClient, db_session):
+def test_forgot_password_registered_user(
+    client: TestClient, db_session, mock_smtp_success
+):
     user = User(
         full_name="Password Reset Traveler",
         email="reset.traveler@example.com",
@@ -708,7 +756,9 @@ def test_forgot_password_unregistered_user_anti_enumeration(
     assert count == 0
 
 
-def test_forgot_password_normalization(client: TestClient, db_session):
+def test_forgot_password_normalization(
+    client: TestClient, db_session, mock_smtp_success
+):
     user = User(
         full_name="Cased Reset Traveler",
         email="cased.traveler@example.com",
@@ -790,6 +840,8 @@ def test_forgot_password_email_failure_handled_safely(
         response.json()["message"]
         == "If an account with that email exists, a password reset link has been sent."
     )
+    # Ensure no unusable reset records remain in the database when delivery fails
+    assert db_session.query(PasswordReset).count() == 0
 
 
 def test_verify_reset_token_valid(client: TestClient, db_session):
@@ -1023,3 +1075,314 @@ def test_reset_password_short_password_validation(client: TestClient):
         json={"token": "any-token", "new_password": "short"},
     )
     assert response.status_code == 422
+
+
+# ==========================================
+# Phase 3.1: Complete SMTP Email Tests
+# ==========================================
+
+
+def test_smtp_configured_helpers(monkeypatch):
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    assert is_smtp_configured() is False
+
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    assert is_smtp_configured() is True
+
+    monkeypatch.setenv("SMTP_PORT", "not-a-number")
+    assert get_smtp_port() == 587
+
+    monkeypatch.setenv("SMTP_PORT", "465")
+    assert get_smtp_port() == 465
+
+    monkeypatch.setenv("SMTP_TIMEOUT_SECONDS", "invalid")
+    assert get_smtp_timeout() == 10
+
+    monkeypatch.setenv("SMTP_TIMEOUT_SECONDS", "25")
+    assert get_smtp_timeout() == 25
+
+
+def test_reset_url_construction(monkeypatch):
+    monkeypatch.setenv(
+        "FRONTEND_RESET_PASSWORD_URL", "http://localhost:4200/reset-password"
+    )
+    url1 = build_password_reset_url("test-token-123")
+    assert url1 == "http://localhost:4200/reset-password?token=test-token-123"
+
+    monkeypatch.setenv(
+        "FRONTEND_RESET_PASSWORD_URL", "http://localhost:4200/auth/reset?mode=traveler"
+    )
+    url2 = build_password_reset_url("test-token-456")
+    assert url2 == "http://localhost:4200/auth/reset?mode=traveler&token=test-token-456"
+
+
+def test_email_html_and_plaintext_content():
+    to = "traveler.amara@example.com"
+    reset_url = "http://localhost:4200/reset-password?token=sample-test-token"
+    name = "Amara Jayawardena"
+
+    msg = build_password_reset_email_message(to, reset_url, name)
+
+    assert msg["Subject"] == "CeylonGo — Reset Your Password"
+    assert msg["To"] == to
+    assert "CeylonGo" in msg["From"]
+
+    # Check plain text content
+    text_content = msg.get_body(preferencelist=("plain",)).get_content()
+    assert "Hello Amara Jayawardena," in text_content
+    assert "CeylonGo" in text_content
+    assert reset_url in text_content
+    assert "30 minutes" in text_content
+    assert "If you did not request this password reset" in text_content
+    assert "Discover Local. Feel at Home." in text_content
+
+    # Check HTML content
+    html_content = msg.get_body(preferencelist=("html",)).get_content()
+    assert "CeylonGo" in html_content
+    assert "#082B5C" in html_content  # Brand Navy
+    assert "#FF9F1C" in html_content  # Brand Orange
+    assert "Reset Password" in html_content
+    assert reset_url in html_content
+    assert "30 minutes" in html_content
+    assert "If you did not request" in html_content
+
+
+def test_unconfigured_smtp_does_not_send_or_create_record(
+    client: TestClient, db_session, monkeypatch
+):
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    assert is_smtp_configured() is False
+
+    user = User(
+        full_name="Unconfigured SMTP Traveler",
+        email="unconf.smtp@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    # Direct function returns False
+    res_bool = send_password_reset_email("unconf.smtp@example.com", "any-token")
+    assert res_bool is False
+
+    # Endpoint returns HTTP 200 generic message without leaving unusable reset records
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "unconf.smtp@example.com"},
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["message"]
+        == "If an account with that email exists, a password reset link has been sent."
+    )
+    assert db_session.query(PasswordReset).count() == 0
+
+
+def test_successful_smtp_dispatch(client: TestClient, db_session, mock_smtp_success):
+    user = User(
+        full_name="Dispatch Traveler",
+        email="dispatch.traveler@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "dispatch.traveler@example.com"},
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["message"]
+        == "If an account with that email exists, a password reset link has been sent."
+    )
+
+    # Verify SMTP server received the message
+    sent_msg = mock_smtp_success.last_sent_msg
+    assert sent_msg is not None
+    assert sent_msg["To"] == "dispatch.traveler@example.com"
+    assert sent_msg["Subject"] == "CeylonGo — Reset Your Password"
+
+    # Verify reset record was committed with SHA-256 token hash
+    record = (
+        db_session.query(PasswordReset).filter(PasswordReset.user_id == user.id).first()
+    )
+    assert record is not None
+    assert len(record.token_hash) == 64
+    assert record.is_used is False
+
+
+def test_smtp_authentication_failure(client: TestClient, db_session, monkeypatch):
+    user = User(
+        full_name="Auth Failure Traveler",
+        email="auth.fail@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    class AuthFailSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self):
+            pass
+
+        def login(self, user, pwd):
+            raise smtplib.SMTPAuthenticationError(535, b"5.7.8 Bad credentials")
+
+        def send_message(self, msg):
+            pass
+
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("SMTP_USERNAME", "traveler@ceylongo.com")
+    monkeypatch.setenv("SMTP_PASSWORD", "bad-password")
+    monkeypatch.setattr(smtplib, "SMTP", AuthFailSMTP)
+
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "auth.fail@example.com"},
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["message"]
+        == "If an account with that email exists, a password reset link has been sent."
+    )
+    # Ensure transaction was rolled back and no unusable record was created
+    assert db_session.query(PasswordReset).count() == 0
+
+
+def test_smtp_connection_timeout(client: TestClient, db_session, monkeypatch):
+    user = User(
+        full_name="Timeout Traveler",
+        email="timeout.traveler@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    class TimeoutSMTP:
+        def __init__(self, *args, **kwargs):
+            raise TimeoutError("Connection to SMTP host timed out")
+
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setattr(smtplib, "SMTP", TimeoutSMTP)
+
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "timeout.traveler@example.com"},
+    )
+    assert response.status_code == 200
+    assert (
+        response.json()["message"]
+        == "If an account with that email exists, a password reset link has been sent."
+    )
+    # Ensure transaction was rolled back
+    assert db_session.query(PasswordReset).count() == 0
+
+
+def test_registered_and_unregistered_anti_enumeration(
+    client: TestClient, db_session, mock_smtp_success
+):
+    user = User(
+        full_name="Known User",
+        email="known@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    res_reg = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "known@example.com"},
+    )
+    res_unreg = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "unknown-stranger@example.com"},
+    )
+
+    assert res_reg.status_code == 200
+    assert res_unreg.status_code == 200
+    assert res_reg.json() == res_unreg.json()
+    assert (
+        res_reg.json()["message"]
+        == "If an account with that email exists, a password reset link has been sent."
+    )
+
+
+def test_no_secrets_exposed_in_logs_or_api_responses(
+    client: TestClient, db_session, monkeypatch, caplog
+):
+    secret_smtp_password = "SuperSecretGmailPassword123!"
+    monkeypatch.setenv("SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("SMTP_USERNAME", "traveler@ceylongo.com")
+    monkeypatch.setenv("SMTP_PASSWORD", secret_smtp_password)
+
+    user = User(
+        full_name="Secret Leak Check",
+        email="leak.check@example.com",
+        password_hash=hash_password("Password123!"),
+        role="traveler",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    class FailingSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self):
+            pass
+
+        def login(self, user, pwd):
+            raise smtplib.SMTPAuthenticationError(535, b"Auth failed")
+
+        def send_message(self, msg):
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP", FailingSMTP)
+
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/v1/auth/forgot-password",
+            json={"email": "leak.check@example.com"},
+        )
+
+    assert response.status_code == 200
+    # Verify password was never logged
+    assert secret_smtp_password not in caplog.text
+    # Verify response body only contains the generic public message
+    assert response.json() == {
+        "message": "If an account with that email exists, a password reset link has been sent."
+    }

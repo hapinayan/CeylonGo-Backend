@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -37,6 +38,7 @@ from app.schemas.auth import (
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
+logger = logging.getLogger(__name__)
 
 security_scheme = HTTPBearer(
     scheme_name="HTTPBearer",
@@ -273,8 +275,8 @@ def forgot_password(
             # Invalidate any previously active unused tokens for this user
             db.query(PasswordReset).filter(
                 PasswordReset.user_id == user.id,
-                PasswordReset.is_used.is_(False),
-            ).update({"is_used": True})
+                PasswordReset.is_used == False,
+            ).update({"is_used": True}, synchronize_session=False)
 
             raw_token = generate_password_reset_token()
             token_hash = hash_reset_token(raw_token)
@@ -287,16 +289,26 @@ def forgot_password(
                 is_used=False,
             )
             db.add(reset_record)
-            db.commit()
 
-            # Safely dispatch email without leaking failures to user
-            send_password_reset_email(
+            # Safely dispatch email via configured SMTP
+            email_sent = send_password_reset_email(
                 to_email=user.email,
                 token=raw_token,
                 user_name=user.full_name,
             )
+
+            if email_sent:
+                db.commit()
+            else:
+                # Do not commit unusable reset records when email delivery fails!
+                db.rollback()
+                logger.error(
+                    "Password reset email delivery failed for user id %s. Rolling back reset token.",
+                    user.id,
+                )
     except SQLAlchemyError:
         db.rollback()
+        logger.exception("Database error occurred during password reset request.")
 
     return ForgotPasswordResponse(
         message="If an account with that email exists, a password reset link has been sent."
@@ -415,12 +427,13 @@ def reset_password(
 
         db.query(PasswordReset).filter(
             PasswordReset.user_id == user.id,
-            PasswordReset.is_used.is_(False),
-        ).update({"is_used": True})
+            PasswordReset.is_used == False,
+        ).update({"is_used": True}, synchronize_session=False)
 
         db.commit()
     except SQLAlchemyError:
         db.rollback()
+        logger.exception("Database error occurred during password reset execution.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while resetting the password. Please try again later.",

@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.email import send_password_reset_email
+from app.core.google_auth import verify_google_id_token
 from app.core.rate_limiter import check_email_limiter, forgot_password_limiter
 from app.core.security import (
     create_access_token,
@@ -27,6 +28,7 @@ from app.schemas.auth import (
     CheckEmailResponse,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
+    GoogleAuthRequest,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
@@ -228,6 +230,112 @@ def login(
         )
 
     # Generate signed JWT token with sub claim for user id
+    token = create_access_token(data={"sub": str(user.id)})
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
+
+@router.post(
+    "/google",
+    response_model=TokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Authenticate traveler with Google ID token",
+)
+def google_auth(
+    request: GoogleAuthRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Authenticate or register a traveler using a Google Identity Services ID token.
+
+    Security & Verification Rules:
+    1. Verifies token cryptographically via google-auth library with configured GOOGLE_CLIENT_ID.
+    2. Enforces Google issuer, audience, unexpired timestamp, subject (sub), and verified email.
+    3. Finds existing user by Google sub identifier.
+    4. If not found by sub, matches by normalized email:
+       - If email is already linked to a different Google sub, rejects with 409 Conflict.
+       - Otherwise, safely links the Google sub to the existing account.
+    5. If no account exists, creates a new traveler user with password_hash=None.
+    6. Ensures account is active (403 Forbidden if inactive).
+    7. Returns standard CeylonGo JWT access token and user profile.
+    """
+    token_data = verify_google_id_token(request.id_token)
+    google_sub = token_data["google_sub"]
+    email = token_data["email"]
+    full_name = token_data["full_name"]
+
+    # 1. Lookup user by Google subject ID
+    user = db.query(User).filter(User.google_sub == google_sub).first()
+
+    if user:
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is inactive. Please contact support.",
+            )
+    else:
+        # 2. Lookup existing user by verified email
+        existing_user = db.query(User).filter(func.lower(User.email) == email).first()
+
+        if existing_user:
+            if not existing_user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is inactive. Please contact support.",
+                )
+            if existing_user.google_sub and existing_user.google_sub != google_sub:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This email is already associated with another Google account.",
+                )
+
+            # Safely link Google account
+            existing_user.google_sub = google_sub
+            try:
+                db.commit()
+                db.refresh(existing_user)
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account conflict occurred during Google account linking.",
+                )
+            user = existing_user
+        else:
+            # 3. Create new traveler user (no local password)
+            new_user = User(
+                full_name=full_name,
+                email=email,
+                password_hash=None,
+                role="traveler",
+                is_active=True,
+                google_sub=google_sub,
+            )
+            db.add(new_user)
+            try:
+                db.commit()
+                db.refresh(new_user)
+            except IntegrityError:
+                db.rollback()
+                # Handle concurrent registration race condition
+                user = db.query(User).filter(User.google_sub == google_sub).first()
+                if not user:
+                    user = (
+                        db.query(User).filter(func.lower(User.email) == email).first()
+                    )
+                if not user:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An account conflict occurred during Google registration.",
+                    )
+            else:
+                user = new_user
+
+    # Generate signed JWT token
     token = create_access_token(data={"sub": str(user.id)})
 
     return TokenResponse(

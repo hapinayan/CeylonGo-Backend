@@ -68,6 +68,10 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str = Field(min_length=1)
+
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 

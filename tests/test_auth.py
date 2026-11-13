@@ -2,6 +2,11 @@ import smtplib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from app.core.email import (
     build_password_reset_email_message,
     build_password_reset_url,
@@ -22,10 +27,6 @@ from app.database.connection import get_db
 from app.main import app
 from app.models.password_reset import PasswordReset
 from app.models.user import Base, User
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 # Create isolated in-memory SQLite database
 test_engine = create_engine(
@@ -1386,3 +1387,855 @@ def test_no_secrets_exposed_in_logs_or_api_responses(
     assert response.json() == {
         "message": "If an account with that email exists, a password reset link has been sent."
     }
+
+
+# ==============================================================================
+# PHASE 3.2: GOOGLE SIGN-IN TESTS
+# ==============================================================================
+
+
+@pytest.fixture
+def mock_google_client_id(monkeypatch):
+    test_client_id = "test-mock-client-id.apps.googleusercontent.com"
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", test_client_id)
+    return test_client_id
+
+
+def test_google_auth_new_user_registration(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 1: New traveler registration via Google Sign-In with verified payload."""
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_sub_1001",
+        "email": "Amara.Traveler@Gmail.Com",
+        "email_verified": True,
+        "name": "Amara Jayawardena",
+        "picture": "https://lh3.googleusercontent.com/a/photo_1",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_1"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
+    assert data["user"]["email"] == "amara.traveler@gmail.com"
+    assert data["user"]["full_name"] == "Amara Jayawardena"
+    assert data["user"]["role"] == "traveler"
+    assert data["user"]["is_active"] is True
+
+    # Verify database persistence
+    user = db_session.query(User).filter(User.google_sub == "google_sub_1001").first()
+    assert user is not None
+    assert user.email == "amara.traveler@gmail.com"
+    assert (
+        user.password_hash is None
+    )  # Google-only accounts do not have local passwords
+
+    # Verify issued token
+    decoded = decode_access_token(data["access_token"])
+    assert decoded["sub"] == str(user.id)
+
+
+def test_google_auth_existing_google_user_login(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 2: Existing Google traveler logs in without creating duplicate records."""
+    existing_user = User(
+        full_name="Returning Traveler",
+        email="returning.traveler@gmail.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="google_sub_2002",
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "accounts.google.com",
+        "sub": "google_sub_2002",
+        "email": "returning.traveler@gmail.com",
+        "email_verified": True,
+        "name": "Returning Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_2"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["user"]["id"] == existing_user.id
+    assert data["user"]["email"] == "returning.traveler@gmail.com"
+
+    # Verify no duplicate user was created
+    users_count = (
+        db_session.query(User)
+        .filter(User.email == "returning.traveler@gmail.com")
+        .count()
+    )
+    assert users_count == 1
+
+
+def test_google_auth_safe_account_linking(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 3: Existing password-registered traveler safely links Google account."""
+    hashed_pwd = hash_password("TravelerSecret123!")
+    existing_user = User(
+        full_name="Local Registered Traveler",
+        email="local.traveler@gmail.com",
+        password_hash=hashed_pwd,
+        role="traveler",
+        is_active=True,
+        google_sub=None,
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_sub_3003",
+        "email": "Local.Traveler@Gmail.Com",
+        "email_verified": True,
+        "name": "Local Registered Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_3"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["user"]["id"] == existing_user.id
+
+    # Verify Google sub was linked and password hash preserved
+    db_session.refresh(existing_user)
+    assert existing_user.google_sub == "google_sub_3003"
+    assert existing_user.password_hash == hashed_pwd
+
+    # Verify user can STILL log in using their local email and password
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "local.traveler@gmail.com",
+            "password": "TravelerSecret123!",
+        },
+    )
+    assert login_response.status_code == 200
+    assert "access_token" in login_response.json()
+
+
+def test_google_auth_invalid_signature_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 4: Token with invalid cryptographic signature returns 401."""
+    import google.oauth2.id_token
+
+    def mock_invalid_token(*args, **kwargs):
+        raise ValueError("Invalid token signature")
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_invalid_token
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "tampered_token_payload"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_expired_token_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 5: Expired Google ID token returns 401."""
+    import google.oauth2.id_token
+
+    def mock_expired_token(*args, **kwargs):
+        raise ValueError("Token used too late")
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_expired_token
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "expired_token_payload"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_wrong_audience_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 6: Token minted for a different Client ID returns 401."""
+    import google.oauth2.id_token
+
+    def mock_wrong_audience(*args, **kwargs):
+        raise ValueError(
+            "Token has wrong audience, expected test-mock-client-id.apps.googleusercontent.com"
+        )
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_wrong_audience
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "wrong_audience_token"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_invalid_issuer_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 7: Token with untrusted issuer returns 401."""
+    google_payload = {
+        "iss": "https://untrusted-identity-provider.com",
+        "sub": "untrusted_sub",
+        "email": "hacker@example.com",
+        "email_verified": True,
+        "name": "Attacker",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "untrusted_issuer_token"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token issuer" in response.json()["detail"]
+
+
+def test_google_auth_unverified_email_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 8: Google account with unverified email is rejected with 400 Bad Request."""
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "unverified_sub_8008",
+        "email": "unverified@example.com",
+        "email_verified": False,
+        "name": "Unverified User",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "unverified_email_token"},
+    )
+
+    assert response.status_code == 400
+    assert "email is not verified" in response.json()["detail"].lower()
+
+
+def test_google_auth_conflict_different_google_sub(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 9: Account linking conflict if email is already linked to another Google sub."""
+    existing_user = User(
+        full_name="Original Google User",
+        email="conflict.traveler@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="original_google_sub_1",
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    # Attempt to sign in with same email but a DIFFERENT Google sub
+    mismatched_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "different_google_sub_2",
+        "email": "conflict.traveler@example.com",
+        "email_verified": True,
+        "name": "Impostor",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: mismatched_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "conflict_sub_token"},
+    )
+
+    assert response.status_code == 409
+    assert "already associated with another Google account" in response.json()["detail"]
+
+
+def test_google_only_user_password_login_returns_401_cleanly(
+    client: TestClient, db_session
+):
+    """Test 10: Attempting password login on Google-only user rejects cleanly without crashing."""
+    google_user = User(
+        full_name="Google Only Traveler",
+        email="google.only@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="google_only_sub_999",
+    )
+    db_session.add(google_user)
+    db_session.commit()
+
+    # Attempt password login
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": "google.only@example.com", "password": "Password123!"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"
+
+
+def test_google_auth_inactive_account_rejected(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 11: Inactive traveler account is blocked from Google Sign-In with 403 Forbidden."""
+    inactive_user = User(
+        full_name="Banned Traveler",
+        email="banned@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=False,
+        google_sub="google_banned_sub",
+    )
+    db_session.add(inactive_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_banned_sub",
+        "email": "banned@example.com",
+        "email_verified": True,
+        "name": "Banned Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "banned_user_token"},
+    )
+
+    assert response.status_code == 403
+    assert "account is inactive" in response.json()["detail"].lower()
+
+
+def test_google_auth_missing_client_id_raises_runtime_error(monkeypatch):
+    """Test 12: Missing GOOGLE_CLIENT_ID configuration raises RuntimeError."""
+    from app.core.google_auth import get_google_client_id
+
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        get_google_client_id()
+    assert "GOOGLE_CLIENT_ID environment variable is not set" in str(exc_info.value)
+
+
+def test_google_auth_empty_id_token_rejected(client: TestClient):
+    """Test 13: Empty ID token rejected by Pydantic validation with 422."""
+    response = client.post("/api/v1/auth/google", json={"id_token": ""})
+    assert response.status_code == 422
+
+
+# ==============================================================================
+# PHASE 3.2: GOOGLE SIGN-IN TESTS
+# ==============================================================================
+
+
+@pytest.fixture
+def mock_google_client_id(monkeypatch):
+    test_client_id = "test-mock-client-id.apps.googleusercontent.com"
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", test_client_id)
+    return test_client_id
+
+
+def test_google_auth_new_user_registration(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 1: New traveler registration via Google Sign-In with verified payload."""
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_sub_1001",
+        "email": "Amara.Traveler@Gmail.Com",
+        "email_verified": True,
+        "name": "Amara Jayawardena",
+        "picture": "https://lh3.googleusercontent.com/a/photo_1",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_1"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
+    assert data["user"]["email"] == "amara.traveler@gmail.com"
+    assert data["user"]["full_name"] == "Amara Jayawardena"
+    assert data["user"]["role"] == "traveler"
+    assert data["user"]["is_active"] is True
+
+    # Verify database persistence
+    user = (
+        db_session.query(User).filter(User.google_sub == "google_sub_1001").first()
+    )
+    assert user is not None
+    assert user.email == "amara.traveler@gmail.com"
+    assert user.password_hash is None  # Google-only accounts do not have local passwords
+
+    # Verify issued token
+    decoded = decode_access_token(data["access_token"])
+    assert decoded["sub"] == str(user.id)
+
+
+def test_google_auth_existing_google_user_login(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 2: Existing Google traveler logs in without creating duplicate records."""
+    existing_user = User(
+        full_name="Returning Traveler",
+        email="returning.traveler@gmail.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="google_sub_2002",
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "accounts.google.com",
+        "sub": "google_sub_2002",
+        "email": "returning.traveler@gmail.com",
+        "email_verified": True,
+        "name": "Returning Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_2"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["user"]["id"] == existing_user.id
+    assert data["user"]["email"] == "returning.traveler@gmail.com"
+
+    # Verify no duplicate user was created
+    users_count = (
+        db_session.query(User)
+        .filter(User.email == "returning.traveler@gmail.com")
+        .count()
+    )
+    assert users_count == 1
+
+
+def test_google_auth_safe_account_linking(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 3: Existing password-registered traveler safely links Google account."""
+    hashed_pwd = hash_password("TravelerSecret123!")
+    existing_user = User(
+        full_name="Local Registered Traveler",
+        email="local.traveler@gmail.com",
+        password_hash=hashed_pwd,
+        role="traveler",
+        is_active=True,
+        google_sub=None,
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_sub_3003",
+        "email": "Local.Traveler@Gmail.Com",
+        "email_verified": True,
+        "name": "Local Registered Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "valid_mock_google_id_token_3"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["user"]["id"] == existing_user.id
+
+    # Verify Google sub was linked and password hash preserved
+    db_session.refresh(existing_user)
+    assert existing_user.google_sub == "google_sub_3003"
+    assert existing_user.password_hash == hashed_pwd
+
+    # Verify user can STILL log in using their local email and password
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "local.traveler@gmail.com",
+            "password": "TravelerSecret123!",
+        },
+    )
+    assert login_response.status_code == 200
+    assert "access_token" in login_response.json()
+
+
+def test_google_auth_invalid_signature_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 4: Token with invalid cryptographic signature returns 401."""
+    import google.oauth2.id_token
+
+    def mock_invalid_token(*args, **kwargs):
+        raise ValueError("Invalid token signature")
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_invalid_token
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "tampered_token_payload"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_expired_token_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 5: Expired Google ID token returns 401."""
+    import google.oauth2.id_token
+
+    def mock_expired_token(*args, **kwargs):
+        raise ValueError("Token used too late")
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_expired_token
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "expired_token_payload"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_wrong_audience_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 6: Token minted for a different Client ID returns 401."""
+    import google.oauth2.id_token
+
+    def mock_wrong_audience(*args, **kwargs):
+        raise ValueError(
+            "Token has wrong audience, expected test-mock-client-id.apps.googleusercontent.com"
+        )
+
+    monkeypatch.setattr(
+        google.oauth2.id_token, "verify_oauth2_token", mock_wrong_audience
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "wrong_audience_token"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token" in response.json()["detail"]
+
+
+def test_google_auth_invalid_issuer_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 7: Token with untrusted issuer returns 401."""
+    google_payload = {
+        "iss": "https://untrusted-identity-provider.com",
+        "sub": "untrusted_sub",
+        "email": "hacker@example.com",
+        "email_verified": True,
+        "name": "Attacker",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "untrusted_issuer_token"},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid Google ID token issuer" in response.json()["detail"]
+
+
+def test_google_auth_unverified_email_rejected(
+    client: TestClient, mock_google_client_id, monkeypatch
+):
+    """Test 8: Google account with unverified email is rejected with 400 Bad Request."""
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "unverified_sub_8008",
+        "email": "unverified@example.com",
+        "email_verified": False,
+        "name": "Unverified User",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "unverified_email_token"},
+    )
+
+    assert response.status_code == 400
+    assert "email is not verified" in response.json()["detail"].lower()
+
+
+def test_google_auth_conflict_different_google_sub(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 9: Account linking conflict if email is already linked to another Google sub."""
+    existing_user = User(
+        full_name="Original Google User",
+        email="conflict.traveler@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="original_google_sub_1",
+    )
+    db_session.add(existing_user)
+    db_session.commit()
+
+    # Attempt to sign in with same email but a DIFFERENT Google sub
+    mismatched_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "different_google_sub_2",
+        "email": "conflict.traveler@example.com",
+        "email_verified": True,
+        "name": "Impostor",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: mismatched_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "conflict_sub_token"},
+    )
+
+    assert response.status_code == 409
+    assert (
+        "already associated with another Google account"
+        in response.json()["detail"]
+    )
+
+
+def test_google_only_user_password_login_returns_401_cleanly(
+    client: TestClient, db_session
+):
+    """Test 10: Attempting password login on Google-only user rejects cleanly without crashing."""
+    google_user = User(
+        full_name="Google Only Traveler",
+        email="google.only@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=True,
+        google_sub="google_only_sub_999",
+    )
+    db_session.add(google_user)
+    db_session.commit()
+
+    # Attempt password login
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": "google.only@example.com", "password": "Password123!"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"
+
+
+def test_google_auth_inactive_account_rejected(
+    client: TestClient, db_session, mock_google_client_id, monkeypatch
+):
+    """Test 11: Inactive traveler account is blocked from Google Sign-In with 403 Forbidden."""
+    inactive_user = User(
+        full_name="Banned Traveler",
+        email="banned@example.com",
+        password_hash=None,
+        role="traveler",
+        is_active=False,
+        google_sub="google_banned_sub",
+    )
+    db_session.add(inactive_user)
+    db_session.commit()
+
+    google_payload = {
+        "iss": "https://accounts.google.com",
+        "sub": "google_banned_sub",
+        "email": "banned@example.com",
+        "email_verified": True,
+        "name": "Banned Traveler",
+        "aud": mock_google_client_id,
+    }
+
+    import google.oauth2.id_token
+
+    monkeypatch.setattr(
+        google.oauth2.id_token,
+        "verify_oauth2_token",
+        lambda token, request, audience: google_payload,
+    )
+
+    response = client.post(
+        "/api/v1/auth/google",
+        json={"id_token": "banned_user_token"},
+    )
+
+    assert response.status_code == 403
+    assert "account is inactive" in response.json()["detail"].lower()
+
+
+def test_google_auth_missing_client_id_raises_runtime_error(monkeypatch):
+    """Test 12: Missing GOOGLE_CLIENT_ID configuration raises RuntimeError."""
+    from app.core.google_auth import get_google_client_id
+
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        get_google_client_id()
+    assert "GOOGLE_CLIENT_ID environment variable is not set" in str(
+        exc_info.value
+    )
+
+
+def test_google_auth_empty_id_token_rejected(client: TestClient):
+    """Test 13: Empty ID token rejected by Pydantic validation with 422."""
+    response = client.post("/api/v1/auth/google", json={"id_token": ""})
+    assert response.status_code == 422
+

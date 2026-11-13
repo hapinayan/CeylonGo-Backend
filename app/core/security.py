@@ -17,7 +17,9 @@ def hash_password(password: str) -> str:
     return password_hash.hash(password)
 
 
-def verify_password(password: str, hashed_password: str) -> bool:
+def verify_password(password: str, hashed_password: str | None) -> bool:
+    if not hashed_password:
+        return False
     return password_hash.verify(password, hashed_password)
 
 

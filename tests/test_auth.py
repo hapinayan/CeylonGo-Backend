@@ -9,7 +9,7 @@ from app.core.security import (
 )
 from app.database.connection import get_db
 from app.main import app
-from app.models.user import Base, User
+from app.models.user import Base, Role, User, UserRole
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -20,6 +20,7 @@ test_engine = create_engine(
     "sqlite:///:memory:",
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
+    execution_options={"schema_translate_map": {"dbo": None}},
 )
 
 
@@ -41,6 +42,18 @@ TestingSessionLocal = sessionmaker(
 @pytest.fixture(autouse=True)
 def setup_test_db():
     Base.metadata.create_all(bind=test_engine)
+    session = TestingSessionLocal()
+    try:
+        session.add_all(
+            [
+                Role(role_id=1, role_name="Tourist"),
+                Role(role_id=2, role_name="Vendor"),
+                Role(role_id=3, role_name="Admin"),
+            ]
+        )
+        session.commit()
+    finally:
+        session.close()
     yield
     Base.metadata.drop_all(bind=test_engine)
 
@@ -148,6 +161,14 @@ def test_register_duplicate_email(client: TestClient):
                 "password": "short",
             },
             "password",
+        ),
+        (
+            {
+                "full_name": "A" * 101,
+                "email": "valid@example.com",
+                "password": "TestPassword123!",
+            },
+            "full_name",
         ),
     ],
 )
@@ -487,3 +508,123 @@ def test_cors_disallowed_origin_no_allow_header(client: TestClient):
         },
     )
     assert response.headers.get("access-control-allow-origin") is None
+
+
+# ==========================================
+# Role Mapping & Database Transaction Tests
+# ==========================================
+
+
+def test_role_mapping_tourist_to_traveler(db_session):
+    user = User(
+        full_name="Tourist User",
+        email="tourist@example.com",
+        password_hash=hash_password("Password123!"),
+        is_active=True,
+    )
+    user.user_role_links.append(UserRole(role_id=1))
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    assert user.role == "traveler"
+
+
+def test_role_mapping_vendor_and_admin(db_session):
+    vendor = User(
+        full_name="Vendor User",
+        email="vendor@example.com",
+        password_hash=hash_password("Password123!"),
+        is_active=True,
+    )
+    vendor.user_role_links.append(UserRole(role_id=2))
+    admin = User(
+        full_name="Admin User",
+        email="admin@example.com",
+        password_hash=hash_password("Password123!"),
+        is_active=True,
+    )
+    admin.user_role_links.append(UserRole(role_id=3))
+
+    db_session.add_all([vendor, admin])
+    db_session.commit()
+    db_session.refresh(vendor)
+    db_session.refresh(admin)
+
+    assert vendor.role == "vendor"
+    assert admin.role == "admin"
+
+
+def test_register_creates_both_user_and_user_role_records(client: TestClient, db_session):
+    payload = {
+        "full_name": "Relational Traveler",
+        "email": "relational@example.com",
+        "password": "SecurePassword123!",
+    }
+    response = client.post("/api/v1/auth/register", json=payload)
+    assert response.status_code == 201
+
+    saved_user = (
+        db_session.query(User).filter(User.email == "relational@example.com").first()
+    )
+    assert saved_user is not None
+    assert saved_user.full_name == "Relational Traveler"
+    assert saved_user.role == "traveler"
+
+    saved_user_role = (
+        db_session.query(UserRole).filter(UserRole.user_id == saved_user.id).first()
+    )
+    assert saved_user_role is not None
+    assert saved_user_role.role_id == 1
+
+
+def test_register_fails_if_tourist_role_missing(client: TestClient, db_session):
+    # Temporarily remove Tourist role from database
+    tourist_role = db_session.query(Role).filter(Role.role_name == "Tourist").first()
+    if tourist_role:
+        db_session.delete(tourist_role)
+        db_session.commit()
+
+    payload = {
+        "full_name": "No Role Traveler",
+        "email": "norole@example.com",
+        "password": "SecurePassword123!",
+    }
+    response = client.post("/api/v1/auth/register", json=payload)
+    assert response.status_code == 500
+    assert "not configured" in response.json()["detail"].lower()
+
+
+def test_register_transaction_rollback_on_failure(client: TestClient, db_session, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    def failing_commit():
+        raise OperationalError("Simulated DB failure", {}, None)
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+
+    payload = {
+        "full_name": "Rollback Traveler",
+        "email": "rollback@example.com",
+        "password": "SecurePassword123!",
+    }
+    with pytest.raises(OperationalError):
+        client.post("/api/v1/auth/register", json=payload)
+
+    db_session.rollback()
+    monkeypatch.undo()
+    saved_user = (
+        db_session.query(User).filter(User.email == "rollback@example.com").first()
+    )
+    assert saved_user is None
+
+
+def test_register_exact_100_chars_full_name_succeeds(client: TestClient):
+    payload = {
+        "full_name": "A" * 100,
+        "email": "exact100@example.com",
+        "password": "SecurePassword123!",
+    }
+    response = client.post("/api/v1/auth/register", json=payload)
+    assert response.status_code == 201
+    assert response.json()["user"]["full_name"] == "A" * 100

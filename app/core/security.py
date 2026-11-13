@@ -1,4 +1,6 @@
+import hashlib
 import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -66,3 +68,22 @@ def decode_access_token(token: str) -> dict[str, Any]:
     secret_key = get_jwt_secret_key()
     algorithm = get_jwt_algorithm()
     return jwt.decode(token, secret_key, algorithms=[algorithm])
+
+
+def generate_password_reset_token() -> str:
+    """Generate a 256-bit URL-safe cryptographically secure random token."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_token(token: str) -> str:
+    """Compute SHA-256 digest of a reset token for secure database storage."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def get_password_reset_token_expire_minutes() -> int:
+    """Retrieve password reset token lifetime in minutes (default 15)."""
+    raw = os.getenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "15")
+    try:
+        return int(raw)
+    except ValueError:
+        return 15

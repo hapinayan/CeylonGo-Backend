@@ -17,11 +17,15 @@ class User(Base):
 
     email: Mapped[str] = mapped_column(Unicode(255), unique=True, nullable=False)
 
-    password_hash: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(Unicode(255), nullable=True)
 
     role: Mapped[str] = mapped_column(Unicode(30), default="traveler", nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    google_sub: Mapped[str | None] = mapped_column(
+        Unicode(255), unique=True, nullable=True, index=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False

@@ -3,6 +3,20 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
+class CheckEmailRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class CheckEmailResponse(BaseModel):
+    email: EmailStr
+    is_registered: bool
+
+
 class RegisterRequest(BaseModel):
     full_name: str = Field(min_length=2, max_length=150)
     email: EmailStr
@@ -52,3 +66,35 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str = Field(min_length=1)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+
+
+class VerifyResetTokenResponse(BaseModel):
+    valid: bool
+    email: EmailStr
+    message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str

@@ -1,29 +1,46 @@
+import logging
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.email import send_password_reset_email
+from app.core.google_auth import verify_google_id_token
+from app.core.rate_limiter import check_email_limiter, forgot_password_limiter
 from app.core.security import (
     create_access_token,
     decode_access_token,
+    generate_password_reset_token,
     hash_password,
+    hash_reset_token,
     verify_password,
 )
 from app.database.connection import get_db
+from app.models.password_reset import PasswordReset
 from app.models.user import User
 from app.schemas.auth import (
+    CheckEmailRequest,
+    CheckEmailResponse,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
+    GoogleAuthRequest,
     LoginRequest,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     TokenResponse,
     UserResponse,
+    VerifyResetTokenResponse,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
+logger = logging.getLogger(__name__)
 
 security_scheme = HTTPBearer(
     scheme_name="HTTPBearer",
@@ -84,6 +101,51 @@ def get_current_user(
         )
 
     return user
+
+
+def rate_limit_check_email(request: Request) -> None:
+    check_email_limiter.check(request)
+
+
+def rate_limit_forgot_password(request: Request) -> None:
+    forgot_password_limiter.check(request)
+
+
+@router.post(
+    "/check-email",
+    response_model=CheckEmailResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(rate_limit_check_email)],
+    summary="Check if an email address is already registered",
+)
+def check_email(
+    request: CheckEmailRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Check whether a traveler account with the specified email address exists.
+
+    Security Note (Account Enumeration):
+    This endpoint directly returns `is_registered: true` or `false` to support
+    the email-first authentication flow. Returning this boolean inherently
+    reveals account existence to the caller. While rate limiting is enforced
+    to hinder automated bulk enumeration, returning existence status cannot
+    completely prevent enumeration of targeted email addresses.
+    """
+    normalized_email = request.email.strip().lower()
+
+    try:
+        user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while verifying the email address. Please try again later.",
+        )
+
+    return CheckEmailResponse(
+        email=normalized_email,
+        is_registered=user is not None,
+    )
 
 
 @router.post(
@@ -177,6 +239,112 @@ def login(
     )
 
 
+@router.post(
+    "/google",
+    response_model=TokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Authenticate traveler with Google ID token",
+)
+def google_auth(
+    request: GoogleAuthRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Authenticate or register a traveler using a Google Identity Services ID token.
+
+    Security & Verification Rules:
+    1. Verifies token cryptographically via google-auth library with configured GOOGLE_CLIENT_ID.
+    2. Enforces Google issuer, audience, unexpired timestamp, subject (sub), and verified email.
+    3. Finds existing user by Google sub identifier.
+    4. If not found by sub, matches by normalized email:
+       - If email is already linked to a different Google sub, rejects with 409 Conflict.
+       - Otherwise, safely links the Google sub to the existing account.
+    5. If no account exists, creates a new traveler user with password_hash=None.
+    6. Ensures account is active (403 Forbidden if inactive).
+    7. Returns standard CeylonGo JWT access token and user profile.
+    """
+    token_data = verify_google_id_token(request.id_token)
+    google_sub = token_data["google_sub"]
+    email = token_data["email"]
+    full_name = token_data["full_name"]
+
+    # 1. Lookup user by Google subject ID
+    user = db.query(User).filter(User.google_sub == google_sub).first()
+
+    if user:
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is inactive. Please contact support.",
+            )
+    else:
+        # 2. Lookup existing user by verified email
+        existing_user = db.query(User).filter(func.lower(User.email) == email).first()
+
+        if existing_user:
+            if not existing_user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is inactive. Please contact support.",
+                )
+            if existing_user.google_sub and existing_user.google_sub != google_sub:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This email is already associated with another Google account.",
+                )
+
+            # Safely link Google account
+            existing_user.google_sub = google_sub
+            try:
+                db.commit()
+                db.refresh(existing_user)
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account conflict occurred during Google account linking.",
+                )
+            user = existing_user
+        else:
+            # 3. Create new traveler user (no local password)
+            new_user = User(
+                full_name=full_name,
+                email=email,
+                password_hash=None,
+                role="traveler",
+                is_active=True,
+                google_sub=google_sub,
+            )
+            db.add(new_user)
+            try:
+                db.commit()
+                db.refresh(new_user)
+            except IntegrityError:
+                db.rollback()
+                # Handle concurrent registration race condition
+                user = db.query(User).filter(User.google_sub == google_sub).first()
+                if not user:
+                    user = (
+                        db.query(User).filter(func.lower(User.email) == email).first()
+                    )
+                if not user:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An account conflict occurred during Google registration.",
+                    )
+            else:
+                user = new_user
+
+    # Generate signed JWT token
+    token = create_access_token(data={"sub": str(user.id)})
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
+
 @router.get(
     "/me",
     response_model=UserResponse,
@@ -185,3 +353,200 @@ def login(
 )
 def get_me(current_user: Annotated[User, Depends(get_current_user)]):
     return current_user
+
+
+@router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(rate_limit_forgot_password)],
+    summary="Request a password reset link",
+)
+def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Request a password reset link for the provided email address.
+
+    Security Note (Anti-Enumeration):
+    This endpoint returns an identical generic response whether the email exists
+    in the database or not. If registered and active, a single-use token expiring
+    in 30 minutes is created, its SHA-256 hash is saved to the database, and an email
+    is safely dispatched via SMTP.
+    """
+    normalized_email = request.email.strip().lower()
+
+    try:
+        user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+        if user and user.is_active:
+            # Invalidate any previously active unused tokens for this user
+            db.query(PasswordReset).filter(
+                PasswordReset.user_id == user.id,
+                PasswordReset.is_used == False,
+            ).update({"is_used": True}, synchronize_session=False)
+
+            raw_token = generate_password_reset_token()
+            token_hash = hash_reset_token(raw_token)
+            expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
+
+            reset_record = PasswordReset(
+                user_id=user.id,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                is_used=False,
+            )
+            db.add(reset_record)
+
+            # Safely dispatch email via configured SMTP
+            email_sent = send_password_reset_email(
+                to_email=user.email,
+                token=raw_token,
+                user_name=user.full_name,
+            )
+
+            if email_sent:
+                db.commit()
+            else:
+                # Do not commit unusable reset records when email delivery fails!
+                db.rollback()
+                logger.error(
+                    "Password reset email delivery failed for user id %s. Rolling back reset token.",
+                    user.id,
+                )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Database error occurred during password reset request.")
+
+    return ForgotPasswordResponse(
+        message="If an account with that email exists, a password reset link has been sent."
+    )
+
+
+@router.get(
+    "/verify-reset-token",
+    response_model=VerifyResetTokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Verify if a password reset token is valid and unexpired",
+)
+def verify_reset_token(
+    token: Annotated[str, Query(min_length=1, description="Password reset token")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Verify the validity, usage status, and expiration of a password reset token.
+    """
+    token_hash = hash_reset_token(token)
+    reset_record = (
+        db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
+    )
+
+    if not reset_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    if reset_record.is_used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has already been used.",
+        )
+
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    record_expires = reset_record.expires_at
+    if record_expires.tzinfo is not None:
+        record_expires = record_expires.replace(tzinfo=None)
+
+    if now_utc > record_expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has expired.",
+        )
+
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    return VerifyResetTokenResponse(
+        valid=True,
+        email=user.email,
+        message="Password reset token is valid.",
+    )
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reset password using a valid reset token",
+)
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Atomically update user password using Argon2 and consume the single-use reset token.
+    """
+    token_hash = hash_reset_token(request.token)
+    reset_record = (
+        db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
+    )
+
+    if not reset_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    if reset_record.is_used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has already been used.",
+        )
+
+    now_utc = datetime.now(UTC).replace(tzinfo=None)
+    record_expires = reset_record.expires_at
+    if record_expires.tzinfo is not None:
+        record_expires = record_expires.replace(tzinfo=None)
+
+    if now_utc > record_expires:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password reset token has expired.",
+        )
+
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired password reset token.",
+        )
+
+    hashed_password = hash_password(request.new_password)
+
+    try:
+        user.password_hash = hashed_password
+        reset_record.is_used = True
+        reset_record.used_at = now_utc
+
+        db.query(PasswordReset).filter(
+            PasswordReset.user_id == user.id,
+            PasswordReset.is_used == False,
+        ).update({"is_used": True}, synchronize_session=False)
+
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Database error occurred during password reset execution.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while resetting the password. Please try again later.",
+        )
+
+    return ResetPasswordResponse(
+        message="Password has been reset successfully. You can now sign in with your new password."
+    )

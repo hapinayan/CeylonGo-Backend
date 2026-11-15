@@ -4,7 +4,17 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers.admin_providers import (
+    router as admin_providers_router,
+)
 from app.routers.auth import router as auth_router
+from app.routers.provider_auth import (
+    router as provider_auth_router,
+)
+from app.routers.provider_otp import router as provider_otp_router
+from app.routers.provider_registration import (
+    router as provider_registration_router,
+)
 
 load_dotenv()
 
@@ -48,6 +58,10 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth_router)
+app.include_router(provider_otp_router)
+app.include_router(provider_registration_router)
+app.include_router(admin_providers_router)
+app.include_router(provider_auth_router)
 
 
 @app.get("/api/v1/health", tags=["Health"])

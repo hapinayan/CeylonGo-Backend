@@ -15,6 +15,7 @@ class ProviderProfile(Base):
         Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True
     )
 
+    # Business Details
     business_name: Mapped[str] = mapped_column(Unicode(150), nullable=False)
 
     provider_type: Mapped[str] = mapped_column(
@@ -23,10 +24,70 @@ class ProviderProfile(Base):
 
     phone: Mapped[str] = mapped_column(Unicode(25), nullable=False)
 
+    secondary_phone: Mapped[str | None] = mapped_column(
+        Unicode(25), nullable=True
+    )
+
+    # Legacy district column retained for backward compatibility
     district: Mapped[str] = mapped_column(Unicode(100), nullable=False)
 
     description: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
 
+    business_registration_number: Mapped[str | None] = mapped_column(
+        Unicode(50), nullable=True
+    )
+
+    # Personal Details
+    nic_number: Mapped[str | None] = mapped_column(
+        Unicode(20), nullable=True, index=True
+    )
+
+    # Permanent Address
+    permanent_province: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    permanent_district: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    permanent_city: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    permanent_landmark: Mapped[str | None] = mapped_column(
+        Unicode(255), nullable=True
+    )
+    permanent_postal_code: Mapped[str | None] = mapped_column(
+        Unicode(20), nullable=True
+    )
+
+    # Business Address
+    business_province: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    business_district: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    business_city: Mapped[str | None] = mapped_column(
+        Unicode(100), nullable=True
+    )
+    business_landmark: Mapped[str | None] = mapped_column(
+        Unicode(255), nullable=True
+    )
+    business_postal_code: Mapped[str | None] = mapped_column(
+        Unicode(20), nullable=True
+    )
+
+    # Identity Verification File References (Stored as secure file paths/references)
+    selfie_image_path: Mapped[str | None] = mapped_column(
+        Unicode(255), nullable=True
+    )
+    nic_front_image_path: Mapped[str | None] = mapped_column(
+        Unicode(255), nullable=True
+    )
+    nic_back_image_path: Mapped[str | None] = mapped_column(
+        Unicode(255), nullable=True
+    )
+
+    # Approval Workflow
     approval_status: Mapped[str] = mapped_column(
         Unicode(20), default="pending", nullable=False, index=True
     )
@@ -54,4 +115,3 @@ class ProviderProfile(Base):
         "User",
         foreign_keys=[reviewed_by],
     )
-

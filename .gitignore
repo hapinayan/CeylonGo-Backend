@@ -221,3 +221,7 @@ __marimo__/
 
 # Python virtual environment
 .venv/
+
+# Uploaded documents
+uploads/
+

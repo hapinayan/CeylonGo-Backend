@@ -5,7 +5,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.auth import router as auth_router
+from app.routers.homestay import router as homestay_router
 
+from app.routers.booking import router as booking_router
+from app.routers.promotion import router as promotion_router
 load_dotenv()
 
 app = FastAPI(
@@ -48,7 +51,10 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth_router)
+app.include_router(homestay_router)
 
+app.include_router(booking_router)
+app.include_router(promotion_router)
 
 @app.get("/api/v1/health", tags=["Health"])
 def health_check():

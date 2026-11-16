@@ -11,7 +11,7 @@ Covers:
 7. Existing RBAC dependencies compatibility with the extended model.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -105,8 +105,12 @@ def test_provider_profile_backward_compatibility(db_session: Session):
     assert profile.district == "Galle"
     assert profile.approval_status == "pending"
 
-    # All new fields should safely be None
+    # All new fields should safely be None or default to nic
     assert profile.nic_number is None
+    assert profile.identity_document_type == "nic"
+    assert profile.date_of_birth is None
+    assert profile.gender is None
+    assert profile.nationality is None
     assert profile.secondary_phone is None
     assert profile.permanent_province is None
     assert profile.permanent_district is None
@@ -149,7 +153,11 @@ def test_provider_profile_with_all_extended_fields(db_session: Session):
         description="Authentic homestay at the foot of Sigiriya Rock Fortress.",
         business_registration_number="PV123456",
         # Personal details
+        identity_document_type="nic",
         nic_number="199012345678",
+        date_of_birth=date(1990, 5, 15),
+        gender="Male",
+        nationality="Sri Lankan",
         # Permanent address
         permanent_province="Central Province",
         permanent_district="Matale",
@@ -172,7 +180,11 @@ def test_provider_profile_with_all_extended_fields(db_session: Session):
     db_session.commit()
     db_session.refresh(profile)
 
+    assert profile.identity_document_type == "nic"
     assert profile.nic_number == "199012345678"
+    assert profile.date_of_birth == date(1990, 5, 15)
+    assert profile.gender == "Male"
+    assert profile.nationality == "Sri Lankan"
     assert profile.secondary_phone == "0719876543"
     assert profile.permanent_province == "Central Province"
     assert profile.permanent_city == "Dambulla"

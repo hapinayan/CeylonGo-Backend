@@ -66,9 +66,13 @@ def compute_draft_response(draft: ProviderRegistrationDraft) -> DraftResponse:
         draft.full_name
         and draft.primary_phone
         and draft.nic_number
+        and draft.date_of_birth
+        and draft.gender
+        and draft.nationality
         and draft.permanent_province
         and draft.permanent_district
         and draft.permanent_city
+        and draft.permanent_landmark
         and draft.permanent_postal_code
     )
     business_completed = bool(
@@ -80,11 +84,18 @@ def compute_draft_response(draft: ProviderRegistrationDraft) -> DraftResponse:
         and draft.business_postal_code
         and draft.business_description
     )
-    identity_completed = bool(
-        draft.selfie_file_reference
-        and draft.nic_front_file_reference
-        and draft.nic_back_file_reference
-    )
+    is_passport = (draft.identity_document_type == "passport")
+    if is_passport:
+        identity_completed = bool(
+            draft.selfie_file_reference
+            and draft.nic_front_file_reference
+        )
+    else:
+        identity_completed = bool(
+            draft.selfie_file_reference
+            and draft.nic_front_file_reference
+            and draft.nic_back_file_reference
+        )
 
     if not personal_completed:
         current_step = "personal"
@@ -99,7 +110,11 @@ def compute_draft_response(draft: ProviderRegistrationDraft) -> DraftResponse:
         email=draft.email,
         full_name=draft.full_name,
         phone=draft.primary_phone,
+        identity_document_type=draft.identity_document_type or "nic",
         nic_number=draft.nic_number,
+        date_of_birth=draft.date_of_birth,
+        gender=draft.gender,
+        nationality=draft.nationality,
         permanent_province=draft.permanent_province,
         permanent_district=draft.permanent_district,
         permanent_city=draft.permanent_city,
@@ -232,9 +247,12 @@ def save_personal_details(
 ):
     email = auth_record.email
 
-    # Check for duplicate NIC in existing provider profiles
+    doc_label = "Passport" if payload.identity_document_type == "passport" else "NIC"
+
+    # Check for duplicate identity document in existing provider profiles
     existing_profile_query = db.query(ProviderProfile).filter(
-        ProviderProfile.nic_number == payload.nic_number
+        ProviderProfile.nic_number == payload.nic_number,
+        ProviderProfile.identity_document_type == payload.identity_document_type,
     )
     if auth_record.purpose == "resubmission":
         user = db.query(User).filter_by(email=email).first()
@@ -246,14 +264,15 @@ def save_personal_details(
     if existing_profile_query.first():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This NIC number is already associated with another provider account.",
+            detail=f"This {doc_label} number is already associated with another provider account.",
         )
 
-    # Check for duplicate NIC in other active drafts
+    # Check for duplicate identity document in other active drafts
     other_draft = (
         db.query(ProviderRegistrationDraft)
         .filter(
             ProviderRegistrationDraft.nic_number == payload.nic_number,
+            ProviderRegistrationDraft.identity_document_type == payload.identity_document_type,
             ProviderRegistrationDraft.email != email,
         )
         .first()
@@ -261,13 +280,17 @@ def save_personal_details(
     if other_draft:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This NIC number is currently used in another pending registration draft.",
+            detail=f"This {doc_label} number is currently used in another pending registration draft.",
         )
 
     draft = get_or_create_draft(email, db)
     draft.full_name = payload.full_name
     draft.primary_phone = payload.phone
+    draft.identity_document_type = payload.identity_document_type
     draft.nic_number = payload.nic_number
+    draft.date_of_birth = payload.date_of_birth
+    draft.gender = payload.gender
+    draft.nationality = payload.nationality
     draft.permanent_province = payload.permanent_province
     draft.permanent_district = payload.permanent_district
     draft.permanent_city = payload.permanent_city
@@ -445,14 +468,18 @@ def submit_provider_registration(
         draft.full_name
         and draft.primary_phone
         and draft.nic_number
+        and draft.date_of_birth
+        and draft.gender
+        and draft.nationality
         and draft.permanent_province
         and draft.permanent_district
         and draft.permanent_city
+        and draft.permanent_landmark
         and draft.permanent_postal_code
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Incomplete personal details. All personal fields and permanent address are required.",
+            detail="Incomplete personal details. All personal fields, demographic information, and permanent residential address are required.",
         )
 
     # Business details
@@ -471,17 +498,30 @@ def submit_provider_registration(
         )
 
     # Identity images
-    if not (
-        draft.selfie_file_reference
-        and draft.nic_front_file_reference
-        and draft.nic_back_file_reference
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Incomplete identity verification. All three documents (selfie, NIC front, and NIC back) are required.",
-        )
+    is_passport = (draft.identity_document_type == "passport")
+    if is_passport:
+        if not (
+            draft.selfie_file_reference
+            and draft.nic_front_file_reference
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Incomplete identity verification. Selfie and passport photo page are required.",
+            )
+    else:
+        if not (
+            draft.selfie_file_reference
+            and draft.nic_front_file_reference
+            and draft.nic_back_file_reference
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Incomplete identity verification. All three documents (selfie, NIC front, and NIC back) are required.",
+            )
 
     now = datetime.now(UTC)
+    doc_type = draft.identity_document_type or "nic"
+    doc_label = "Passport" if doc_type == "passport" else "NIC"
 
     # 2. Check Purpose & Apply Profile Changes
     if auth_record.purpose == "registration":
@@ -493,16 +533,19 @@ def submit_provider_registration(
                 detail="An account with this email already exists.",
             )
 
-        # Ensure NIC is unique
+        # Ensure Identity Document is unique for this document type
         existing_profile = (
             db.query(ProviderProfile)
-            .filter_by(nic_number=draft.nic_number)
+            .filter_by(
+                nic_number=draft.nic_number,
+                identity_document_type=doc_type,
+            )
             .first()
         )
         if existing_profile:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This NIC number is already associated with another provider account.",
+                detail=f"This {doc_label} number is already associated with another provider account.",
             )
 
         # Create User record (inactive, no password until approved)
@@ -526,7 +569,11 @@ def submit_provider_registration(
             district=draft.business_district or draft.permanent_district,
             description=draft.business_description,
             business_registration_number=draft.business_registration_number,
+            identity_document_type=doc_type,
             nic_number=draft.nic_number,
+            date_of_birth=draft.date_of_birth,
+            gender=draft.gender,
+            nationality=draft.nationality,
             permanent_province=draft.permanent_province,
             permanent_district=draft.permanent_district,
             permanent_city=draft.permanent_city,
@@ -572,11 +619,12 @@ def submit_provider_registration(
                 detail="Only rejected provider profiles can be resubmitted.",
             )
 
-        # Check duplicate NIC among OTHER profiles
+        # Check duplicate Identity Document among OTHER profiles
         other_profile = (
             db.query(ProviderProfile)
             .filter(
                 ProviderProfile.nic_number == draft.nic_number,
+                ProviderProfile.identity_document_type == doc_type,
                 ProviderProfile.id != existing_profile.id,
             )
             .first()
@@ -584,7 +632,7 @@ def submit_provider_registration(
         if other_profile:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This NIC number is already associated with another provider account.",
+                detail=f"This {doc_label} number is already associated with another provider account.",
             )
 
         # Update existing profile
@@ -595,7 +643,11 @@ def submit_provider_registration(
         existing_profile.district = draft.business_district or draft.permanent_district
         existing_profile.description = draft.business_description
         existing_profile.business_registration_number = draft.business_registration_number
+        existing_profile.identity_document_type = doc_type
         existing_profile.nic_number = draft.nic_number
+        existing_profile.date_of_birth = draft.date_of_birth
+        existing_profile.gender = draft.gender
+        existing_profile.nationality = draft.nationality
         existing_profile.permanent_province = draft.permanent_province
         existing_profile.permanent_district = draft.permanent_district
         existing_profile.permanent_city = draft.permanent_city

@@ -1,8 +1,8 @@
 import re
-from datetime import datetime
-from typing import Annotated
+from datetime import UTC, date, datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 VALID_PROVIDER_TYPES = {
     "homestay",
@@ -15,6 +15,7 @@ VALID_PROVIDER_TYPES = {
 PHONE_PATTERN = re.compile(r"^(?:\+94|0094|94)?(0?[1-9]\d{8})$")
 NIC_OLD_PATTERN = re.compile(r"^[0-9]{9}[VX]$")
 NIC_NEW_PATTERN = re.compile(r"^[0-9]{12}$")
+PASSPORT_PATTERN = re.compile(r"^[A-Z0-9]{6,12}$")
 
 
 def validate_sri_lankan_phone(phone_str: str) -> str:
@@ -39,14 +40,32 @@ def validate_sri_lankan_nic(nic_str: str) -> str:
     return cleaned
 
 
+def validate_passport(passport_str: str) -> str:
+    cleaned = passport_str.strip().upper()
+    if not PASSPORT_PATTERN.match(cleaned):
+        raise ValueError(
+            "Invalid passport format. Must be 6 to 12 alphanumeric characters without spaces or symbols."
+        )
+    return cleaned
+
+
 class PersonalDetailsRequest(BaseModel):
     full_name: Annotated[str, Field(min_length=2, max_length=150)]
     phone: str
-    nic_number: str
+    date_of_birth: date
+    gender: Annotated[str, Field(min_length=2, max_length=20)]
+    nationality: Annotated[str, Field(min_length=2, max_length=50)] = "Sri Lankan"
+    identity_document_type: Literal["nic", "passport"] = "nic"
+    nic_number: Annotated[
+        str,
+        Field(
+            description="Identity document number (Sri Lankan NIC or Passport number depending on identity_document_type)"
+        ),
+    ]
     permanent_province: Annotated[str, Field(min_length=2, max_length=100)]
     permanent_district: Annotated[str, Field(min_length=2, max_length=100)]
     permanent_city: Annotated[str, Field(min_length=2, max_length=100)]
-    permanent_landmark: Annotated[str | None, Field(default=None, max_length=255)] = None
+    permanent_landmark: Annotated[str, Field(min_length=5, max_length=255)]
     permanent_postal_code: Annotated[str, Field(min_length=3, max_length=20)]
 
     @field_validator("full_name")
@@ -62,26 +81,54 @@ class PersonalDetailsRequest(BaseModel):
     def validate_phone(cls, v: str) -> str:
         return validate_sri_lankan_phone(v)
 
+    @field_validator("date_of_birth")
+    @classmethod
+    def validate_dob(cls, v: date) -> date:
+        today = datetime.now(UTC).date()
+        if v >= today:
+            raise ValueError("Date of birth must be in the past.")
+        age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
+        if age < 18:
+            raise ValueError("Service provider primary contact must be at least 18 years old.")
+        return v
+
+    @field_validator("gender")
+    @classmethod
+    def validate_gender(cls, v: str) -> str:
+        cleaned = v.strip().title()
+        if cleaned not in {"Male", "Female", "Other"}:
+            raise ValueError("Gender must be one of 'Male', 'Female', or 'Other'.")
+        return cleaned
+
+    @field_validator("nationality")
+    @classmethod
+    def clean_demographic_strings(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Field cannot be empty or blank.")
+        return cleaned
+
     @field_validator("nic_number")
     @classmethod
-    def validate_nic(cls, v: str) -> str:
+    def validate_identity_number(cls, v: str, info: ValidationInfo) -> str:
+        doc_type = info.data.get("identity_document_type", "nic") if info.data else "nic"
+        if doc_type == "passport":
+            return validate_passport(v)
         return validate_sri_lankan_nic(v)
 
-    @field_validator("permanent_province", "permanent_district", "permanent_city", "permanent_postal_code")
+    @field_validator(
+        "permanent_province",
+        "permanent_district",
+        "permanent_city",
+        "permanent_landmark",
+        "permanent_postal_code",
+    )
     @classmethod
     def clean_required_strings(cls, v: str) -> str:
         cleaned = v.strip()
         if not cleaned:
             raise ValueError("Field cannot be empty or blank.")
         return cleaned
-
-    @field_validator("permanent_landmark")
-    @classmethod
-    def clean_optional_strings(cls, v: str | None) -> str | None:
-        if v is not None:
-            cleaned = v.strip()
-            return cleaned if cleaned else None
-        return None
 
 
 class BusinessDetailsRequest(BaseModel):
@@ -145,7 +192,11 @@ class DraftResponse(BaseModel):
     email: str
     full_name: str | None = None
     phone: str | None = None
+    identity_document_type: str = "nic"
     nic_number: str | None = None
+    date_of_birth: date | None = None
+    gender: str | None = None
+    nationality: str | None = None
     permanent_province: str | None = None
     permanent_district: str | None = None
     permanent_city: str | None = None

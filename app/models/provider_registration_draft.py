@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import DateTime, Integer, Unicode, func
+from sqlalchemy import Date, DateTime, Integer, Unicode, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.user import Base
@@ -30,9 +30,19 @@ class ProviderRegistrationDraft(Base):
 
     primary_phone: Mapped[str | None] = mapped_column(Unicode(25), nullable=True)
 
+    identity_document_type: Mapped[str] = mapped_column(
+        Unicode(20), nullable=False, default="nic"
+    )
+
     nic_number: Mapped[str | None] = mapped_column(
         Unicode(20), nullable=True, index=True
     )
+
+    date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    gender: Mapped[str | None] = mapped_column(Unicode(20), nullable=True)
+
+    nationality: Mapped[str | None] = mapped_column(Unicode(50), nullable=True)
 
     # Permanent Address
     permanent_province: Mapped[str | None] = mapped_column(

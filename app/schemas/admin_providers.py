@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -38,7 +38,11 @@ class ProviderDetailResponse(BaseModel):
 
     # Personal details
     phone: str
+    identity_document_type: str = "nic"
     nic_number: str | None = None
+    date_of_birth: date | None = None
+    gender: str | None = None
+    nationality: str | None = None
     permanent_province: str | None = None
     permanent_district: str | None = None
     permanent_city: str | None = None

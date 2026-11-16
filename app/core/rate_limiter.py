@@ -90,11 +90,95 @@ def get_default_forgot_password_rate_limiter() -> SlidingWindowRateLimiter:
     )
 
 
+def get_default_provider_otp_send_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_OTP_SEND_RATE_LIMIT", "5"))
+    window_seconds = int(os.getenv("PROVIDER_OTP_SEND_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many verification code requests. Please try again later.",
+    )
+
+
+def get_default_provider_otp_verify_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_OTP_VERIFY_RATE_LIMIT", "10"))
+    window_seconds = int(os.getenv("PROVIDER_OTP_VERIFY_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many verification attempts. Please try again later.",
+    )
+
+
+def get_default_provider_registration_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_REGISTRATION_RATE_LIMIT", "60"))
+    window_seconds = int(os.getenv("PROVIDER_REGISTRATION_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many registration requests. Please try again later.",
+    )
+
+
+def get_default_provider_identity_upload_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_IDENTITY_UPLOAD_RATE_LIMIT", "20"))
+    window_seconds = int(os.getenv("PROVIDER_IDENTITY_UPLOAD_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many upload attempts. Please try again later.",
+    )
+
+
+def get_default_provider_submit_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_SUBMIT_RATE_LIMIT", "10"))
+    window_seconds = int(os.getenv("PROVIDER_SUBMIT_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many submission attempts. Please try again later.",
+    )
+
+
+def get_default_provider_password_setup_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_PASSWORD_SETUP_RATE_LIMIT", "5"))
+    window_seconds = int(os.getenv("PROVIDER_PASSWORD_SETUP_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many password setup attempts. Please try again later.",
+    )
+
+
+def get_default_provider_login_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("PROVIDER_LOGIN_RATE_LIMIT", "5"))
+    window_seconds = int(os.getenv("PROVIDER_LOGIN_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many provider login attempts. Please try again later.",
+    )
+
+
 # Global instances for auth endpoints
 check_email_limiter = get_default_check_email_rate_limiter()
 forgot_password_limiter = get_default_forgot_password_rate_limiter()
+provider_otp_send_limiter = get_default_provider_otp_send_limiter()
+provider_otp_verify_limiter = get_default_provider_otp_verify_limiter()
+provider_registration_limiter = get_default_provider_registration_limiter()
+provider_identity_upload_limiter = get_default_provider_identity_upload_limiter()
+provider_submit_limiter = get_default_provider_submit_limiter()
+provider_password_setup_limiter = get_default_provider_password_setup_limiter()
+provider_login_limiter = get_default_provider_login_limiter()
 
 
 def reset_all_limiters() -> None:
     check_email_limiter.reset()
     forgot_password_limiter.reset()
+    provider_otp_send_limiter.reset()
+    provider_otp_verify_limiter.reset()
+    provider_registration_limiter.reset()
+    provider_identity_upload_limiter.reset()
+    provider_submit_limiter.reset()
+    provider_password_setup_limiter.reset()
+    provider_login_limiter.reset()

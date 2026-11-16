@@ -22,6 +22,7 @@ from app.core.security import (
 )
 from app.database.connection import get_db
 from app.models.password_reset import PasswordReset
+from app.models.provider_profile import ProviderProfile
 from app.models.user import User
 from app.schemas.auth import (
     CheckEmailRequest,
@@ -215,6 +216,29 @@ def login(
     # Query user by normalized email
     user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
 
+    # Enforce Provider onboarding and application status rules
+    if user and user.role == "provider":
+        profile = (
+            db.query(ProviderProfile)
+            .filter(ProviderProfile.user_id == user.id)
+            .first()
+        )
+        if not profile or profile.approval_status == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Provider application is pending admin review.",
+            )
+        if profile.approval_status == "rejected":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Provider application was rejected.",
+            )
+        if profile.approval_status == "approved" and user.password_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Provider account setup incomplete. Password setup required.",
+            )
+
     # Verify user exists and password matches
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(
@@ -272,6 +296,11 @@ def google_auth(
     user = db.query(User).filter(User.google_sub == google_sub).first()
 
     if user:
+        if user.role == "provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Google authentication is not supported for provider accounts.",
+            )
         if not user.is_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -282,6 +311,11 @@ def google_auth(
         existing_user = db.query(User).filter(func.lower(User.email) == email).first()
 
         if existing_user:
+            if existing_user.role == "provider":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Google authentication is not supported for provider accounts.",
+                )
             if not existing_user.is_active:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -379,6 +413,12 @@ def forgot_password(
 
     try:
         user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+        if user and user.is_active and user.role == "provider":
+            # Enforce that incomplete provider onboarding cannot use password reset
+            profile = db.query(ProviderProfile).filter_by(user_id=user.id).first()
+            if not profile or profile.approval_status != "approved" or user.password_hash is None:
+                user = None
+
         if user and user.is_active:
             # Invalidate any previously active unused tokens for this user
             db.query(PasswordReset).filter(
@@ -471,6 +511,14 @@ def verify_reset_token(
             detail="Invalid or expired password reset token.",
         )
 
+    if user.role == "provider":
+        profile = db.query(ProviderProfile).filter_by(user_id=user.id).first()
+        if not profile or profile.approval_status != "approved" or user.password_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password reset is not available for this provider account.",
+            )
+
     return VerifyResetTokenResponse(
         valid=True,
         email=user.email,
@@ -525,6 +573,14 @@ def reset_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired password reset token.",
         )
+
+    if user.role == "provider":
+        profile = db.query(ProviderProfile).filter_by(user_id=user.id).first()
+        if not profile or profile.approval_status != "approved" or user.password_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password reset is not available for this provider account.",
+            )
 
     hashed_password = hash_password(request.new_password)
 

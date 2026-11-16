@@ -9,10 +9,23 @@ load_dotenv(dotenv_path=_env_path)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers.admin_providers import (
+    router as admin_providers_router,
+)
 from app.routers.artisan_listings import router as artisan_listings_router
 from app.routers.auth import router as auth_router
+from app.routers.booking import router as booking_router
+from app.routers.homestay import router as homestay_router
+from app.routers.promotion import router as promotion_router
 from app.routers.promotions import router as promotions_router
+from app.routers.provider_auth import router as provider_auth_router
+from app.routers.provider_otp import router as provider_otp_router
+from app.routers.provider_registration import (
+    router as provider_registration_router,
+)
 from app.routers.showcase_items import router as showcase_items_router
+
+load_dotenv()
 
 app = FastAPI(
     title="CeylonGo API",
@@ -54,10 +67,25 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth_router)
+
+# Artisan module
 app.include_router(artisan_listings_router)
 app.include_router(showcase_items_router)
 app.include_router(promotions_router)
 
+# Homestay module
+app.include_router(homestay_router)
+app.include_router(booking_router)
+app.include_router(promotion_router)
+
+# Service Provider module
+app.include_router(provider_otp_router)
+app.include_router(provider_registration_router)
+app.include_router(admin_providers_router)
+app.include_router(provider_auth_router)
+
+app.include_router(booking_router)
+app.include_router(promotion_router)
 
 @app.get("/api/v1/health", tags=["Health"])
 def health_check():

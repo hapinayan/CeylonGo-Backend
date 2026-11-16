@@ -1,12 +1,18 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_env_path)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers.artisan_listings import router as artisan_listings_router
 from app.routers.auth import router as auth_router
-
-load_dotenv()
+from app.routers.promotions import router as promotions_router
+from app.routers.showcase_items import router as showcase_items_router
 
 app = FastAPI(
     title="CeylonGo API",
@@ -48,6 +54,9 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth_router)
+app.include_router(artisan_listings_router)
+app.include_router(showcase_items_router)
+app.include_router(promotions_router)
 
 
 @app.get("/api/v1/health", tags=["Health"])

@@ -567,4 +567,3 @@ def test_password_reset_cannot_activate_incomplete_provider(client: TestClient, 
     res = client.post("/api/v1/auth/forgot-password", json={"email": email})
     assert res.status_code == 200
     assert "If an account with that email exists" in res.json()["message"]
-

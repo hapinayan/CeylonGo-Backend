@@ -124,11 +124,14 @@ def test_save_personal_details_success(client: TestClient, db_session: Session):
     token = issue_test_auth_token(db_session, "newprovider@ceylongo.com")
     payload = {
         "full_name": "Kasun Perera",
+        "date_of_birth": "1995-06-15",
+        "gender": "Male",
         "phone": "0771234567",
         "nic_number": "200012345678",
         "permanent_province": "Central",
         "permanent_district": "Kandy",
         "permanent_city": "Kandy",
+        "permanent_landmark": "Near Main Road",
         "permanent_landmark": "Near Lake",
         "permanent_postal_code": "20000",
     }
@@ -137,6 +140,8 @@ def test_save_personal_details_success(client: TestClient, db_session: Session):
         json=payload,
         headers={"Authorization": f"Bearer {token}"},
     )
+    print("\nVALIDATION RESPONSE:", res.status_code, res.json())
+
     assert res.status_code == 200
     data = res.json()
     assert data["email"] == "newprovider@ceylongo.com"
@@ -163,11 +168,14 @@ def test_save_personal_details_validates_phone_formats(client: TestClient, db_se
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Test User",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "12345",
             "nic_number": "123456789V",
             "permanent_province": "Western",
             "permanent_district": "Colombo",
             "permanent_city": "Colombo",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "00100",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -179,11 +187,14 @@ def test_save_personal_details_validates_phone_formats(client: TestClient, db_se
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Test User",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "+94771234567",
             "nic_number": "123456789V",
             "permanent_province": "Western",
             "permanent_district": "Colombo",
             "permanent_city": "Colombo",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "00100",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -200,11 +211,14 @@ def test_save_personal_details_validates_nic_formats(client: TestClient, db_sess
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Test User",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "invalid_nic_123",
             "permanent_province": "Western",
             "permanent_district": "Colombo",
             "permanent_city": "Colombo",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "00100",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -216,11 +230,14 @@ def test_save_personal_details_validates_nic_formats(client: TestClient, db_sess
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Test User",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "987654321v",
             "permanent_province": "Western",
             "permanent_district": "Colombo",
             "permanent_city": "Colombo",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "00100",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -257,11 +274,14 @@ def test_save_personal_details_duplicate_nic_detected(client: TestClient, db_ses
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "New Applicant",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0779998888",
             "nic_number": "199012345678",
             "permanent_province": "Central",
             "permanent_district": "Kandy",
             "permanent_city": "Kandy",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "20000",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -330,11 +350,14 @@ def test_save_business_details_same_as_permanent(client: TestClient, db_session:
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Nimal Silva",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "199512345678",
             "permanent_province": "Southern",
             "permanent_district": "Galle",
             "permanent_city": "Unawatuna",
+            "permanent_landmark": "Near Main Road",
             "permanent_landmark": "Near Beach",
             "permanent_postal_code": "80600",
         },
@@ -485,11 +508,14 @@ def test_get_registration_draft_lifecycle(client: TestClient, db_session: Sessio
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Ruwan Perera",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "198812345678",
             "permanent_province": "Central",
             "permanent_district": "Matale",
             "permanent_city": "Dambulla",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "21100",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -604,11 +630,14 @@ def test_final_submit_missing_sections_blocked(client: TestClient, db_session: S
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Incomplete User",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "199112345678",
             "permanent_province": "Central",
             "permanent_district": "Kandy",
             "permanent_city": "Kandy",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "20000",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -632,11 +661,14 @@ def test_final_submit_success_new_provider(client: TestClient, db_session: Sessi
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Sunil Jayawardena",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771234567",
             "nic_number": "198512345678",
             "permanent_province": "Central",
             "permanent_district": "Kandy",
             "permanent_city": "Kandy",
+            "permanent_landmark": "Near Main Road",
             "permanent_landmark": "Temple Road",
             "permanent_postal_code": "20000",
         },
@@ -759,11 +791,14 @@ def test_final_submit_resubmission_rejected_provider(client: TestClient, db_sess
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Updated Provider Name",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0779998888",
             "nic_number": "198012345678",
             "permanent_province": "Central",
             "permanent_district": "Kandy",
             "permanent_city": "Kandy",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "20000",
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -822,11 +857,14 @@ def test_registration_cross_account_isolation(client: TestClient, db_session: Se
         "/api/v1/providers/registration/personal",
         json={
             "full_name": "Provider A",
+            "date_of_birth": "1995-06-15",
+            "gender": "Male",
             "phone": "0771111111",
             "nic_number": "199011111111",
             "permanent_province": "Western",
             "permanent_district": "Colombo",
             "permanent_city": "Colombo",
+            "permanent_landmark": "Near Main Road",
             "permanent_postal_code": "00100",
         },
         headers={"Authorization": f"Bearer {token_a}"},
@@ -936,4 +974,3 @@ def test_rejected_provider_wrong_purpose_blocked(client: TestClient, db_session:
     )
     assert res.status_code == 400
     assert "purpose for resubmission" in res.json()["detail"]
-

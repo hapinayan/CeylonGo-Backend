@@ -21,20 +21,20 @@ from app.models.user import User
 from app.schemas.promotion import (
     PromotionCreateRequest,
     PromotionListResponse,
-    PromotionResponse,
+    HomestayPromotionResponse,
     PromotionUpdateRequest,
 )
 
 
 router = APIRouter(
-    prefix="/api/v1/promotions",
+    prefix="/api/v1/homestay-promotions",
     tags=["Homestay Promotions"],
 )
 
 
 @router.post(
     "",
-    response_model=PromotionResponse,
+    response_model=HomestayPromotionResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def create_promotion(
@@ -90,7 +90,7 @@ def create_promotion(
 
 @router.put(
     "/{promotion_id}",
-    response_model=PromotionResponse,
+    response_model=HomestayPromotionResponse,
 )
 def update_promotion(
     promotion_id: int,

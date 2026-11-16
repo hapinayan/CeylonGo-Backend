@@ -1,11 +1,14 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker
 
-load_dotenv()
+# Load .env reliably from the backend root regardless of working directory
+_env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 DATABASE_URL = URL.create(
     "mssql+pyodbc",

@@ -42,8 +42,8 @@ def test_homestay_negative_price():
 
     assert response.status_code == 422
 
-def test_homestay_not_found():
-    response = client.get(
+def test_homestay_not_found(homestay_test_client):
+    response = homestay_test_client.get(
         "/api/v1/homestays/99999"
     )
 

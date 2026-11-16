@@ -34,6 +34,7 @@ from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
 
 from app.models.user import Base, User
+from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
 from app.models.provider_registration_draft import ProviderRegistrationDraft
 from app.models.provider_registration_authorization import ProviderRegistrationAuthorization
@@ -295,7 +296,7 @@ class TestPersonalDetailsValidation:
         assert "18 years old" in str(exc.value)
 
     def test_date_of_birth_exact_18_accepted(self):
-        today = date.today()
+        today = datetime.now(UTC).date()
         # Exactly 18 years old today
         exact_18 = date(today.year - 18, today.month, today.day)
         req = PersonalDetailsRequest(

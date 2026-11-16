@@ -97,7 +97,7 @@ def test_public_promotions_filter_by_homestay():
         try:
             with TestClient(app) as client:
                 response = client.get(
-                    "/api/v1/promotions",
+                    "/api/v1/homestay-promotions",
                     params={"homestay_id": homestay_a_id},
                 )
 

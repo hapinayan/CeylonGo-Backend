@@ -185,7 +185,7 @@ def test_owner_can_create_promotion_via_api():
 
         with TestClient(app) as client:
             response = client.post(
-                "/api/v1/promotions",
+                "/api/v1/homestay-promotions",
                 json={
                     "homestay_id": 1,
                     "title": "Weekend Special",
@@ -410,7 +410,7 @@ def test_owner_can_update_promotion_via_api():
     try:
         with TestClient(app) as client:
             response = client.put(
-                "/api/v1/promotions/1",
+                "/api/v1/homestay-promotions/1",
                 json={
                     "title": "Updated Special Offer",
                     "description": "Updated by owner",
@@ -566,7 +566,7 @@ def test_public_promotions_show_only_current_active_offers():
     try:
         with TestClient(app) as client:
             response = client.get(
-                "/api/v1/promotions"
+                "/api/v1/homestay-promotions"
             )
 
         assert response.status_code == 200, response.text
@@ -703,7 +703,7 @@ def test_owner_can_list_only_own_promotions():
     try:
         with TestClient(app) as client:
             response = client.get(
-                "/api/v1/promotions/mine"
+                "/api/v1/homestay-promotions/mine"
             )
 
         assert response.status_code == 200, response.text
@@ -750,7 +750,7 @@ def test_traveler_cannot_access_owner_promotions():
     try:
         with TestClient(app) as client:
             response = client.get(
-                "/api/v1/promotions/mine"
+                "/api/v1/homestay-promotions/mine"
             )
 
         assert response.status_code == 403
@@ -775,7 +775,7 @@ def test_unauthenticated_user_cannot_access_owner_promotions():
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/v1/promotions/mine"
+            "/api/v1/homestay-promotions/mine"
         )
 
     assert response.status_code == 401
@@ -855,7 +855,7 @@ def test_public_promotions_pagination():
     try:
         with TestClient(app) as client:
             response = client.get(
-                "/api/v1/promotions",
+                "/api/v1/homestay-promotions",
                 params={
                     "page": 2,
                     "page_size": 2,
@@ -898,7 +898,7 @@ def test_public_promotions_reject_invalid_pagination(params):
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/v1/promotions",
+            "/api/v1/homestay-promotions",
             params=params,
         )
 
@@ -988,7 +988,7 @@ def test_other_owner_cannot_update_promotion_via_api():
     try:
         with TestClient(app) as client:
             response = client.put(
-                "/api/v1/promotions/1",
+                "/api/v1/homestay-promotions/1",
                 json={
                     "title": "Unauthorized Update",
                     "description": "Should not be saved",
@@ -1126,7 +1126,7 @@ def test_owner_promotion_complete_flow():
 
         with TestClient(app) as client:
             create_response = client.post(
-                "/api/v1/promotions",
+                "/api/v1/homestay-promotions",
                 json={
                     "homestay_id": 1,
                     "title": "Integration Special",
@@ -1140,7 +1140,7 @@ def test_owner_promotion_complete_flow():
             assert create_response.status_code == 201, create_response.text
             promotion_id = create_response.json()["id"]
 
-            mine_response = client.get("/api/v1/promotions/mine")
+            mine_response = client.get("/api/v1/homestay-promotions/mine")
             assert mine_response.status_code == 200, mine_response.text
 
             assert any(
@@ -1149,7 +1149,7 @@ def test_owner_promotion_complete_flow():
             )
 
             update_response = client.put(
-                f"/api/v1/promotions/{promotion_id}",
+                f"/api/v1/homestay-promotions/{promotion_id}",
                 json={
                     "title": "Updated Integration Special",
                     "description": "Updated offer",
@@ -1164,7 +1164,7 @@ def test_owner_promotion_complete_flow():
             assert update_response.json()["title"] == "Updated Integration Special"
 
             public_response = client.get(
-                "/api/v1/promotions",
+                "/api/v1/homestay-promotions",
                 params={"homestay_id": 1},
             )
 

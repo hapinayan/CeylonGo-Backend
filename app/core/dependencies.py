@@ -365,6 +365,3 @@ def require_password_setup_authorization(
         )
 
     return auth_record, user, profile
-
-
-

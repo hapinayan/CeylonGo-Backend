@@ -13,7 +13,7 @@ def generate_six_digit_otp() -> str:
 def hash_provider_otp(email: str, otp: str) -> str:
     """
     Compute a keyed HMAC-SHA256 digest of the OTP bound to the recipient's normalized email.
-    
+
     Protects against precomputed dictionary/rainbow attacks and prevents raw OTP storage.
     """
     secret = get_jwt_secret_key().encode()
@@ -37,4 +37,3 @@ def generate_authorization_token() -> str:
 def hash_authorization_token(token: str) -> str:
     """Compute SHA-256 hex digest of the raw authorization token for safe storage."""
     return hashlib.sha256(token.strip().encode()).hexdigest()
-

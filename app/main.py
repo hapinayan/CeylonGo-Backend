@@ -84,9 +84,6 @@ app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
 
-app.include_router(booking_router)
-app.include_router(promotion_router)
-
 @app.get("/api/v1/health", tags=["Health"])
 def health_check():
     return {

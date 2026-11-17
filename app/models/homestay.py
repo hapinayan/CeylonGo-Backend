@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     Unicode,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
@@ -156,6 +157,14 @@ class HomestayImage(Base):
 
 class HomestayAmenity(Base):
     __tablename__ = "homestay_amenities"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "homestay_id",
+            "name",
+            name="UQ_homestay_amenities_name",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer,

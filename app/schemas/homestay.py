@@ -93,33 +93,54 @@ class HomestayCreateRequest(BaseModel):
                 "Name and location cannot be empty"
             )
 
-        cleaned_amenities = [
-            amenity.strip()
-            for amenity in self.amenities
-        ]
+        if self.amenities is not None:
+            cleaned_amenities = [
+                amenity.strip()
+                for amenity in self.amenities
+            ]
 
-        if any(
-            not amenity or len(amenity) > 100
-            for amenity in cleaned_amenities
-        ):
-            raise ValueError(
-                "Each amenity must contain 1 to 100 characters"
-            )
+            if any(
+                not amenity or len(amenity) > 100
+                for amenity in cleaned_amenities
+            ):
+                raise ValueError(
+                    "Each amenity must contain 1 to 100 characters"
+                )
 
-        if len(set(cleaned_amenities)) != len(cleaned_amenities):
-            raise ValueError(
-                "Duplicate amenities are not allowed"
-            )
+            seen_lower = set()
+            for amenity in cleaned_amenities:
+                if amenity.lower() in seen_lower:
+                    raise ValueError(
+                        "Duplicate amenities are not allowed"
+                    )
+                seen_lower.add(amenity.lower())
 
-        self.amenities = cleaned_amenities
+            self.amenities = cleaned_amenities
 
-        if sum(image.is_primary for image in self.images) > 1:
-            raise ValueError(
-                "Only one image can be primary"
-            )
+        if self.images is not None:
+            if sum(image.is_primary for image in self.images) > 1:
+                raise ValueError(
+                    "Only one image can be primary"
+                )
+
+            seen_urls = set()
+            for image in self.images:
+                cleaned_url = image.image_url.strip()
+                if not cleaned_url:
+                    raise ValueError(
+                        "Image URL cannot be empty"
+                    )
+                if cleaned_url in seen_urls:
+                    raise ValueError(
+                        "Duplicate image URLs are not allowed"
+                    )
+                seen_urls.add(cleaned_url)
+                image.image_url = cleaned_url
 
         return self
 
 
 class HomestayUpdateRequest(HomestayCreateRequest):
+    images: list[HomestayImageInput] | None = None
+    amenities: list[str] | None = None
     is_active: bool = True

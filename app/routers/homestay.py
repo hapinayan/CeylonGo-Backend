@@ -470,18 +470,56 @@ def update_homestay(
     homestay.max_guests = request.max_guests
     homestay.is_active = request.is_active
 
-    homestay.images = [
-        HomestayImage(
-            image_url=image.image_url,
-            is_primary=image.is_primary,
-        )
-        for image in request.images
-    ]
+    # Safe synchronization of images (preserves existing when omitted)
+    if request.images is not None:
+        existing_images_by_url = {img.image_url.strip(): img for img in homestay.images}
+        req_images_by_url = {img.image_url.strip(): img for img in request.images}
 
-    homestay.amenities = [
-        HomestayAmenity(name=amenity)
-        for amenity in request.amenities
-    ]
+        # Remove images no longer requested
+        for img_url, img_obj in list(existing_images_by_url.items()):
+            if img_url not in req_images_by_url:
+                homestay.images.remove(img_obj)
+                db.delete(img_obj)
+
+        # Update or add requested images
+        for img_input in request.images:
+            clean_url = img_input.image_url.strip()
+            if clean_url in existing_images_by_url:
+                existing_images_by_url[clean_url].is_primary = img_input.is_primary
+            else:
+                homestay.images.append(
+                    HomestayImage(
+                        image_url=clean_url,
+                        is_primary=img_input.is_primary,
+                    )
+                )
+
+    # Safe synchronization of amenities (avoids UQ_homestay_amenities_name constraint collision)
+    if request.amenities is not None:
+        existing_amenities_by_lower = {
+            a.name.strip().lower(): a for a in homestay.amenities
+        }
+
+        unique_req_amenities = {}
+        for a_name in request.amenities:
+            clean_name = a_name.strip()
+            if clean_name:
+                key = clean_name.lower()
+                if key not in unique_req_amenities:
+                    unique_req_amenities[key] = clean_name
+
+        req_keys = set(unique_req_amenities.keys())
+
+        # Remove amenities no longer requested
+        for key, a_obj in list(existing_amenities_by_lower.items()):
+            if key not in req_keys:
+                homestay.amenities.remove(a_obj)
+                db.delete(a_obj)
+
+        # Insert only genuinely new amenities; preserve existing ones in-place
+        for key, orig_name in unique_req_amenities.items():
+            if key not in existing_amenities_by_lower:
+                homestay.amenities.append(HomestayAmenity(name=orig_name))
 
     try:
         db.commit()

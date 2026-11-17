@@ -1,5 +1,20 @@
 
 from app.models.artisan_listing import ArtisanListing
+from app.models.eco_experience import (
+    EcoEvidence,
+    EcoExperience,
+    EcoExperienceImage,
+    EcoPractice,
+    EcoSafetyRule,
+    EcoSeasonRestriction,
+    EcoVerification,
+)
+from app.models.eco_promotion import (
+    EcoPromotionAnalytics,
+    EcoPromotionPackage,
+    EcoSponsoredPromotion,
+)
+from app.models.eco_wishlist import EcoWishlist
 from app.models.password_reset import PasswordReset
 from app.models.promotion import HomestayPromotion, Promotion
 from app.models.provider_email_otp import ProviderEmailOtp
@@ -14,6 +29,17 @@ from app.models.user import Base, User
 __all__ = [
     "ArtisanListing",
     "Base",
+    "EcoEvidence",
+    "EcoExperience",
+    "EcoExperienceImage",
+    "EcoPractice",
+    "EcoPromotionAnalytics",
+    "EcoPromotionPackage",
+    "EcoSafetyRule",
+    "EcoSeasonRestriction",
+    "EcoSponsoredPromotion",
+    "EcoVerification",
+    "EcoWishlist",
     "HomestayPromotion",
     "PasswordReset",
     "Promotion",

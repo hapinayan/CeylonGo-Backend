@@ -78,3 +78,50 @@ def generate_password_reset_token() -> str:
 def hash_reset_token(token: str) -> str:
     """Compute SHA-256 hex digest of the raw token for safe storage."""
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def create_sponsored_tracking_token(
+    campaign_id: int,
+    eco_experience_id: int,
+    expires_delta: timedelta | None = None,
+) -> str:
+    """
+    Generate a tamper-evident, time-limited cryptographic token for a visible
+    boosted sponsored placement. Forbids arbitrary provider-selected IDs or forgery.
+    """
+    if expires_delta is None:
+        expires_delta = timedelta(hours=2)
+    now = datetime.now(UTC)
+    payload = {
+        "sub": "sponsored_tracking",
+        "campaign_id": campaign_id,
+        "eco_experience_id": eco_experience_id,
+        "placement_type": "boosted",
+        "nonce": secrets.token_hex(16),
+        "iat": int(now.timestamp()),
+        "exp": int((now + expires_delta).timestamp()),
+    }
+    return jwt.encode(
+        payload, get_jwt_secret_key(), algorithm=get_jwt_algorithm()
+    )
+
+
+def verify_sponsored_tracking_token(token: str) -> dict[str, Any]:
+    """
+    Verify signature, expiration, and boosted placement claims of a tracking token.
+    Raises ValueError on invalid token.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            get_jwt_secret_key(),
+            algorithms=[get_jwt_algorithm()],
+        )
+    except jwt.PyJWTError as exc:
+        raise ValueError(f"Invalid tracking token: {str(exc)}") from exc
+
+    if payload.get("sub") != "sponsored_tracking":
+        raise ValueError("Invalid tracking token subject")
+    if payload.get("placement_type") != "boosted":
+        raise ValueError("Tracking only permitted for boosted sponsored placements")
+    return payload

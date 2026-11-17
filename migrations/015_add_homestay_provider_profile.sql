@@ -169,7 +169,6 @@ INNER JOIN dbo.provider_profiles p
 WHERE h.provider_profile_id IS NULL
   AND u.role <> 'admin'
   AND u.is_active = 1
-  AND p.is_active = 1
   AND p.provider_type = 'homestay'
   AND p.approval_status = 'approved';
 
@@ -199,7 +198,7 @@ INNER JOIN dbo.provider_profiles p ON p.user_id = h.owner_id
 WHERE h.provider_profile_id IS NULL
   AND u.role <> 'admin'
   AND p.provider_type = 'homestay'
-  AND (p.approval_status <> 'approved' OR p.is_active = 0 OR u.is_active = 0);
+  AND (p.approval_status <> 'approved' OR u.is_active = 0);
 
 -- Category [G]: Unmatched / orphan homestays (owner_id is NULL or user has no provider profile and is not admin)
 SELECT @UnmatchedOrphanCount = COUNT(*)

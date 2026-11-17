@@ -1480,3 +1480,177 @@ def test_inconsistent_ownership_relationship_handling(
     assert res_b_update.status_code == 403
     assert "cannot manage this homestay" in res_b_update.json()["detail"].lower()
 
+
+# -----------------------------------------------------------------------------
+# 21. Homestay Deactivation Safety (Active Booking Protection on PUT and DELETE)
+# -----------------------------------------------------------------------------
+
+def test_homestay_deactivation_blocked_by_active_booking_on_put_and_delete(
+    client: TestClient,
+    approved_homestay_provider_a: User,
+    traveler_user: User,
+    db_session: Session,
+):
+    headers_owner = auth_header(approved_homestay_provider_a)
+
+    # 1. Provider creates an active homestay
+    res_h = client.post(
+        "/api/v1/homestays",
+        json={
+            "name": "Deactivation Protection Villa",
+            "description": "Homestay with active upcoming bookings",
+            "location": "Mirissa",
+            "price_per_night": 12000.00,
+            "max_guests": 4,
+        },
+        headers=headers_owner,
+    )
+    assert res_h.status_code == 201
+    homestay_id = res_h.json()["id"]
+
+    # 2. Traveler creates a confirmed booking with upcoming checkout
+    today = date.today()
+    active_booking = Booking(
+        homestay_id=homestay_id,
+        user_id=traveler_user.id,
+        check_in=today + timedelta(days=2),
+        check_out=today + timedelta(days=5),
+        guests=2,
+        total_price=Decimal("36000.00"),
+        status="confirmed",
+    )
+    db_session.add(active_booking)
+    db_session.commit()
+
+    # 3. Provider attempts to deactivate via PUT -> Blocked (400)
+    res_put_deactivate = client.put(
+        f"/api/v1/homestays/{homestay_id}",
+        json={
+            "name": "Deactivation Protection Villa",
+            "description": "Attempting bypass via PUT",
+            "location": "Mirissa",
+            "price_per_night": 12000.00,
+            "max_guests": 4,
+            "is_active": False,
+            "images": [],
+            "amenities": [],
+        },
+        headers=headers_owner,
+    )
+    assert res_put_deactivate.status_code == 400
+    assert "active or upcoming confirmed bookings" in res_put_deactivate.json()["detail"].lower()
+
+    # 4. Provider attempts to deactivate via DELETE -> Blocked (400)
+    res_del = client.delete(f"/api/v1/homestays/{homestay_id}", headers=headers_owner)
+    assert res_del.status_code == 400
+    assert "active or upcoming confirmed bookings" in res_del.json()["detail"].lower()
+
+    # 5. Normal update keeping is_active=True succeeds (200)
+    res_put_normal = client.put(
+        f"/api/v1/homestays/{homestay_id}",
+        json={
+            "name": "Deactivation Protection Villa Updated",
+            "description": "Updating details while keeping active",
+            "location": "Mirissa",
+            "price_per_night": 13000.00,
+            "max_guests": 4,
+            "is_active": True,
+            "images": [],
+            "amenities": [],
+        },
+        headers=headers_owner,
+    )
+    assert res_put_normal.status_code == 200
+    assert res_put_normal.json()["is_active"] is True
+
+
+def test_homestay_deactivation_allowed_with_cancelled_or_past_booking(
+    client: TestClient,
+    approved_homestay_provider_a: User,
+    traveler_user: User,
+    db_session: Session,
+):
+    headers_owner = auth_header(approved_homestay_provider_a)
+
+    # 1. Provider creates an active homestay
+    res_h = client.post(
+        "/api/v1/homestays",
+        json={
+            "name": "Safe To Deactivate Villa",
+            "description": "Homestay with cancelled/past bookings only",
+            "location": "Ahangama",
+            "price_per_night": 9000.00,
+            "max_guests": 3,
+        },
+        headers=headers_owner,
+    )
+    assert res_h.status_code == 201
+    homestay_id = res_h.json()["id"]
+
+    today = date.today()
+
+    # 2. Add past booking (checkout in the past)
+    past_booking = Booking(
+        homestay_id=homestay_id,
+        user_id=traveler_user.id,
+        check_in=today - timedelta(days=10),
+        check_out=today - timedelta(days=5),
+        guests=2,
+        total_price=Decimal("45000.00"),
+        status="confirmed",
+    )
+    # 3. Add cancelled future booking
+    cancelled_booking = Booking(
+        homestay_id=homestay_id,
+        user_id=traveler_user.id,
+        check_in=today + timedelta(days=3),
+        check_out=today + timedelta(days=7),
+        guests=2,
+        total_price=Decimal("36000.00"),
+        status="cancelled",
+    )
+    db_session.add_all([past_booking, cancelled_booking])
+    db_session.commit()
+
+    # 4. Provider deactivates via PUT -> Allowed (200)
+    res_put_deactivate = client.put(
+        f"/api/v1/homestays/{homestay_id}",
+        json={
+            "name": "Safe To Deactivate Villa",
+            "description": "Deactivated safely",
+            "location": "Ahangama",
+            "price_per_night": 9000.00,
+            "max_guests": 3,
+            "is_active": False,
+            "images": [],
+            "amenities": [],
+        },
+        headers=headers_owner,
+    )
+    assert res_put_deactivate.status_code == 200
+    assert res_put_deactivate.json()["is_active"] is False
+
+    # 5. Reactivate homestay
+    res_reactivate = client.put(
+        f"/api/v1/homestays/{homestay_id}",
+        json={
+            "name": "Safe To Deactivate Villa",
+            "description": "Reactivated",
+            "location": "Ahangama",
+            "price_per_night": 9000.00,
+            "max_guests": 3,
+            "is_active": True,
+            "images": [],
+            "amenities": [],
+        },
+        headers=headers_owner,
+    )
+    assert res_reactivate.status_code == 200
+    assert res_reactivate.json()["is_active"] is True
+
+    # 6. Provider deactivates via DELETE -> Allowed (200)
+    res_del = client.delete(f"/api/v1/homestays/{homestay_id}", headers=headers_owner)
+    assert res_del.status_code == 200
+    assert res_del.json()["is_active"] is False
+
+

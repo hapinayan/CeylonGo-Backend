@@ -255,10 +255,19 @@ class TestTargetDatabaseValidation:
     def test_verify_target_database_mismatch_raises(self):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = ("wrong_db", "PRODUCTION-CLUSTER")
+        mock_conn.cursor.return_value = mock_cursor
+
+        with pytest.raises(TargetDatabaseMismatchError, match="connected to 'wrong_db'"):
+            verify_target_database(mock_conn, "CeylonGoDB")
+
+    def test_verify_target_database_system_db_rejected(self):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
         mock_cursor.fetchone.return_value = ("master", "PRODUCTION-CLUSTER")
         mock_conn.cursor.return_value = mock_cursor
 
-        with pytest.raises(TargetDatabaseMismatchError, match="connected to 'master'"):
+        with pytest.raises(TargetDatabaseMismatchError, match="Connected to system database 'master'"):
             verify_target_database(mock_conn, "CeylonGoDB")
 
 
@@ -271,27 +280,20 @@ class TestBaselineSchemaVerification:
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
 
-        # Mock responses for all checks in verify_baseline_schema
-        # 1. password_resets exists (101)
-        # 2. token_hash exists (64)
-        # 3. users exists (102)
-        # 4. google_sub exists (255)
-        # 5. provider_profiles exists (103)
-        # 6. provider_type exists (30)
-        # 7. UQ_provider_profiles_user_id exists (row)
-        # 8. provider_email_otps exists (104)
-        # 9. provider_registration_authorizations exists (105)
-        # 10. nic_number exists (20)
-        # 11. provider_registration_drafts exists (106)
-        # 12. gender exists (10)
-        # 13. date_of_birth exists (10)
+        # Mock responses for all checks in enhanced verify_baseline_schema
+        # 001: password_resets exists, token_hash, expires_at, FK, index
+        # 002: users exists, google_sub, unique index
+        # 003: provider_profiles exists, provider_type, approval_status, UQ user_id, FK, CK type, CK approval
+        # 004: provider_email_otps, provider_registration_authorizations, nic_number, permanent_province
+        # 005: provider_registration_drafts
+        # 006: gender, date_of_birth, permanent_landmark
         mock_cursor.fetchone.side_effect = [
-            (101,), (64,),      # 001
-            (102,), (255,),     # 002
-            (103,), (30,), (1,),# 003
-            (104,), (105,), (20,), # 004
-            (106,),             # 005
-            (10,), (10,),       # 006
+            (101,), (64,), (10,), (1,), (1,),           # 001
+            (102,), (255,), (1,),                        # 002
+            (103,), (30,), (20,), (1,), (1,), (1,), (1,),# 003
+            (104,), (105,), (20,), (100,),               # 004
+            (106,),                                      # 005
+            (10,), (10,), (255,),                        # 006
         ]
         mock_conn.cursor.return_value = mock_cursor
 
@@ -305,12 +307,12 @@ class TestBaselineSchemaVerification:
 
         # Simulate missing date_of_birth (006)
         mock_cursor.fetchone.side_effect = [
-            (101,), (64,),
-            (102,), (255,),
-            (103,), (30,), (1,),
-            (104,), (105,), (20,),
+            (101,), (64,), (10,), (1,), (1,),
+            (102,), (255,), (1,),
+            (103,), (30,), (20,), (1,), (1,), (1,), (1,),
+            (104,), (105,), (20,), (100,),
             (106,),
-            (10,), None,  # date_of_birth is None
+            (10,), None, (255,),  # date_of_birth is None
         ]
         mock_conn.cursor.return_value = mock_cursor
 

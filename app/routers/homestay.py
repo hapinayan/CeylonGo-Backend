@@ -446,6 +446,23 @@ def update_homestay(
     ):
         homestay.provider_profile_id = profile.id
 
+    # Prevent deactivation if active or upcoming confirmed bookings exist
+    if not request.is_active and homestay.is_active:
+        active_bookings = (
+            db.query(Booking)
+            .filter(
+                Booking.homestay_id == homestay_id,
+                Booking.status == "confirmed",
+                Booking.check_out >= date.today(),
+            )
+            .count()
+        )
+        if active_bookings > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deactivate homestay with active or upcoming confirmed bookings",
+            )
+
     homestay.name = request.name
     homestay.description = request.description
     homestay.location = request.location

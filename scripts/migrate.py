@@ -403,16 +403,23 @@ class DatabaseConfig:
     password: str | None = None
     driver: str = "ODBC Driver 18 for SQL Server"
     trust_server_certificate: str = "yes"
-    connection_timeout: int = 15
+    connection_timeout: int = 60
+    expected_server: str | None = None
 
     @classmethod
-    def from_env(cls, env_path: Path | str | None = None) -> DatabaseConfig:
+    def from_env(cls, env_path: Path | str | None = None, database_override: str | None = None) -> DatabaseConfig:
         """Reads configuration from environment variables or .env file."""
+        if env_path is None:
+            if Path(".env").is_file():
+                env_path = Path(".env")
+            elif (Path(__file__).resolve().parent.parent / ".env").is_file():
+                env_path = Path(__file__).resolve().parent.parent / ".env"
+
         if env_path and Path(env_path).is_file():
             _load_env_file(Path(env_path))
 
         server = os.getenv("DB_SERVER", r".\SQLEXPRESS")
-        database = os.getenv("DB_NAME", "CeylonGoDB")
+        database = database_override or os.getenv("DB_NAME", "CeylonGoDB")
         user = os.getenv("DB_USER") or None
         password = os.getenv("DB_PASSWORD") or None
         driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
@@ -425,6 +432,7 @@ class DatabaseConfig:
             password=password,
             driver=driver,
             trust_server_certificate=trust_cert,
+            expected_server=server,
         )
 
     def build_connection_string(self) -> str:
@@ -434,7 +442,6 @@ class DatabaseConfig:
             f"SERVER={self.server}",
             f"DATABASE={self.database}",
             f"TrustServerCertificate={self.trust_server_certificate}",
-            f"Timeout={self.connection_timeout}",
         ]
         if self.user and self.password:
             parts.append(f"UID={self.user}")
@@ -466,25 +473,50 @@ def get_connection(config: DatabaseConfig):
     """Establishes an active pyodbc connection."""
     import pyodbc
     conn_str = config.build_connection_string()
-    return pyodbc.connect(conn_str, autocommit=False)
+    return pyodbc.connect(conn_str, timeout=config.connection_timeout, autocommit=False)
 
 
-def verify_target_database(connection, expected_database: str) -> str:
+DISALLOWED_SYSTEM_DATABASES = {"master", "tempdb", "model", "msdb"}
+
+
+def verify_target_database(connection, expected_database: str, expected_server: str | None = None) -> str:
     """
-    Verifies that the current connection is connected to the expected database.
-    Raises TargetDatabaseMismatchError if there is a mismatch.
+    Verifies that the current connection is connected to the expected database
+    and SQL Server instance. Prevents accidental execution against system
+    databases or mismatched instances.
     """
     cursor = connection.cursor()
-    cursor.execute("SELECT DB_NAME() AS current_db, @@SERVERNAME AS server_name;")
+    cursor.execute("SELECT DB_NAME() AS current_db, @@SERVERNAME AS server_name, CAST(SERVERPROPERTY('MachineName') AS NVARCHAR(100)) AS machine_name, CAST(SERVERPROPERTY('InstanceName') AS NVARCHAR(100)) AS instance_name;")
     row = cursor.fetchone()
-    current_db = row[0] if row else ""
-    server_name = row[1] if row else ""
+    current_db = str(row[0]) if row and len(row) > 0 and row[0] else ""
+    server_name = str(row[1]) if row and len(row) > 1 and row[1] else ""
+    machine_name = str(row[2]) if row and len(row) > 2 and row[2] else ""
+    instance_name = str(row[3]) if row and len(row) > 3 and row[3] else ""
+
+    if current_db.lower() in DISALLOWED_SYSTEM_DATABASES:
+        raise TargetDatabaseMismatchError(
+            f"Execution rejected: Connected to system database '{current_db}'. "
+            f"Migrations must never target system databases."
+        )
 
     if current_db.lower() != expected_database.lower():
         raise TargetDatabaseMismatchError(
             f"Target database mismatch: connected to '{current_db}' on '{server_name}', "
             f"but expected '{expected_database}'. Execution aborted for safety."
         )
+
+    if expected_server:
+        clean_exp = expected_server.strip(r".\ ").lower()
+        clean_srv = server_name.strip(r".\ ").lower()
+        # Check instance match if expected_server contains instance name (e.g. SQLEXPRESS)
+        if "\\" in expected_server:
+            exp_inst = expected_server.split("\\", 1)[1].lower()
+            if instance_name and instance_name.lower() != exp_inst and exp_inst not in clean_srv:
+                raise TargetDatabaseMismatchError(
+                    f"Target SQL Server instance mismatch: connected to instance '{instance_name}', "
+                    f"expected '{exp_inst}'. Execution aborted."
+                )
+
     return current_db
 
 
@@ -620,34 +652,72 @@ def _col_exists(cursor, table_name: str, col_name: str) -> bool:
     return bool(row and row[0] is not None)
 
 
+def _fk_exists(cursor, table_name: str, fk_name: str) -> bool:
+    cursor.execute("""
+        SELECT 1 FROM sys.foreign_keys
+        WHERE name = ? AND parent_object_id = OBJECT_ID(?);
+    """, (fk_name, table_name))
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
+
+
+def _index_exists(cursor, table_name: str, index_name: str) -> bool:
+    cursor.execute("""
+        SELECT 1 FROM sys.indexes
+        WHERE name = ? AND object_id = OBJECT_ID(?);
+    """, (index_name, table_name))
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
+
+
+def _check_constraint_exists(cursor, table_name: str, constraint_name: str) -> bool:
+    cursor.execute("""
+        SELECT 1 FROM sys.check_constraints
+        WHERE name = ? AND parent_object_id = OBJECT_ID(?);
+    """, (constraint_name, table_name))
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
+
+
 def verify_baseline_schema(connection) -> tuple[bool, list[str]]:
     """
     Inspects live database schema to confirm that migrations 001-006 structures exist.
+    Validates tables, columns, nullability, foreign keys, indexes, and check constraints.
     Returns (True, []) if verified, or (False, missing_items) if any check fails.
     """
     cursor = connection.cursor()
     missing: list[str] = []
 
-    # 001: dbo.password_resets table and columns
+    # 001: dbo.password_resets table, columns, FK, and index
     if not _table_exists(cursor, "dbo.password_resets"):
         missing.append("001: Table dbo.password_resets missing")
     else:
         if not _col_exists(cursor, "dbo.password_resets", "token_hash"):
             missing.append("001: Column dbo.password_resets.token_hash missing")
+        if not _col_exists(cursor, "dbo.password_resets", "expires_at"):
+            missing.append("001: Column dbo.password_resets.expires_at missing")
+        if not _fk_exists(cursor, "dbo.password_resets", "FK_password_resets_users"):
+            missing.append("001: Foreign key FK_password_resets_users missing")
+        if not _index_exists(cursor, "dbo.password_resets", "IX_password_resets_token_hash"):
+            missing.append("001: Index IX_password_resets_token_hash missing")
 
-    # 002: dbo.users table and google_sub column
+    # 002: dbo.users table, google_sub column, nullable password_hash, unique index
     if not _table_exists(cursor, "dbo.users"):
         missing.append("002: Table dbo.users missing")
     else:
         if not _col_exists(cursor, "dbo.users", "google_sub"):
             missing.append("002: Column dbo.users.google_sub missing")
+        if not _index_exists(cursor, "dbo.users", "UQ_users_google_sub"):
+            missing.append("002: Unique index UQ_users_google_sub missing")
 
-    # 003: dbo.provider_profiles table, category/provider_type, and UQ_provider_profiles_user_id
+    # 003: dbo.provider_profiles table, category/provider_type, constraints & indexes
     if not _table_exists(cursor, "dbo.provider_profiles"):
         missing.append("003: Table dbo.provider_profiles missing")
     else:
         if not _col_exists(cursor, "dbo.provider_profiles", "provider_type"):
             missing.append("003: Column dbo.provider_profiles.provider_type missing")
+        if not _col_exists(cursor, "dbo.provider_profiles", "approval_status"):
+            missing.append("003: Column dbo.provider_profiles.approval_status missing")
         cursor.execute("""
             SELECT 1 FROM sys.indexes i
             INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
@@ -659,6 +729,12 @@ def verify_baseline_schema(connection) -> tuple[bool, list[str]]:
         row = cursor.fetchone()
         if not (row and row[0] is not None):
             missing.append("003: Unique constraint on dbo.provider_profiles(user_id) missing")
+        if not _fk_exists(cursor, "dbo.provider_profiles", "FK_provider_profiles_users"):
+            missing.append("003: Foreign key FK_provider_profiles_users missing")
+        if not _check_constraint_exists(cursor, "dbo.provider_profiles", "CK_provider_profiles_type"):
+            missing.append("003: Check constraint CK_provider_profiles_type missing")
+        if not _check_constraint_exists(cursor, "dbo.provider_profiles", "CK_provider_profiles_approval"):
+            missing.append("003: Check constraint CK_provider_profiles_approval missing")
 
     # 004: extended provider profile columns & auth tables
     if not _table_exists(cursor, "dbo.provider_email_otps"):
@@ -669,6 +745,8 @@ def verify_baseline_schema(connection) -> tuple[bool, list[str]]:
 
     if not _col_exists(cursor, "dbo.provider_profiles", "nic_number"):
         missing.append("004: Column dbo.provider_profiles.nic_number missing")
+    if not _col_exists(cursor, "dbo.provider_profiles", "permanent_province"):
+        missing.append("004: Column dbo.provider_profiles.permanent_province missing")
 
     # 005: provider registration drafts
     if not _table_exists(cursor, "dbo.provider_registration_drafts"):
@@ -677,9 +755,10 @@ def verify_baseline_schema(connection) -> tuple[bool, list[str]]:
     # 006: personal details fields
     if not _col_exists(cursor, "dbo.provider_profiles", "gender"):
         missing.append("006: Column dbo.provider_profiles.gender missing")
-
     if not _col_exists(cursor, "dbo.provider_profiles", "date_of_birth"):
         missing.append("006: Column dbo.provider_profiles.date_of_birth missing")
+    if not _col_exists(cursor, "dbo.provider_profiles", "permanent_landmark"):
+        missing.append("006: Column dbo.provider_profiles.permanent_landmark missing")
 
     return (len(missing) == 0, missing)
 
@@ -898,17 +977,24 @@ def cmd_upgrade(
             ensure_schema_migrations_table(conn)
             applied = get_applied_migrations(conn)
 
-            # 1. Verify checksums of previously applied migrations
-            for m in migrations:
-                if m.version in applied:
-                    rec = applied[m.version]
-                    if rec.checksum != m.checksum:
-                        raise ChecksumMismatchError(
-                            f"Applied migration {m.version} ({m.filename}) checksum mismatch!\n"
-                            f"Recorded in DB: {rec.checksum}\n"
-                            f"File on disk  : {m.checksum}\n"
-                            f"Execution aborted to prevent database corruption."
-                        )
+            # 1. Verify unknown migrations in DB history and verify checksums
+            discovered_map = {m.version: m for m in migrations}
+            for ver, rec in applied.items():
+                if ver not in discovered_map:
+                    raise MigrationError(
+                        f"Unknown migration version '{ver}' recorded in database history but missing from disk."
+                    )
+                if rec.filename != discovered_map[ver].filename:
+                    raise MigrationError(
+                        f"Migration {ver} filename mismatch: DB recorded '{rec.filename}', disk has '{discovered_map[ver].filename}'."
+                    )
+                if rec.checksum != discovered_map[ver].checksum:
+                    raise ChecksumMismatchError(
+                        f"Applied migration {ver} ({rec.filename}) checksum mismatch!\n"
+                        f"Recorded in DB: {rec.checksum}\n"
+                        f"File on disk  : {discovered_map[ver].checksum}\n"
+                        f"Execution aborted to prevent database corruption."
+                    )
 
             # 2. Determine pending migrations
             pending = [m for m in migrations if m.version not in applied]
@@ -918,6 +1004,28 @@ def cmd_upgrade(
             if not pending:
                 print(f"\n[UP TO DATE] Database '{current_db}' has no pending migrations.")
                 return 0
+
+            # 3. Check for untracked tables from pending migrations
+            cursor = conn.cursor()
+            pending_tables_map = {
+                "007": ["dbo.homestays", "dbo.homestay_images"],
+                "008": ["dbo.homestay_amenities"],
+                "010": ["dbo.homestay_bookings"],
+                "011": ["dbo.homestay_promotions"],
+                "012": ["dbo.artisan_listings"],
+                "013": ["dbo.showcase_items"],
+                "014": ["dbo.artisan_promotions"],
+            }
+            untracked_conflicts: list[str] = []
+            for m in pending:
+                if m.version in pending_tables_map:
+                    for tbl in pending_tables_map[m.version]:
+                        if _table_exists(cursor, tbl):
+                            untracked_conflicts.append(f"Table '{tbl}' already exists in database, but migration {m.version} is pending.")
+            if untracked_conflicts:
+                for conf in untracked_conflicts:
+                    print(f"  [CONFLICT] {conf}")
+                raise MigrationError("Existing untracked tables detected. Explicit reconciliation required before upgrading.")
 
             print(f"\nStarting upgrade of '{current_db}' ({len(pending)} pending migrations)...")
 
@@ -981,6 +1089,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to .env configuration file (default: looks in working dir).",
     )
     parser.add_argument(
+        "--database",
+        type=str,
+        default=None,
+        help="Target database name override (e.g. CeylonGoDB_Rehearsal).",
+    )
+    parser.add_argument(
+        "--server",
+        type=str,
+        default=None,
+        help="Target server instance override.",
+    )
+    parser.add_argument(
         "--migrations-dir",
         type=str,
         default=None,
@@ -1014,6 +1134,7 @@ def build_parser() -> argparse.ArgumentParser:
     up_p.add_argument("--target", type=str, default=None, help="Target version to migrate up to.")
     up_p.add_argument("--dry-run", action="store_true", help="Preview plan without executing.")
     up_p.add_argument("--yes", action="store_true", help="Confirm execution of pending migrations.")
+    up_p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose batch output.")
 
     return parser
 
@@ -1032,7 +1153,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     env_file = Path(args.env_file) if args.env_file else base_dir / ".env"
     migrations_dir = Path(args.migrations_dir) if args.migrations_dir else base_dir / "migrations"
 
-    config = DatabaseConfig.from_env(env_file if env_file.is_file() else None)
+    config = DatabaseConfig.from_env(env_file if env_file.is_file() else None, database_override=args.database)
+    if args.server:
+        config.server = args.server
+        config.expected_server = args.server
 
     try:
         if args.command == "status":

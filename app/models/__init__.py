@@ -1,4 +1,8 @@
 
+from app.models.activity import Activity
+from app.models.activity_booking import ActivityBooking
+from app.models.activity_image import ActivityImage
+from app.models.activity_slot import ActivitySlot
 from app.models.artisan_listing import ArtisanListing
 from app.models.eco_experience import (
     EcoEvidence,
@@ -39,6 +43,10 @@ from app.models.rental_booking import RentalBooking
 
 
 __all__ = [
+    "Activity",
+    "ActivityBooking",
+    "ActivityImage",
+    "ActivitySlot",
     "ArtisanListing",
     "Base",
     "EcoEvidence",

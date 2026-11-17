@@ -22,6 +22,15 @@ from app.routers.artisan_listings import (
 )
 from app.routers.auth import router as auth_router
 from app.routers.booking import router as booking_router
+from app.routers.eco_experiences import (
+    admin_eco_router,
+    router as eco_experiences_router,
+    uploads_router,
+)
+from app.routers.eco_promotions import (
+    admin_eco_promotions_router,
+    eco_promotions_router,
+)
 from app.routers.homestay import router as homestay_router
 from app.routers.promotion import router as promotion_router
 from app.routers.promotions import router as promotions_router
@@ -33,10 +42,11 @@ from app.routers.provider_registration import (
 from app.routers.showcase_items import (
     router as showcase_items_router,
 )
+from app.routers.wishlists import router as wishlists_router
 
-# ==========================================
+# ============================================
 # RENTAL MODULE ROUTER IMPORTS
-# ==========================================
+# ============================================
 
 from app.routers.rental_vehicles import (
     router as rental_vehicles_router,
@@ -44,7 +54,6 @@ from app.routers.rental_vehicles import (
 from app.routers.rental_bookings import (
     router as rental_bookings_router,
 )
-
 
 load_dotenv()
 
@@ -145,6 +154,16 @@ app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
 
+# Eco-Tourism module (M04)
+app.include_router(eco_experiences_router)
+app.include_router(admin_eco_router)
+app.include_router(uploads_router)
+app.include_router(wishlists_router)
+app.include_router(eco_promotions_router)
+app.include_router(admin_eco_promotions_router)
+
+app.include_router(booking_router)
+app.include_router(promotion_router)
 
 # ==========================================
 # RENTAL MODULE

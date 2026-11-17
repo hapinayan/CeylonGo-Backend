@@ -1,3 +1,4 @@
+
 import os
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.admin_providers import (
     router as admin_providers_router,
 )
-from app.routers.artisan_listings import router as artisan_listings_router
+from app.routers.artisan_listings import (
+    router as artisan_listings_router,
+)
 from app.routers.auth import router as auth_router
 from app.routers.booking import router as booking_router
 from app.routers.homestay import router as homestay_router
@@ -23,7 +26,23 @@ from app.routers.provider_otp import router as provider_otp_router
 from app.routers.provider_registration import (
     router as provider_registration_router,
 )
-from app.routers.showcase_items import router as showcase_items_router
+from app.routers.showcase_items import (
+    router as showcase_items_router,
+)
+
+# Module 03 - Activities & Experiences
+from app.routers.provider_activities import (
+    router as provider_activities_router,
+)
+from app.routers.admin_activities import (
+    router as admin_activities_router,
+)
+from app.routers.activity_slots import (
+    router as activity_slots_router,
+)
+from app.routers.activity_bookings import (
+    router as activity_bookings_router,
+)
 
 load_dotenv()
 
@@ -40,13 +59,17 @@ def get_allowed_origins() -> list[str]:
         "http://localhost:4200",
         "http://127.0.0.1:4200",
     ]
-    # Read additional comma-separated origins from environment configuration
+
+    # Read additional comma-separated origins
     custom_origins = os.getenv("CORS_ORIGINS", "")
+
     if custom_origins:
         for origin in custom_origins.split(","):
             cleaned = origin.strip()
+
             if cleaned and cleaned not in origins:
                 origins.append(cleaned)
+
     return origins
 
 
@@ -55,7 +78,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+        "OPTIONS",
+    ],
     allow_headers=[
         "Authorization",
         "Content-Type",
@@ -65,7 +95,10 @@ app.add_middleware(
     ],
 )
 
+
 # Register routers
+
+# Authentication
 app.include_router(auth_router)
 
 # Artisan module
@@ -84,8 +117,16 @@ app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
 
+# Existing registrations - preserved
 app.include_router(booking_router)
 app.include_router(promotion_router)
+
+# Module 03 - Activities & Experiences
+app.include_router(provider_activities_router)
+app.include_router(admin_activities_router)
+app.include_router(activity_slots_router)
+app.include_router(activity_bookings_router)
+
 
 @app.get("/api/v1/health", tags=["Health"])
 def health_check():

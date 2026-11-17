@@ -131,7 +131,6 @@ def test_save_personal_details_success(client: TestClient, db_session: Session):
         "permanent_province": "Central",
         "permanent_district": "Kandy",
         "permanent_city": "Kandy",
-        "permanent_landmark": "Near Main Road",
         "permanent_landmark": "Near Lake",
         "permanent_postal_code": "20000",
     }
@@ -140,7 +139,6 @@ def test_save_personal_details_success(client: TestClient, db_session: Session):
         json=payload,
         headers={"Authorization": f"Bearer {token}"},
     )
-    print("\nVALIDATION RESPONSE:", res.status_code, res.json())
 
     assert res.status_code == 200
     data = res.json()
@@ -357,7 +355,6 @@ def test_save_business_details_same_as_permanent(client: TestClient, db_session:
             "permanent_province": "Southern",
             "permanent_district": "Galle",
             "permanent_city": "Unawatuna",
-            "permanent_landmark": "Near Main Road",
             "permanent_landmark": "Near Beach",
             "permanent_postal_code": "80600",
         },
@@ -668,7 +665,6 @@ def test_final_submit_success_new_provider(client: TestClient, db_session: Sessi
             "permanent_province": "Central",
             "permanent_district": "Kandy",
             "permanent_city": "Kandy",
-            "permanent_landmark": "Near Main Road",
             "permanent_landmark": "Temple Road",
             "permanent_postal_code": "20000",
         },

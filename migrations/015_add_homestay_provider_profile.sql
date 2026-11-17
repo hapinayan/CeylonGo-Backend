@@ -108,40 +108,57 @@ GO
 -- Batch 4: Safe, Idempotent Backfill & Non-Overlapping Discrepancy Audit
 -- -----------------------------------------------------------------------------
 -- Invariant Rules:
--- 1. Explicitly exclude administrator-owned listings (u.role = 'admin').
--- 2. Backfill ONLY unambiguous, valid homestay providers (provider_type = 'homestay' AND approval_status = 'approved').
--- 3. Preserve existing non-null provider_profile_id values unless an inconsistency is detected.
--- 4. Do not backfill artisan or unrelated provider profiles.
--- 5. Audit and report mutually exclusive, non-overlapping categories.
+-- 1. Verify UQ_provider_profiles_user_id unique constraint exists before backfilling.
+-- 2. Explicitly exclude administrator-owned listings (u.role = 'admin').
+-- 3. Backfill ONLY unambiguous, active, valid homestay providers:
+--    (provider_type = 'homestay' AND approval_status = 'approved' AND is_active = 1).
+-- 4. Preserve existing non-null provider_profile_id values unless an inconsistency is detected.
+-- 5. Do not backfill artisan or unrelated provider profiles.
+-- 6. Audit and report mutually exclusive, non-overlapping categories ([A] through [G]).
 -- -----------------------------------------------------------------------------
+
+-- Pre-condition check: verify uniqueness on dbo.provider_profiles(user_id)
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes i
+    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+    WHERE i.object_id = OBJECT_ID('dbo.provider_profiles')
+      AND i.is_unique = 1
+      AND c.name = 'user_id'
+)
+BEGIN
+    RAISERROR('Pre-condition failed: dbo.provider_profiles must have a UNIQUE constraint on user_id.', 16, 1);
+    RETURN;
+END;
 
 DECLARE @TotalHomestaysCount INT = 0;
 DECLARE @AlreadyConsistentCount INT = 0;
 DECLARE @NewlyBackfilledCount INT = 0;
 DECLARE @PreservedAdminCount INT = 0;
 DECLARE @MismatchedTypeCount INT = 0;
-DECLARE @UnapprovedStatusCount INT = 0;
+DECLARE @UnapprovedOrInactiveStatusCount INT = 0;
 DECLARE @InconsistentMismatchedLinks INT = 0;
 DECLARE @UnmatchedOrphanCount INT = 0;
 
 -- Count total homestay records
 SELECT @TotalHomestaysCount = COUNT(*) FROM dbo.homestays;
 
--- Category 1: Inconsistent existing links (provider_profile_id exists, but points to wrong user or invalid profile)
-SELECT @InconsistentMismatchedLinks = COUNT(*)
-FROM dbo.homestays h
-INNER JOIN dbo.provider_profiles p ON p.id = h.provider_profile_id
-WHERE h.owner_id IS NOT NULL
-  AND p.user_id <> h.owner_id;
-
--- Category 2: Already linked and consistent prior to backfill
+-- Category [A]: Already linked and consistent prior to backfill
 SELECT @AlreadyConsistentCount = COUNT(*)
 FROM dbo.homestays h
 INNER JOIN dbo.provider_profiles p ON p.id = h.provider_profile_id
 WHERE h.owner_id IS NOT NULL
   AND p.user_id = h.owner_id;
 
--- Execute Backfill: Link ONLY unlinked homestays owned by approved homestay providers (excluding admin)
+-- Category [F]: Inconsistent existing links (provider_profile_id exists, but points to wrong user, missing user, or invalid profile)
+SELECT @InconsistentMismatchedLinks = COUNT(*)
+FROM dbo.homestays h
+LEFT JOIN dbo.provider_profiles p ON p.id = h.provider_profile_id
+WHERE h.provider_profile_id IS NOT NULL
+  AND (h.owner_id IS NULL OR p.id IS NULL OR p.user_id <> h.owner_id);
+
+-- Execute Backfill: Link ONLY unlinked homestays owned by active, approved homestay providers (excluding admin)
 UPDATE h
 SET h.provider_profile_id = p.id
 FROM dbo.homestays h
@@ -151,19 +168,21 @@ INNER JOIN dbo.provider_profiles p
     ON p.user_id = h.owner_id
 WHERE h.provider_profile_id IS NULL
   AND u.role <> 'admin'
+  AND u.is_active = 1
+  AND p.is_active = 1
   AND p.provider_type = 'homestay'
   AND p.approval_status = 'approved';
 
 SET @NewlyBackfilledCount = @@ROWCOUNT;
 
--- Category 3: Admin-owned listings (intentionally unlinked, provider_profile_id remains NULL)
+-- Category [C]: Admin-owned listings (intentionally unlinked, provider_profile_id remains NULL)
 SELECT @PreservedAdminCount = COUNT(*)
 FROM dbo.homestays h
 INNER JOIN dbo.users u ON u.id = h.owner_id
 WHERE h.provider_profile_id IS NULL
   AND u.role = 'admin';
 
--- Category 4: Owner is an artisan or other non-homestay provider (not backfilled, flagged for review)
+-- Category [D]: Owner is an artisan or other non-homestay provider (not backfilled, flagged for review)
 SELECT @MismatchedTypeCount = COUNT(*)
 FROM dbo.homestays h
 INNER JOIN dbo.users u ON u.id = h.owner_id
@@ -172,38 +191,38 @@ WHERE h.provider_profile_id IS NULL
   AND u.role <> 'admin'
   AND p.provider_type <> 'homestay';
 
--- Category 5: Owner has a homestay profile but it is pending or rejected (not backfilled, flagged for review)
-SELECT @UnapprovedStatusCount = COUNT(*)
+-- Category [E]: Owner has a homestay profile but it is pending, rejected, or inactive (not backfilled, flagged for review)
+SELECT @UnapprovedOrInactiveStatusCount = COUNT(*)
 FROM dbo.homestays h
 INNER JOIN dbo.users u ON u.id = h.owner_id
 INNER JOIN dbo.provider_profiles p ON p.user_id = h.owner_id
 WHERE h.provider_profile_id IS NULL
   AND u.role <> 'admin'
   AND p.provider_type = 'homestay'
-  AND p.approval_status <> 'approved';
+  AND (p.approval_status <> 'approved' OR p.is_active = 0 OR u.is_active = 0);
 
--- Category 6: Unmatched / orphan homestays (owner_id is NULL or user has no provider profile and is not admin)
+-- Category [G]: Unmatched / orphan homestays (owner_id is NULL or user has no provider profile and is not admin)
 SELECT @UnmatchedOrphanCount = COUNT(*)
 FROM dbo.homestays h
 LEFT JOIN dbo.users u ON u.id = h.owner_id
 LEFT JOIN dbo.provider_profiles p ON p.user_id = h.owner_id
 WHERE h.provider_profile_id IS NULL
-  AND (h.owner_id IS NULL OR (u.role <> 'admin' AND p.id IS NULL));
+  AND (h.owner_id IS NULL OR u.id IS NULL OR (u.role <> 'admin' AND p.id IS NULL));
 
 PRINT '===================================================================';
 PRINT '             MIGRATION 015 AUDIT & BACKFILL REPORT                 ';
 PRINT '===================================================================';
 PRINT 'Total Homestay Listings in Database: ' + CAST(@TotalHomestaysCount AS NVARCHAR(10));
 PRINT '-------------------------------------------------------------------';
-PRINT '[A] Pre-existing Consistent Links:    ' + CAST(@AlreadyConsistentCount AS NVARCHAR(10));
-PRINT '[B] Newly Backfilled Homestays:       ' + CAST(@NewlyBackfilledCount AS NVARCHAR(10));
-PRINT '[C] Admin-Created Listings (NULL FK): ' + CAST(@PreservedAdminCount AS NVARCHAR(10));
-PRINT '[D] Flagged - Non-Homestay Providers: ' + CAST(@MismatchedTypeCount AS NVARCHAR(10));
-PRINT '[E] Flagged - Unapproved Providers:   ' + CAST(@UnapprovedStatusCount AS NVARCHAR(10));
-PRINT '[F] Flagged - Inconsistent FK Links:  ' + CAST(@InconsistentMismatchedLinks AS NVARCHAR(10));
-PRINT '[G] Flagged - Unmatched / Orphans:    ' + CAST(@UnmatchedOrphanCount AS NVARCHAR(10));
+PRINT '[A] Pre-existing Consistent Links:      ' + CAST(@AlreadyConsistentCount AS NVARCHAR(10));
+PRINT '[B] Newly Backfilled Homestays:         ' + CAST(@NewlyBackfilledCount AS NVARCHAR(10));
+PRINT '[C] Admin-Created Listings (NULL FK):   ' + CAST(@PreservedAdminCount AS NVARCHAR(10));
+PRINT '[D] Flagged - Non-Homestay Providers:   ' + CAST(@MismatchedTypeCount AS NVARCHAR(10));
+PRINT '[E] Flagged - Unapproved/Inactive:      ' + CAST(@UnapprovedOrInactiveStatusCount AS NVARCHAR(10));
+PRINT '[F] Flagged - Inconsistent FK Links:    ' + CAST(@InconsistentMismatchedLinks AS NVARCHAR(10));
+PRINT '[G] Flagged - Unmatched / Orphans:      ' + CAST(@UnmatchedOrphanCount AS NVARCHAR(10));
 PRINT '-------------------------------------------------------------------';
 PRINT 'Verification Sum ([A]+[B]+[C]+[D]+[E]+[F]+[G]): ' +
-      CAST((@AlreadyConsistentCount + @NewlyBackfilledCount + @PreservedAdminCount + @MismatchedTypeCount + @UnapprovedStatusCount + @InconsistentMismatchedLinks + @UnmatchedOrphanCount) AS NVARCHAR(10));
+      CAST((@AlreadyConsistentCount + @NewlyBackfilledCount + @PreservedAdminCount + @MismatchedTypeCount + @UnapprovedOrInactiveStatusCount + @InconsistentMismatchedLinks + @UnmatchedOrphanCount) AS NVARCHAR(10));
 PRINT '===================================================================';
 GO

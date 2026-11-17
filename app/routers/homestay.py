@@ -523,6 +523,22 @@ def delete_homestay(
             detail="You cannot manage this homestay",
         )
 
+    # Prevent deactivation if active or upcoming confirmed bookings exist
+    active_bookings = (
+        db.query(Booking)
+        .filter(
+            Booking.homestay_id == homestay_id,
+            Booking.status == "confirmed",
+            Booking.check_out >= date.today(),
+        )
+        .count()
+    )
+    if active_bookings > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot deactivate homestay with active or upcoming confirmed bookings",
+        )
+
     homestay.is_active = False
     try:
         db.commit()

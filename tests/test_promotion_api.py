@@ -10,6 +10,7 @@ from app.models.user import User
 from app.routers.promotion import create_promotion
 from app.schemas.promotion import PromotionCreateRequest
 from app.models.promotion import HomestayPromotion
+from app.models.provider_profile import ProviderProfile
 
 def make_user(user_id, role):
     return User(
@@ -18,6 +19,17 @@ def make_user(user_id, role):
         email=f"user{user_id}@example.com",
         role=role,
         is_active=True,
+    )
+
+
+def make_homestay_profile(user_id, business_name="Test Homestay"):
+    return ProviderProfile(
+        user_id=user_id,
+        business_name=business_name,
+        provider_type="homestay",
+        phone="+94771234567",
+        district="Jaffna",
+        approval_status="approved",
     )
 
 
@@ -157,6 +169,7 @@ def test_owner_can_create_promotion_via_api():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Heritage Stay"))
         db.add(
             Homestay(
                 id=1,
@@ -371,6 +384,7 @@ def test_owner_can_update_promotion_via_api():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Update Stay"))
 
         db.add(
             Homestay(
@@ -632,6 +646,8 @@ def test_owner_can_list_only_own_promotions():
 
     with TestingSession() as db:
         db.add_all([owner, other_owner])
+        db.add(make_homestay_profile(owner.id, "Owner 501 Stay"))
+        db.add(make_homestay_profile(other_owner.id, "Owner 502 Stay"))
 
         db.add_all([
             Homestay(
@@ -949,6 +965,8 @@ def test_other_owner_cannot_update_promotion_via_api():
 
     with TestingSession() as db:
         db.add_all([owner, other_owner])
+        db.add(make_homestay_profile(owner.id, "Owner 701 Stay"))
+        db.add(make_homestay_profile(other_owner.id, "Owner 702 Stay"))
 
         db.add(
             Homestay(
@@ -1100,6 +1118,7 @@ def test_owner_promotion_complete_flow():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Heritage Stay"))
         db.add(
             Homestay(
                 id=1,

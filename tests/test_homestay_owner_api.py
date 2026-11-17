@@ -9,9 +9,21 @@ from sqlalchemy.pool import StaticPool
 
 from app.main import app
 from app.database.connection import get_db
-from app.models.user import Base, User
 from app.models.homestay import Homestay
+from app.models.provider_profile import ProviderProfile
+from app.models.user import Base, User
 from app.routers.auth import get_current_user
+
+
+def make_homestay_profile(user_id: int, business_name: str = "Test Homestay") -> ProviderProfile:
+    return ProviderProfile(
+        user_id=user_id,
+        business_name=business_name,
+        provider_type="homestay",
+        phone="+94771234567",
+        district="Jaffna",
+        approval_status="approved",
+    )
 
 
 @pytest.mark.parametrize("role", ["owner", "admin"])
@@ -53,6 +65,8 @@ def test_manager_can_create_homestay(role):
 
     with TestingSession() as db:
         db.add(manager)
+        if role != "admin":
+            db.add(make_homestay_profile(manager.id, "Manager Homestay"))
         db.commit()
 
     def override_db():
@@ -266,6 +280,7 @@ def test_owner_can_update_homestay_via_api():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Update Homestay"))
         db.add(
             Homestay(
                 id=1,
@@ -370,6 +385,8 @@ def test_other_owner_cannot_update_via_api():
 
     with TestingSession() as db:
         db.add_all([owner, other_owner])
+        db.add(make_homestay_profile(owner.id, "Owner Homestay"))
+        db.add(make_homestay_profile(other_owner.id, "Other Homestay"))
         db.add(
             Homestay(
                 id=1,
@@ -570,6 +587,7 @@ def test_owner_can_deactivate_homestay_via_api():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Deactivation Homestay"))
         db.add(
             Homestay(
                 id=1,
@@ -685,6 +703,8 @@ def test_owner_can_list_only_own_homestays():
 
     with TestingSession() as db:
         db.add_all([owner, other_owner])
+        db.add(make_homestay_profile(owner.id, "Owner 701 Stay"))
+        db.add(make_homestay_profile(other_owner.id, "Owner 702 Stay"))
 
         db.add_all([
             Homestay(
@@ -836,6 +856,7 @@ def test_owner_create_list_update_flow():
 
     with TestingSession() as db:
         db.add(owner)
+        db.add(make_homestay_profile(owner.id, "Integration Stay"))
         db.commit()
 
     def override_db():

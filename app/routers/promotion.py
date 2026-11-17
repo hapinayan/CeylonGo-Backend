@@ -12,11 +12,13 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from app.core.homestay_permissions import (
+    check_homestay_ownership,
     require_homestay_manager,
 )
 from app.database.connection import get_db
 from app.models.homestay import Homestay
 from app.models.promotion import HomestayPromotion
+from app.models.provider_profile import ProviderProfile
 from app.models.user import User
 from app.schemas.promotion import (
     PromotionCreateRequest,
@@ -57,10 +59,21 @@ def create_promotion(
             detail="Homestay not found",
         )
 
-    if (
-        current_user.role != "admin"
-        and homestay.owner_id != current_user.id
+    profile = None
+    if current_user.role != "admin" and (
+        homestay.provider_profile_id is not None
+        or current_user.role == "provider"
     ):
+        try:
+            profile = (
+                db.query(ProviderProfile)
+                .filter(ProviderProfile.user_id == current_user.id)
+                .first()
+            )
+        except Exception:
+            profile = None
+
+    if not check_homestay_ownership(homestay, current_user, profile):
         raise HTTPException(
             status_code=403,
             detail="You cannot manage this homestay",
@@ -125,10 +138,21 @@ def update_promotion(
             detail="Homestay not found",
         )
 
-    if (
-        current_user.role != "admin"
-        and homestay.owner_id != current_user.id
+    profile = None
+    if current_user.role != "admin" and (
+        homestay.provider_profile_id is not None
+        or current_user.role == "provider"
     ):
+        try:
+            profile = (
+                db.query(ProviderProfile)
+                .filter(ProviderProfile.user_id == current_user.id)
+                .first()
+            )
+        except Exception:
+            profile = None
+
+    if not check_homestay_ownership(homestay, current_user, profile):
         raise HTTPException(
             status_code=403,
             detail="You cannot manage this promotion",
@@ -223,16 +247,38 @@ def list_my_promotions(
         Query(ge=1, le=50),
     ] = 10,
 ):
-    query = (
-        db.query(HomestayPromotion)
-        .join(
-            Homestay,
-            Homestay.id == HomestayPromotion.homestay_id,
-        )
-        .filter(
-            Homestay.owner_id == current_user.id
-        )
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == current_user.id)
+        .first()
     )
+
+    if profile is not None:
+        query = (
+            db.query(HomestayPromotion)
+            .join(
+                Homestay,
+                Homestay.id == HomestayPromotion.homestay_id,
+            )
+            .filter(
+                (Homestay.provider_profile_id == profile.id)
+                | (
+                    (Homestay.provider_profile_id == None)
+                    & (Homestay.owner_id == current_user.id)
+                )
+            )
+        )
+    else:
+        query = (
+            db.query(HomestayPromotion)
+            .join(
+                Homestay,
+                Homestay.id == HomestayPromotion.homestay_id,
+            )
+            .filter(
+                Homestay.owner_id == current_user.id
+            )
+        )
 
     total = query.count()
 
@@ -249,3 +295,72 @@ def list_my_promotions(
         page=page,
         page_size=page_size,
     )
+
+
+# OWNER / ADMIN: Soft delete (deactivate) homestay promotion
+@router.delete(
+    "/{promotion_id}",
+    summary="Soft delete (deactivate) a homestay promotion",
+)
+def delete_promotion(
+    promotion_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[
+        User,
+        Depends(require_homestay_manager),
+    ],
+):
+    promotion = (
+        db.query(HomestayPromotion)
+        .filter(HomestayPromotion.id == promotion_id)
+        .first()
+    )
+    if not promotion:
+        raise HTTPException(
+            status_code=404,
+            detail="Promotion not found",
+        )
+
+    homestay = (
+        db.query(Homestay)
+        .filter(Homestay.id == promotion.homestay_id)
+        .first()
+    )
+    if not homestay:
+        raise HTTPException(
+            status_code=404,
+            detail="Homestay not found",
+        )
+
+    profile = None
+    if current_user.role != "admin" and (
+        homestay.provider_profile_id is not None
+        or current_user.role == "provider"
+    ):
+        try:
+            profile = (
+                db.query(ProviderProfile)
+                .filter(ProviderProfile.user_id == current_user.id)
+                .first()
+            )
+        except Exception:
+            profile = None
+
+    if not check_homestay_ownership(homestay, current_user, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot manage this promotion",
+        )
+
+    promotion.is_active = False
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "message": "Homestay promotion deactivated successfully",
+        "id": promotion_id,
+        "is_active": False,
+    }

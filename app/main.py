@@ -162,9 +162,6 @@ app.include_router(wishlists_router)
 app.include_router(eco_promotions_router)
 app.include_router(admin_eco_promotions_router)
 
-app.include_router(booking_router)
-app.include_router(promotion_router)
-
 # ==========================================
 # RENTAL MODULE
 # BIKE, BICYCLE & TUK-TUK
@@ -172,7 +169,6 @@ app.include_router(promotion_router)
 
 app.include_router(rental_vehicles_router)
 app.include_router(rental_bookings_router)
-
 
 # ==========================================
 # HEALTH CHECK API

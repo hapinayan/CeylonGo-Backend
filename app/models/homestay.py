@@ -10,10 +10,12 @@ from sqlalchemy import (
     Integer,
     Numeric,
     Unicode,
+    UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
+from app.models.provider_profile import ProviderProfile
 from app.models.user import Base, User
 
 
@@ -44,10 +46,29 @@ class Homestay(Base):
         index=True,
     )
 
+    provider_profile_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("provider_profiles.id"),
+        nullable=True,
+        index=True,
+    )
+
     owner: Mapped["User | None"] = relationship(
         "User",
         foreign_keys=[owner_id],
     )
+
+    provider_profile: Mapped["ProviderProfile | None"] = relationship(
+        "ProviderProfile",
+        foreign_keys=[provider_profile_id],
+        backref=backref("homestays", lazy="select"),
+    )
+
+    @property
+    def provider_business_name(self) -> str | None:
+        if self.provider_profile:
+            return self.provider_profile.business_name
+        return None
 
     name: Mapped[str] = mapped_column(
         Unicode(150),
@@ -136,6 +157,14 @@ class HomestayImage(Base):
 
 class HomestayAmenity(Base):
     __tablename__ = "homestay_amenities"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "homestay_id",
+            "name",
+            name="UQ_homestay_amenities_name",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer,

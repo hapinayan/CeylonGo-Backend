@@ -11,6 +11,18 @@ from app.models.provider_registration_draft import ProviderRegistrationDraft
 from app.models.showcase_item import ShowcaseItem
 from app.models.user import Base, User
 
+# Homestay Models
+from app.models.homestay import (
+    Homestay,
+    HomestayImage,
+    HomestayAmenity,
+)
+
+# Rental Module 09 Models
+from app.models.rental_vehicle import RentalVehicle
+from app.models.rental_booking import RentalBooking
+
+
 __all__ = [
     "ArtisanListing",
     "Base",
@@ -23,4 +35,13 @@ __all__ = [
     "ProviderRegistrationDraft",
     "ShowcaseItem",
     "User",
+
+    # Homestay Models
+    "Homestay",
+    "HomestayImage",
+    "HomestayAmenity",
+
+    # Rental Module 09
+    "RentalVehicle",
+    "RentalBooking",
 ]

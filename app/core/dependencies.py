@@ -93,6 +93,23 @@ def require_approved_provider(
     return profile
 
 
+def require_approved_eco_provider(
+    provider_profile: Annotated[
+        ProviderProfile, Depends(require_approved_provider)
+    ],
+) -> ProviderProfile:
+    """
+    Ensure the authenticated caller is an approved service provider
+    specifically registered under the 'eco_tourism' provider_type.
+    """
+    if provider_profile.provider_type != "eco_tourism":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: only approved eco_tourism service providers can perform this action",
+        )
+    return provider_profile
+
+
 def require_admin(
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> User:
@@ -105,6 +122,22 @@ def require_admin(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access forbidden: admin role required",
+        )
+    return current_user
+
+
+def require_traveler(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    """
+    Ensure the authenticated caller has the 'traveler' role and is active.
+
+    Rejects providers and admins with 403 Forbidden.
+    """
+    if current_user.role != "traveler":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: traveler role required",
         )
     return current_user
 

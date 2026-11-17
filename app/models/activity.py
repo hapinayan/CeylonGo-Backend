@@ -1,3 +1,4 @@
+from sqlalchemy import UnicodeText
 
 from datetime import datetime
 from decimal import Decimal
@@ -11,6 +12,7 @@ from sqlalchemy import (
     Unicode,
     func,
 )
+from sqlalchemy import DateTime
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -116,7 +118,7 @@ class Activity(Base):
     )
 
     itinerary: Mapped[str | None] = mapped_column(
-        mssql.NVARCHAR(length="max"),
+        UnicodeText().with_variant(mssql.NVARCHAR(length="max"), "mssql"),
         nullable=True,
     )
 
@@ -176,7 +178,7 @@ class Activity(Base):
     )
 
     reviewed_at: Mapped[datetime | None] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         nullable=True,
     )
 
@@ -186,13 +188,13 @@ class Activity(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         server_default=func.sysutcdatetime(),
         nullable=False,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         server_default=func.sysutcdatetime(),
         onupdate=func.sysutcdatetime(),
         nullable=False,

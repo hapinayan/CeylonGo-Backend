@@ -10,6 +10,7 @@ from sqlalchemy import (
     Unicode,
     func,
 )
+from sqlalchemy import DateTime
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -105,18 +106,18 @@ class ActivityBooking(Base):
     )
 
     cancelled_at: Mapped[datetime | None] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         server_default=func.sysutcdatetime(),
         nullable=False,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         server_default=func.sysutcdatetime(),
         onupdate=func.sysutcdatetime(),
         nullable=False,

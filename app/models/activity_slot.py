@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     func,
 )
+from sqlalchemy import DateTime
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -46,12 +47,12 @@ class ActivitySlot(Base):
     )
 
     starts_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         nullable=False,
     )
 
     ends_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         nullable=False,
     )
 
@@ -73,7 +74,7 @@ class ActivitySlot(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        mssql.DATETIME2(),
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         server_default=func.sysutcdatetime(),
         nullable=False,
     )

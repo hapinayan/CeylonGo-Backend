@@ -1,6 +1,7 @@
 import logging
 import os
 import smtplib
+from datetime import date, datetime
 from email.message import EmailMessage
 
 logger = logging.getLogger(__name__)
@@ -551,6 +552,299 @@ def send_provider_rejection_email(
     except (smtplib.SMTPException, OSError, TimeoutError) as exc:
         logger.error(
             "Failed to send provider rejection email to %s: %s",
+            to_email,
+            exc.__class__.__name__,
+        )
+        return False
+
+
+# ==============================================================================
+# M04 Eco-Tourism Badge Verification Decision Notifications
+# ==============================================================================
+
+
+def build_eco_badge_decision_email_message(
+    to_email: str,
+    experience_title: str,
+    decision: str,
+    provider_name: str | None = None,
+    business_name: str | None = None,
+    reason: str | None = None,
+    valid_until: datetime | date | str | None = None,
+) -> EmailMessage:
+    """
+    Construct MIME EmailMessage for Eco Badge verification decision notifications
+    (granted, rejected, or revoked) with CeylonGo branding, clear next actions,
+    and safe plain-text and HTML versions.
+    SECURITY: Never includes private evidence documents, file paths, tokens, or credentials.
+    """
+    name = (
+        provider_name.strip()
+        if provider_name and provider_name.strip()
+        else "Eco Partner"
+    )
+    biz = (
+        business_name.strip()
+        if business_name and business_name.strip()
+        else "your eco-tourism business"
+    )
+    title = experience_title.strip() if experience_title else "Eco Experience"
+
+    validity_str = "Ongoing (Subject to periodic audit)"
+    if valid_until:
+        if isinstance(valid_until, (datetime, date)):
+            validity_str = valid_until.strftime("%B %d, %Y")
+        else:
+            validity_str = str(valid_until)[:10]
+
+    reason_text = (
+        reason.strip()
+        if reason and reason.strip()
+        else "Administrative verification review completed."
+    )
+
+    norm_decision = decision.strip().lower()
+
+    msg = EmailMessage()
+    msg["From"] = f"{get_smtp_from_name()} <{get_smtp_from_email()}>"
+    msg["To"] = to_email
+
+    if norm_decision == "granted":
+        msg["Subject"] = f"CeylonGo — Eco-Friendly Badge Granted for '{title}'"
+        banner_bg = "#ECFDF5"
+        banner_border = "#10B981"
+        banner_title_color = "#065F46"
+        banner_title = "Eco-Friendly Badge Verified & Granted!"
+
+        text_content = (
+            f"Hello {name},\n\n"
+            f"Congratulations! We are delighted to inform you that the sustainability claims and conservation "
+            f"practices for your eco experience \"{title}\" ({biz}) have been reviewed and approved by the "
+            f"CeylonGo Administration Team.\n\n"
+            f"The official CeylonGo Eco-Friendly Badge has been granted to your listing.\n\n"
+            f"Verification Details:\n"
+            f"- Experience: {title}\n"
+            f"- Badge Status: Verified & Granted\n"
+            f"- Validity: {validity_str}\n"
+            f"- Reviewer Note: {reason_text}\n\n"
+            f"What this means for your listing:\n"
+            f"1. Your experience now prominently displays the certified Eco-Friendly Badge in search and detail views.\n"
+            f"2. Travelers filtering for eco-certified activities will discover your listing.\n"
+            f"3. Your verified sustainability practices are showcased to conscious travelers.\n\n"
+            f"Next Steps & Responsibilities:\n"
+            f"- Please maintain ongoing adherence to your approved environmental and wildlife safety guidelines.\n"
+            f"- Keep community records and permit documentation current for periodic administrative audits.\n\n"
+            f"Thank you for championing sustainable tourism in Sri Lanka!\n\n"
+            f"Warm regards,\n"
+            f"The CeylonGo Team\n"
+            f"Discover Local. Feel at Home.\n"
+        )
+
+        decision_html_block = f"""
+            <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 18px; margin: 20px 0;">
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #1E293B;"><strong>Experience:</strong> {title}</p>
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #065F46;"><strong>Status:</strong> Verified & Granted</p>
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #475569;"><strong>Valid Until:</strong> {validity_str}</p>
+                <p style="margin: 0; font-size: 14px; color: #475569;"><strong>Reviewer Note:</strong> {reason_text}</p>
+            </div>
+            <h3 style="color: #082B5C; margin-top: 25px; font-size: 16px;">What This Means For Your Listing:</h3>
+            <ul style="padding-left: 20px; color: #475569; font-size: 14px; line-height: 1.6;">
+                <li style="margin-bottom: 8px;">Your listing prominently displays the certified <strong>Eco-Friendly Badge</strong> in search and detail views.</li>
+                <li style="margin-bottom: 8px;">Travelers filtering for eco-certified activities will easily discover your listing.</li>
+                <li style="margin-bottom: 8px;">Your verified sustainability practices are highlighted for conscious travelers.</li>
+            </ul>
+            <h3 style="color: #082B5C; margin-top: 20px; font-size: 16px;">Next Steps:</h3>
+            <ul style="padding-left: 20px; color: #475569; font-size: 14px; line-height: 1.6;">
+                <li style="margin-bottom: 8px;">Maintain ongoing compliance with your published environmental and wildlife guidelines.</li>
+                <li style="margin-bottom: 8px;">Keep community engagement and conservation records ready for periodic reviews.</li>
+            </ul>
+        """
+
+    elif norm_decision == "rejected":
+        msg["Subject"] = f"CeylonGo — Update Regarding Eco-Friendly Badge for '{title}'"
+        banner_bg = "#FEF2F2"
+        banner_border = "#EF4444"
+        banner_title_color = "#991B1B"
+        banner_title = "Eco-Friendly Badge Verification Requires Attention"
+
+        text_content = (
+            f"Hello {name},\n\n"
+            f"Thank you for submitting your sustainability claims and evidence for your eco experience \"{title}\" ({biz}).\n\n"
+            f"After careful review by the CeylonGo Administration Team, we regret to inform you that your listing "
+            f"cannot be granted the Eco-Friendly Badge at this time.\n\n"
+            f"Decision Details:\n"
+            f"- Experience: {title}\n"
+            f"- Badge Status: Rejected / Needs Revision\n"
+            f"- Reason / Feedback: {reason_text}\n\n"
+            f"How to Resubmit for Verification:\n"
+            f"1. Log in to your CeylonGo Provider Dashboard.\n"
+            f"2. Navigate to your listing's Sustainability Practices section.\n"
+            f"3. Review the feedback provided above and update your practice descriptions or upload valid supporting evidence documents.\n"
+            f"4. Click 'Submit for Verification' when your updated documentation is ready.\n\n"
+            f"Please Note:\n"
+            f"Your eco experience listing itself remains in its current status. Only the specialized Eco-Friendly Badge was declined.\n\n"
+            f"Warm regards,\n"
+            f"The CeylonGo Team\n"
+            f"Discover Local. Feel at Home.\n"
+        )
+
+        decision_html_block = f"""
+            <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 18px; margin: 20px 0;">
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #1E293B;"><strong>Experience:</strong> {title}</p>
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #991B1B;"><strong>Status:</strong> Verification Declined</p>
+                <p style="margin: 0; font-size: 14px; color: #475569;"><strong>Reason / Feedback:</strong> {reason_text}</p>
+            </div>
+            <h3 style="color: #082B5C; margin-top: 25px; font-size: 16px;">How to Resubmit for Verification:</h3>
+            <ol style="padding-left: 20px; color: #475569; font-size: 14px; line-height: 1.6;">
+                <li style="margin-bottom: 8px;">Log in to your <strong>CeylonGo Provider Dashboard</strong>.</li>
+                <li style="margin-bottom: 8px;">Navigate to your listing's <strong>Sustainability Practices</strong> tab.</li>
+                <li style="margin-bottom: 8px;">Review the reviewer feedback and update your practice details or re-upload clear evidence documents.</li>
+                <li style="margin-bottom: 8px;">Click <strong>Submit for Verification</strong> once updated.</li>
+            </ol>
+            <p style="font-size: 13px; color: #64748B; margin-top: 15px;">
+                <em>Note: Your experience listing itself remains in its current listing status; only the Eco-Friendly Badge was not granted.</em>
+            </p>
+        """
+
+    elif norm_decision == "revoked":
+        msg["Subject"] = f"CeylonGo — Notice: Eco-Friendly Badge Revoked for '{title}'"
+        banner_bg = "#FFFBEB"
+        banner_border = "#F59E0B"
+        banner_title_color = "#92400E"
+        banner_title = "Notice: Eco-Friendly Badge Status Update"
+
+        text_content = (
+            f"Hello {name},\n\n"
+            f"This is an official notification regarding your eco experience \"{title}\" ({biz}) on CeylonGo.\n\n"
+            f"Following an administrative audit or compliance review, the Eco-Friendly Badge associated with this "
+            f"experience has been revoked.\n\n"
+            f"Revocation Details:\n"
+            f"- Experience: {title}\n"
+            f"- Badge Status: Revoked\n"
+            f"- Stated Reason: {reason_text}\n\n"
+            f"Impact on Your Listing:\n"
+            f"- The Eco-Friendly Badge has been immediately removed from your listing in search results and public views.\n"
+            f"- Previously verified sustainability practices have been marked unverified.\n\n"
+            f"Next Steps:\n"
+            f"If you believe this action was taken in error or if you have remedied the non-compliance reasons cited above, "
+            f"please contact the CeylonGo Administration Team or submit updated verification documentation through your Provider Dashboard.\n\n"
+            f"Warm regards,\n"
+            f"The CeylonGo Team\n"
+            f"Discover Local. Feel at Home.\n"
+        )
+
+        decision_html_block = f"""
+            <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 18px; margin: 20px 0;">
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #1E293B;"><strong>Experience:</strong> {title}</p>
+                <p style="margin: 0 0 8px 0; font-size: 14px; color: #92400E;"><strong>Badge Status:</strong> Revoked</p>
+                <p style="margin: 0; font-size: 14px; color: #475569;"><strong>Stated Reason:</strong> {reason_text}</p>
+            </div>
+            <h3 style="color: #082B5C; margin-top: 25px; font-size: 16px;">Impact on Your Listing:</h3>
+            <ul style="padding-left: 20px; color: #475569; font-size: 14px; line-height: 1.6;">
+                <li style="margin-bottom: 8px;">The Eco-Friendly Badge has been removed from your listing in search and detail views.</li>
+                <li style="margin-bottom: 8px;">Associated sustainability practices are no longer marked as verified.</li>
+            </ul>
+            <h3 style="color: #082B5C; margin-top: 20px; font-size: 16px;">Next Steps:</h3>
+            <p style="color: #475569; font-size: 14px; line-height: 1.6;">
+                If you have remedied the compliance issues noted above or have additional evidence to submit, you may update your sustainability records and re-request verification via the Provider Dashboard, or contact the CeylonGo Support Team.
+            </p>
+        """
+
+    else:
+        raise ValueError(f"Unsupported badge decision '{decision}' for email template.")
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333; margin: 0; padding: 20px;">
+    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+        <div style="background-color: #082B5C; padding: 24px; text-align: center;">
+            <h1 style="color: #ffffff; margin: 0; font-size: 24px;">CeylonGo</h1>
+            <p style="color: #FF9F1C; margin: 5px 0 0 0; font-size: 14px; font-weight: bold;">Discover Local. Feel at Home.</p>
+        </div>
+        <div style="padding: 30px;">
+            <div style="background-color: {banner_bg}; border-left: 4px solid {banner_border}; padding: 14px 18px; margin-bottom: 24px; border-radius: 4px;">
+                <p style="margin: 0; font-size: 15px; color: {banner_title_color}; font-weight: bold;">
+                    {banner_title}
+                </p>
+            </div>
+            <p style="font-size: 16px;">Hello <strong>{name}</strong>,</p>
+            {decision_html_block}
+            <div style="background-color: #FEF3C7; border-left: 4px solid #FF9F1C; padding: 12px 16px; margin: 25px 0; border-radius: 4px;">
+                <p style="margin: 0; font-size: 13px; color: #92400E;">
+                    <strong>Security Notice:</strong> CeylonGo will never request your account password, payment credentials, or personal identity documents via email.
+                </p>
+            </div>
+            <p style="font-size: 14px; color: #64748B;">Warm regards,<br/>The CeylonGo Team</p>
+            <hr style="border: none; border-top: 1px solid #EEEEEE; margin: 25px 0;" />
+            <p style="font-size: 12px; color: #94A3B8; text-align: center; margin: 0;">CeylonGo — Discover Local. Feel at Home.</p>
+        </div>
+    </div>
+</body>
+</html>"""
+
+    msg.set_content(text_content)
+    msg.add_alternative(html_content, subtype="html")
+    return msg
+
+
+def send_eco_badge_decision_email(
+    to_email: str,
+    experience_title: str,
+    decision: str,
+    provider_name: str | None = None,
+    business_name: str | None = None,
+    reason: str | None = None,
+    valid_until: datetime | date | str | None = None,
+) -> bool:
+    """
+    Send an Eco Badge verification decision email via configured SMTP.
+    Returns True ONLY if SMTP server accepted the message.
+    Returns False if SMTP is unconfigured or if delivery fails.
+    Never exposes credentials, private file paths, or tokens in logs.
+    """
+    if not is_smtp_configured():
+        logger.warning(
+            "SMTP is not configured (SMTP_HOST missing). Eco badge notification skipped for %s.",
+            to_email,
+        )
+        return False
+
+    smtp_host = get_smtp_host()
+    smtp_port = get_smtp_port()
+    timeout = get_smtp_timeout()
+    msg = build_eco_badge_decision_email_message(
+        to_email=to_email,
+        experience_title=experience_title,
+        decision=decision,
+        provider_name=provider_name,
+        business_name=business_name,
+        reason=reason,
+        valid_until=valid_until,
+    )
+
+    try:
+        server_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
+        with server_class(smtp_host, smtp_port, timeout=timeout) as server:
+            server.ehlo()
+            if is_smtp_use_tls() and smtp_port != 465:
+                server.starttls()
+                server.ehlo()
+
+            username = get_smtp_username()
+            password = get_smtp_password()
+            if username and password:
+                server.login(username, password)
+
+            server.send_message(msg)
+            logger.info(
+                "Eco badge decision email dispatched to %s for decision=%s",
+                to_email,
+                decision,
+            )
+            return True
+    except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+        logger.error(
+            "Failed to send eco badge decision email to %s: %s",
             to_email,
             exc.__class__.__name__,
         )

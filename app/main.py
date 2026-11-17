@@ -1,3 +1,4 @@
+
 import os
 from pathlib import Path
 
@@ -9,10 +10,16 @@ load_dotenv(dotenv_path=_env_path)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# ==========================================
+# EXISTING ROUTER IMPORTS
+# ==========================================
+
 from app.routers.admin_providers import (
     router as admin_providers_router,
 )
-from app.routers.artisan_listings import router as artisan_listings_router
+from app.routers.artisan_listings import (
+    router as artisan_listings_router,
+)
 from app.routers.auth import router as auth_router
 from app.routers.booking import router as booking_router
 from app.routers.eco_experiences import (
@@ -32,10 +39,27 @@ from app.routers.provider_otp import router as provider_otp_router
 from app.routers.provider_registration import (
     router as provider_registration_router,
 )
-from app.routers.showcase_items import router as showcase_items_router
+from app.routers.showcase_items import (
+    router as showcase_items_router,
+)
 from app.routers.wishlists import router as wishlists_router
 
+# ============================================
+# RENTAL MODULE ROUTER IMPORTS
+# ============================================
+
+from app.routers.rental_vehicles import (
+    router as rental_vehicles_router,
+)
+from app.routers.rental_bookings import (
+    router as rental_bookings_router,
+)
+
 load_dotenv()
+
+# ==========================================
+# FASTAPI APPLICATION
+# ==========================================
 
 app = FastAPI(
     title="CeylonGo API",
@@ -44,28 +68,47 @@ app = FastAPI(
 )
 
 
+# ==========================================
+# CORS CONFIGURATION
+# ==========================================
+
 def get_allowed_origins() -> list[str]:
     # Default Angular development origins
     origins = [
         "http://localhost:4200",
         "http://127.0.0.1:4200",
     ]
-    # Read additional comma-separated origins from environment configuration
+
+    # Read additional comma-separated origins
+    # from environment configuration
     custom_origins = os.getenv("CORS_ORIGINS", "")
+
     if custom_origins:
         for origin in custom_origins.split(","):
             cleaned = origin.strip()
+
             if cleaned and cleaned not in origins:
                 origins.append(cleaned)
+
     return origins
 
 
-# Configure CORS middleware
+# ==========================================
+# CORS MIDDLEWARE
+# ==========================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+        "OPTIONS",
+    ],
     allow_headers=[
         "Authorization",
         "Content-Type",
@@ -75,20 +118,37 @@ app.add_middleware(
     ],
 )
 
-# Register routers
+
+# ==========================================
+# REGISTER ROUTERS
+# ==========================================
+
+# Authentication Module
 app.include_router(auth_router)
 
-# Artisan module
+
+# ==========================================
+# ARTISAN MODULE
+# ==========================================
+
 app.include_router(artisan_listings_router)
 app.include_router(showcase_items_router)
 app.include_router(promotions_router)
 
-# Homestay module
+
+# ==========================================
+# HOMESTAY MODULE
+# ==========================================
+
 app.include_router(homestay_router)
 app.include_router(booking_router)
 app.include_router(promotion_router)
 
-# Service Provider module
+
+# ==========================================
+# SERVICE PROVIDER MODULE
+# ==========================================
+
 app.include_router(provider_otp_router)
 app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
@@ -105,7 +165,23 @@ app.include_router(admin_eco_promotions_router)
 app.include_router(booking_router)
 app.include_router(promotion_router)
 
-@app.get("/api/v1/health", tags=["Health"])
+# ==========================================
+# RENTAL MODULE
+# BIKE, BICYCLE & TUK-TUK
+# ==========================================
+
+app.include_router(rental_vehicles_router)
+app.include_router(rental_bookings_router)
+
+
+# ==========================================
+# HEALTH CHECK API
+# ==========================================
+
+@app.get(
+    "/api/v1/health",
+    tags=["Health"],
+)
 def health_check():
     return {
         "status": "healthy",

@@ -31,6 +31,8 @@ class HomestayResponse(BaseModel):
     max_guests: int
     is_active: bool
     created_at: datetime
+    owner_id: int | None = None
+    provider_profile_id: int | None = None
 
     images: list[HomestayImageResponse] = Field(
         default_factory=list

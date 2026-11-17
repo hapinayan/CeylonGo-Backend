@@ -118,10 +118,10 @@ def regression_db_client():
 
     app.dependency_overrides[get_db] = override_db
     client = TestClient(app)
-    
+
     token1 = create_access_token({"sub": "10", "role": "provider"})
     token2 = create_access_token({"sub": "20", "role": "provider"})
-    
+
     yield {
         "client": client,
         "token1": token1,
@@ -138,7 +138,7 @@ def regression_db_client():
 def test_update_homestay_retaining_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -161,7 +161,7 @@ def test_update_homestay_retaining_amenities(regression_db_client):
 def test_update_homestay_omitting_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -183,7 +183,7 @@ def test_update_homestay_omitting_amenities(regression_db_client):
 def test_update_homestay_adding_new_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -205,7 +205,7 @@ def test_update_homestay_adding_new_amenities(regression_db_client):
 def test_update_homestay_removing_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -226,7 +226,7 @@ def test_update_homestay_removing_amenities(regression_db_client):
 def test_update_homestay_replacing_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -247,7 +247,7 @@ def test_update_homestay_replacing_amenities(regression_db_client):
 def test_update_homestay_clearing_amenities(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t1}"},
@@ -296,7 +296,7 @@ def test_repeated_identical_updates(regression_db_client):
 def test_preserve_and_update_images(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
-    
+
     # Omit images -> images preserved
     resp = c.put(
         "/api/v1/homestays/1",
@@ -310,7 +310,7 @@ def test_preserve_and_update_images(regression_db_client):
     )
     assert resp.status_code == 200
     assert len(resp.json()["images"]) == 2
-    
+
     # Provide new images list -> images updated
     resp2 = c.put(
         "/api/v1/homestays/1",
@@ -333,7 +333,7 @@ def test_transaction_rollback_on_failure(regression_db_client):
     c = regression_db_client["client"]
     t1 = regression_db_client["token1"]
     Session = regression_db_client["Session"]
-    
+
     # Active booking prevents deactivation
     with Session() as db:
         booking = Booking(
@@ -360,7 +360,7 @@ def test_transaction_rollback_on_failure(regression_db_client):
         },
     )
     assert resp.status_code == 400
-    
+
     # Verify name was rolled back
     with Session() as db:
         hs = db.query(Homestay).filter(Homestay.id == 1).first()
@@ -371,7 +371,7 @@ def test_transaction_rollback_on_failure(regression_db_client):
 def test_cross_provider_update_rejection(regression_db_client):
     c = regression_db_client["client"]
     t2 = regression_db_client["token2"]  # Host 2 trying to edit Homestay 1
-    
+
     resp = c.put(
         "/api/v1/homestays/1",
         headers={"Authorization": f"Bearer {t2}"},
@@ -393,7 +393,7 @@ def test_unique_openapi_operation_ids():
         for method, operation in methods.items():
             if isinstance(operation, dict) and "operationId" in operation:
                 operation_ids.append(operation["operationId"])
-    
+
     duplicates = [op for op in operation_ids if operation_ids.count(op) > 1]
     assert len(duplicates) == 0, f"Duplicate operation IDs found: {set(duplicates)}"
 

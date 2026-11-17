@@ -1,3 +1,4 @@
+
 import re
 from datetime import UTC, date, datetime
 from typing import Annotated, Literal
@@ -10,6 +11,7 @@ VALID_PROVIDER_TYPES = {
     "activity",
     "eco_tourism",
     "artisan",
+    "rental",
 }
 
 PHONE_PATTERN = re.compile(r"^(?:\+94|0094|94)?(0?[1-9]\d{8})$")

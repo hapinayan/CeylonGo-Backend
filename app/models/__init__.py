@@ -41,6 +41,19 @@ from app.models.homestay import (
 from app.models.rental_vehicle import RentalVehicle
 from app.models.rental_booking import RentalBooking
 
+# Tour Guide Module Models
+from app.models.tour_guide import (
+    TourGuide,
+    TourGuideLanguage,
+    TourGuideServiceArea,
+    TourGuideCredential,
+    TourGuideImage,
+    TourGuidePackage,
+    TourGuideAvailability,
+    TourGuideBooking,
+    TourGuideVerification,
+)
+
 
 __all__ = [
     "Activity",
@@ -78,4 +91,15 @@ __all__ = [
     # Rental Module 09
     "RentalVehicle",
     "RentalBooking",
+
+    # Tour Guide Module
+    "TourGuide",
+    "TourGuideLanguage",
+    "TourGuideServiceArea",
+    "TourGuideCredential",
+    "TourGuideImage",
+    "TourGuidePackage",
+    "TourGuideAvailability",
+    "TourGuideBooking",
+    "TourGuideVerification",
 ]

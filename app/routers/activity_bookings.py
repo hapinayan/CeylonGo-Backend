@@ -166,6 +166,34 @@ def create_activity_booking(
 
     return booking
 
+# ==========================================================
+# GET MY ACTIVITY BOOKINGS
+# ==========================================================
+
+@router.get(
+    "/me",
+    response_model=list[ActivityBookingResponse],
+    summary="Get my activity bookings",
+)
+def get_my_activity_bookings(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    if current_user.role != "traveler":
+        raise HTTPException(
+            status_code=403,
+            detail="Only travelers can view their activity bookings",
+        )
+
+    bookings = (
+        db.query(ActivityBooking)
+        .filter(ActivityBooking.user_id == current_user.id)
+        .order_by(ActivityBooking.created_at.desc())
+        .all()
+    )
+
+    return bookings
+
 
 # ==========================================================
 # CANCEL ACTIVITY BOOKING

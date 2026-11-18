@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -11,7 +10,7 @@ from sqlalchemy import (
     Unicode,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.user import Base
 
@@ -61,8 +60,31 @@ class RentalVehicle(Base):
         Unicode(30), default="available", nullable=False
     )
 
+    model_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    license_plate: Mapped[str | None] = mapped_column(Unicode(50), nullable=True)
+    seating_capacity: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+    transmission: Mapped[str] = mapped_column(Unicode(20), default="manual", nullable=False)
+    fuel_type: Mapped[str] = mapped_column(Unicode(20), default="petrol", nullable=False)
+    district: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    city: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    location_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("rental_locations.id"), nullable=True)
+
+    approval_status: Mapped[str] = mapped_column(Unicode(20), default="approved", nullable=False)
+    verification_status: Mapped[str] = mapped_column(Unicode(20), default="unverified", nullable=False)
+    reviewed_by: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
+    cancellation_policy: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
+    free_cancellation_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.sysutcdatetime(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.sysutcdatetime(),
+        onupdate=func.sysutcdatetime(),
         nullable=False,
     )

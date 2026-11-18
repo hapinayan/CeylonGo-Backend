@@ -1,4 +1,3 @@
-
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -20,6 +19,25 @@ class BookingCreate(BaseModel):
         return self
 
 
+class BookingCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cancellation_reason: str | None = Field(default=None, max_length=1000)
+
+
+class BookingRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class CashPaymentRecordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: Decimal | None = Field(default=None, ge=0, decimal_places=2)
+    notes: str | None = Field(default=None, max_length=500)
+
+
 class BookingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -31,7 +49,17 @@ class BookingResponse(BaseModel):
     guests: int
     total_price: Decimal
     status: str
+    currency: str = "LKR"
+    payment_method: str = "pay_at_location"
+    payment_status: str = "unpaid"
+    nightly_rate_snapshot: Decimal | None = None
+    cancellation_policy_snapshot: str | None = None
+    free_cancellation_hours_snapshot: int = 24
+    cancellation_reason: str | None = None
+    cancelled_at: datetime | None = None
+    cancelled_by: int | None = None
     created_at: datetime
+    updated_at: datetime | None = None
 
 
 class BookingListResponse(BaseModel):

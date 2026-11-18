@@ -38,11 +38,26 @@ from app.routers.promotions import (
 # HOMESTAY MODULE ROUTER IMPORTS
 # ==========================================
 
+from app.routers.homestay_campaigns import (
+    router as homestay_campaigns_router,
+)
 from app.routers.homestay import (
     router as homestay_router,
 )
+from app.routers.admin_homestays import (
+    router as admin_homestays_router,
+)
 from app.routers.booking import (
     router as booking_router,
+)
+from app.routers.homestay_reviews import (
+    router as homestay_reviews_router,
+)
+from app.routers.notifications import (
+    router as notifications_router,
+)
+from app.routers.payments import (
+    router as payments_router,
 )
 from app.routers.promotion import (
     router as promotion_router,
@@ -189,9 +204,19 @@ app.include_router(promotions_router)
 # HOMESTAY MODULE
 # ==========================================
 
+app.include_router(homestay_campaigns_router)
 app.include_router(homestay_router)
+app.include_router(admin_homestays_router)
 app.include_router(booking_router)
+app.include_router(homestay_reviews_router)
 app.include_router(promotion_router)
+
+# ==========================================
+# NOTIFICATIONS & PAYMENTS MODULE
+# ==========================================
+
+app.include_router(notifications_router)
+app.include_router(payments_router)
 
 # ==========================================
 # SERVICE PROVIDER MODULE

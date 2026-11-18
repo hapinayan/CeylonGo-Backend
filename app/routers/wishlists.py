@@ -15,15 +15,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.dependencies import require_traveler
+from app.core.listing_sync import sync_homestay_listing_reference
 from app.database.connection import get_db
 from app.models.eco_experience import EcoExperience
 from app.models.eco_wishlist import EcoWishlist
+from app.models.homestay import Homestay
+from app.models.shared import ListingReference, Wishlist
 from app.models.user import User
 from app.schemas.eco_experience import EcoExperiencePublicSummary
 from app.schemas.eco_wishlist import (
     EcoWishlistItemResponse,
     EcoWishlistPagination,
 )
+from app.schemas.homestay import HomestayResponse
 
 router = APIRouter(
     prefix="/api/v1/wishlists",
@@ -241,3 +245,194 @@ def list_my_wishlist(
         page_size=page_size,
         total_pages=total_pages,
     )
+
+
+# ==========================================
+# HOMESTAY WISHLIST ENDPOINTS (MODULE 02 / PHASE 03)
+# ==========================================
+
+@router.post(
+    "/homestays/{homestay_id}",
+    status_code=status.HTTP_201_CREATED,
+    summary="Add an approved homestay to authenticated traveler's wishlist",
+)
+def add_homestay_to_wishlist(
+    homestay_id: int,
+    current_user: Annotated[User, Depends(require_traveler)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    if not homestay or not homestay.is_active or homestay.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Homestay not found",
+        )
+
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "homestay",
+            ListingReference.target_id == homestay.id,
+        )
+        .first()
+    )
+    if not listing_ref:
+        listing_ref = sync_homestay_listing_reference(db, homestay)
+        if not listing_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Homestay cannot be saved at this time",
+            )
+        db.flush()
+
+    existing = (
+        db.query(Wishlist)
+        .filter(
+            Wishlist.user_id == current_user.id,
+            Wishlist.listing_reference_id == listing_ref.id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Homestay is already in your wishlist",
+        )
+
+    entry = Wishlist(
+        user_id=current_user.id,
+        listing_reference_id=listing_ref.id,
+    )
+    db.add(entry)
+    db.commit()
+
+    return {
+        "message": "Homestay added to wishlist",
+        "homestay_id": homestay_id,
+        "saved": True,
+    }
+
+
+@router.delete(
+    "/homestays/{homestay_id}",
+    summary="Remove a homestay from authenticated traveler's wishlist",
+)
+def remove_homestay_from_wishlist(
+    homestay_id: int,
+    current_user: Annotated[User, Depends(require_traveler)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "homestay",
+            ListingReference.target_id == homestay_id,
+        )
+        .first()
+    )
+    if not listing_ref:
+        return {
+            "message": "Homestay removed from wishlist",
+            "homestay_id": homestay_id,
+            "saved": False,
+        }
+
+    entry = (
+        db.query(Wishlist)
+        .filter(
+            Wishlist.user_id == current_user.id,
+            Wishlist.listing_reference_id == listing_ref.id,
+        )
+        .first()
+    )
+    if entry:
+        db.delete(entry)
+        db.commit()
+
+    return {
+        "message": "Homestay removed from wishlist",
+        "homestay_id": homestay_id,
+        "saved": False,
+    }
+
+
+@router.get(
+    "/homestays",
+    summary="List authenticated traveler's saved homestays with pagination",
+)
+def get_my_homestay_wishlist(
+    current_user: Annotated[User, Depends(require_traveler)],
+    db: Annotated[Session, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=50)] = 20,
+):
+    query = (
+        db.query(Wishlist, Homestay)
+        .join(ListingReference, Wishlist.listing_reference_id == ListingReference.id)
+        .join(Homestay, ListingReference.target_id == Homestay.id)
+        .options(
+            selectinload(Homestay.images),
+            selectinload(Homestay.amenities),
+        )
+        .filter(
+            Wishlist.user_id == current_user.id,
+            ListingReference.module_type == "homestay",
+        )
+    )
+
+    total = query.count()
+    results = (
+        query.order_by(Wishlist.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    items = []
+    for w, h in results:
+        items.append(
+            {
+                "wishlist_id": w.id,
+                "saved_at": w.created_at,
+                "homestay": HomestayResponse.model_validate(h),
+            }
+        )
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get(
+    "/homestays/{homestay_id}/status",
+    summary="Check whether a homestay is saved in traveler's wishlist",
+)
+def check_homestay_wishlist_status(
+    homestay_id: int,
+    current_user: Annotated[User, Depends(require_traveler)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "homestay",
+            ListingReference.target_id == homestay_id,
+        )
+        .first()
+    )
+    if not listing_ref:
+        return {"homestay_id": homestay_id, "saved": False}
+
+    saved = (
+        db.query(Wishlist)
+        .filter(
+            Wishlist.user_id == current_user.id,
+            Wishlist.listing_reference_id == listing_ref.id,
+        )
+        .first()
+        is not None
+    )
+    return {"homestay_id": homestay_id, "saved": saved}

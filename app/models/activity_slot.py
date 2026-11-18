@@ -46,6 +46,13 @@ class ActivitySlot(Base):
         index=True,
     )
 
+    eco_experience_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("eco_experiences.id"),
+        nullable=True,
+        index=True,
+    )
+
     starts_at: Mapped[datetime] = mapped_column(
         DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
         nullable=False,

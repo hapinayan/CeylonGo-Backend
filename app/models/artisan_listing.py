@@ -51,6 +51,22 @@ class ArtisanListing(Base):
 
     is_featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    approval_status: Mapped[str] = mapped_column(
+        Unicode(20), default="approved", nullable=False, index=True
+    )
+
+    reviewed_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    rejection_reason: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
+
+    verification_status: Mapped[str] = mapped_column(
+        Unicode(20), default="unverified", nullable=False, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )

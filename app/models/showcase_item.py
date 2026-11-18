@@ -41,6 +41,16 @@ class ShowcaseItem(Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    stock_quantity: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+
+    sku: Mapped[str | None] = mapped_column(Unicode(50), nullable=True)
+
+    approval_status: Mapped[str] = mapped_column(
+        Unicode(20), default="approved", nullable=False, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )

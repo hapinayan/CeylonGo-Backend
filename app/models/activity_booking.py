@@ -60,6 +60,13 @@ class ActivityBooking(Base):
         index=True,
     )
 
+    eco_experience_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("eco_experiences.id"),
+        nullable=True,
+        index=True,
+    )
+
     user_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("users.id"),
@@ -132,3 +139,61 @@ class ActivityBooking(Base):
         "User",
         foreign_keys=[user_id],
     )
+
+
+class ActivityBookingParticipant(Base):
+    __tablename__ = "activity_booking_participants"
+
+    __table_args__ = (
+        CheckConstraint(
+            "age IS NULL OR age > 0",
+            name="CK_activity_participants_age",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    activity_booking_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("activity_bookings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    full_name: Mapped[str] = mapped_column(
+        Unicode(150),
+        nullable=False,
+    )
+
+    id_or_passport: Mapped[str | None] = mapped_column(
+        Unicode(50),
+        nullable=True,
+    )
+
+    age: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    special_requirements: Mapped[str | None] = mapped_column(
+        Unicode(500),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
+        server_default=func.sysutcdatetime(),
+        nullable=False,
+    )
+
+    booking = relationship(
+        "ActivityBooking",
+        backref=__import__('sqlalchemy.orm', fromlist=['backref']).backref(
+            "participants_list", cascade="all, delete-orphan", lazy="select"
+        ),
+    )
+

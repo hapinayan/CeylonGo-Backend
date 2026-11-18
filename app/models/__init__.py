@@ -35,6 +35,7 @@ from app.models.homestay import (
     Homestay,
     HomestayImage,
     HomestayAmenity,
+    HomestayAvailabilityBlock,
 )
 
 # Rental Module 09 Models
@@ -87,6 +88,7 @@ __all__ = [
     "Homestay",
     "HomestayImage",
     "HomestayAmenity",
+    "HomestayAvailabilityBlock",
 
     # Rental Module 09
     "RentalVehicle",

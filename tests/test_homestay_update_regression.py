@@ -13,6 +13,7 @@ from app.models.user import Base, User
 from app.models.provider_profile import ProviderProfile
 from app.models.homestay import Homestay, HomestayImage, HomestayAmenity
 from app.models.booking import Booking
+from app.models.shared import ListingReference
 from app.core.security import create_access_token
 from app.core.database_guard import verify_safe_integration_database, DatabaseSafetyError
 from app.schemas.homestay import HomestayUpdateRequest
@@ -42,6 +43,7 @@ def regression_db_client():
             HomestayImage.__table__,
             HomestayAmenity.__table__,
             Booking.__table__,
+            ListingReference.__table__,
         ],
     )
     Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

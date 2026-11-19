@@ -767,13 +767,14 @@ def test_traveler_access_restrictions(
 
 def test_public_discovery_and_traveler_booking_compatibility(
     client: TestClient,
+    db_session: Session,
     approved_homestay_provider_a: User,
     traveler_user: User,
 ):
     headers_prov = auth_header(approved_homestay_provider_a)
     headers_traveler = auth_header(traveler_user)
 
-    # Provider A publishes a homestay
+    # Provider A creates a draft homestay
     res_h = client.post(
         "/api/v1/homestays",
         json={
@@ -789,6 +790,12 @@ def test_public_discovery_and_traveler_booking_compatibility(
     )
     assert res_h.status_code == 201
     homestay_id = res_h.json()["id"]
+
+    # Prepare an approved listing for the public discovery and booking flow.
+    listing = db_session.get(Homestay, homestay_id)
+    assert listing.approval_status == "draft"
+    listing.approval_status = "approved"
+    db_session.commit()
 
     # 1. Unauthenticated discovery: List homestays
     res_pub_list = client.get("/api/v1/homestays")
@@ -834,7 +841,7 @@ def test_public_discovery_and_traveler_booking_compatibility(
     )
     assert res_booking.status_code == 201
     booking_id = res_booking.json()["id"]
-    assert res_booking.json()["status"] == "confirmed"
+    assert res_booking.json()["status"] == "pending"
 
     # 6. Traveler views their bookings
     res_my_bookings = client.get("/api/v1/bookings/me", headers=headers_traveler)

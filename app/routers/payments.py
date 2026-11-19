@@ -20,6 +20,8 @@ from app.core.payhere import payhere_service
 from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import Homestay
+from app.models.rental_booking import RentalBooking
+from app.models.rental_vehicle import RentalVehicle
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import (
     BookingReference,
@@ -165,6 +167,137 @@ def initiate_booking_payment(
 
 
 # ==========================================
+# 1B. PAYHERE ONLINE PAYMENT INITIATION FOR RENTALS (TR-11)
+# ==========================================
+
+@router.post(
+    "/rental/bookings/{booking_id}/initiate",
+    response_model=PaymentInitiateResponse,
+    summary="Initiate PayHere online payment for a rental booking (TR-11)",
+)
+def initiate_rental_booking_payment(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    rental_booking = db.query(RentalBooking).filter(RentalBooking.id == booking_id).first()
+    if not rental_booking:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rental booking not found",
+        )
+
+    if rental_booking.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only initiate payment for your own bookings",
+        )
+
+    if rental_booking.status in ("cancelled", "rejected", "expired", "completed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot initiate payment for rental booking with status '{rental_booking.status}'",
+        )
+
+    if rental_booking.payment_status == "paid":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This rental booking has already been paid",
+        )
+
+    vehicle = rental_booking.vehicle or db.get(RentalVehicle, rental_booking.vehicle_id)
+    if not vehicle:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vehicle not found",
+        )
+
+    # Locate or create BookingReference for this rental booking
+    import uuid
+    booking_ref = (
+        db.query(BookingReference)
+        .filter(
+            BookingReference.module_type == "rental_vehicle",
+            BookingReference.target_booking_id == rental_booking.id,
+        )
+        .first()
+    )
+    if not booking_ref:
+        ref_code = f"RB-{rental_booking.id}-{uuid.uuid4().hex[:8].upper()}"
+        booking_ref = BookingReference(
+            booking_reference=ref_code,
+            module_type="rental_vehicle",
+            target_booking_id=rental_booking.id,
+            user_id=current_user.id,
+            provider_profile_id=vehicle.provider_id,
+            total_price=rental_booking.total_price,
+            currency=rental_booking.currency or "LKR",
+            booking_status=rental_booking.status,
+            payment_status=rental_booking.payment_status or "unpaid",
+        )
+        db.add(booking_ref)
+        db.flush()
+
+    rental_booking.payment_method = "online"
+
+    # Upsert pending PaymentTransaction
+    tx = (
+        db.query(PaymentTransaction)
+        .filter(
+            PaymentTransaction.booking_reference_id == booking_ref.id,
+            PaymentTransaction.payment_status == "pending",
+        )
+        .first()
+    )
+    if not tx:
+        tx = PaymentTransaction(
+            booking_reference_id=booking_ref.id,
+            user_id=current_user.id,
+            gateway_name="payhere",
+            amount=rental_booking.total_price,
+            currency=rental_booking.currency or "LKR",
+            payment_status="pending",
+            payment_method="online",
+        )
+        db.add(tx)
+    else:
+        tx.amount = rental_booking.total_price
+        tx.currency = rental_booking.currency or "LKR"
+
+    db.commit()
+
+    order_id = booking_ref.booking_reference
+    checkout_hash = payhere_service.generate_checkout_hash(
+        order_id=order_id,
+        amount=rental_booking.total_price,
+        currency=rental_booking.currency or "LKR",
+    )
+
+    name_parts = (current_user.full_name or "Traveler").split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else "Traveler"
+
+    return PaymentInitiateResponse(
+        booking_id=rental_booking.id,
+        booking_reference=order_id,
+        merchant_id=payhere_service.merchant_id,
+        checkout_url=payhere_service.checkout_url,
+        order_id=order_id,
+        items=f"Rental: {vehicle.vehicle_name} ({rental_booking.pickup_at.strftime('%Y-%m-%d')} to {rental_booking.return_at.strftime('%Y-%m-%d')})",
+        amount=rental_booking.total_price,
+        currency=rental_booking.currency or "LKR",
+        hash=checkout_hash,
+        first_name=first_name,
+        last_name=last_name,
+        email=current_user.email,
+        phone=None,
+        return_url=payhere_service.return_url,
+        cancel_url=payhere_service.cancel_url,
+        notify_url=payhere_service.notify_url,
+    )
+
+
+# ==========================================
 # 2. PAYHERE WEBHOOK / NOTIFICATION LISTENER
 # ==========================================
 
@@ -218,23 +351,61 @@ async def payhere_webhook_listener(
             detail="Booking reference not found",
         )
 
-    booking = db.query(Booking).filter(Booking.id == booking_ref.target_booking_id).first()
-    if not booking:
+    # Resolve target booking strictly by module_type (Conditions 2 & 3)
+    rental_booking = None
+    homestay_booking = None
+
+    if booking_ref.module_type == "rental_vehicle":
+        rental_booking = (
+            db.query(RentalBooking)
+            .filter(RentalBooking.id == booking_ref.target_booking_id)
+            .first()
+        )
+        if not rental_booking:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Associated rental booking not found",
+            )
+        expected_total = rental_booking.total_price
+        expected_currency = rental_booking.currency or "LKR"
+        target_user_id = rental_booking.user_id
+        is_already_paid = (rental_booking.payment_status == "paid")
+        current_booking_status = rental_booking.status
+
+    elif booking_ref.module_type == "homestay":
+        homestay_booking = (
+            db.query(Booking)
+            .filter(Booking.id == booking_ref.target_booking_id)
+            .first()
+        )
+        if not homestay_booking:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Associated homestay booking not found",
+            )
+        expected_total = homestay_booking.total_price
+        expected_currency = homestay_booking.currency or "LKR"
+        target_user_id = homestay_booking.user_id
+        is_already_paid = (homestay_booking.payment_status == "paid")
+        current_booking_status = homestay_booking.status
+
+    else:
+        # Strictly reject unknown module types rather than falling back (Condition 3)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Associated booking not found",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported booking reference module type '{booking_ref.module_type}'",
         )
 
-    # 3. Verify amount and currency
+    # 3. Verify amount and currency (Condition 4)
     received_amt = Decimal(payhere_amount)
-    if received_amt != booking.total_price or payhere_currency != (booking.currency or "LKR"):
+    if received_amt != expected_total or payhere_currency != expected_currency:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payment amount or currency mismatch with booking record",
         )
 
-    # 4. Idempotency: if already paid, return 200 immediately
-    if booking.payment_status == "paid":
+    # 4. Idempotency: if already paid, return 200 immediately (Condition 5)
+    if is_already_paid:
         return {"status": "already_processed"}
 
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -248,7 +419,7 @@ async def payhere_webhook_listener(
     if not tx:
         tx = PaymentTransaction(
             booking_reference_id=booking_ref.id,
-            user_id=booking.user_id,
+            user_id=target_user_id,
             gateway_name="payhere",
             amount=received_amt,
             currency=payhere_currency,
@@ -262,55 +433,84 @@ async def payhere_webhook_listener(
     if status_code == "2":
         tx.payment_status = "paid"
         tx.paid_at = now_utc
-        booking.payment_status = "paid"
-        booking.payment_method = "online"
         booking_ref.payment_status = "paid"
 
         record_booking_status_change(
             db,
             booking_reference_id=booking_ref.id,
-            from_status=booking.status,
-            to_status=booking.status,
+            from_status=current_booking_status,
+            to_status=current_booking_status,
             changed_by=None,
             notes=f"PayHere Online Payment Confirmed (Payment ID: {payment_id})",
         )
 
-        homestay = db.query(Homestay).filter(Homestay.id == booking.homestay_id).first()
-        h_name = homestay.name if homestay else ""
+        if rental_booking:
+            rental_booking.payment_status = "paid"
+            rental_booking.payment_method = "online"
 
-        # In-app notifications
-        create_notification(
-            db=db,
-            user_id=booking.user_id,
-            title="Online Payment Successful!",
-            message=f"Your payment of {payhere_amount} {payhere_currency} for {h_name} was received.",
-            notification_type="payment_success",
-            link_url=f"/bookings/{booking.id}",
-        )
-
-        provider_user_id = homestay.owner_id if homestay else None
-        if not provider_user_id and homestay and homestay.provider_profile:
-            provider_user_id = homestay.provider_profile.user_id
-
-        if provider_user_id:
+            v_name = rental_booking.vehicle.vehicle_name if rental_booking.vehicle else "Vehicle"
             create_notification(
                 db=db,
-                user_id=provider_user_id,
-                title="Online Payment Received",
-                message=f"Traveler paid {payhere_amount} {payhere_currency} online for booking #{booking.id}.",
-                notification_type="payment_received",
-                link_url=f"/provider/bookings/{booking.id}",
+                user_id=rental_booking.user_id,
+                title="Rental Payment Successful!",
+                message=f"Your payment of {payhere_amount} {payhere_currency} for {v_name} was received.",
+                notification_type="payment_success",
+                link_url=f"/rentals/bookings/{rental_booking.id}",
             )
+
+            p_user_id = None
+            if rental_booking.vehicle and rental_booking.vehicle.provider:
+                p_user_id = rental_booking.vehicle.provider.user_id
+
+            if p_user_id:
+                create_notification(
+                    db=db,
+                    user_id=p_user_id,
+                    title="Rental Payment Received",
+                    message=f"Traveler paid {payhere_amount} {payhere_currency} online for rental booking #{rental_booking.id}.",
+                    notification_type="payment_received",
+                    link_url=f"/provider/rentals/bookings/{rental_booking.id}",
+                )
+
+        elif homestay_booking:
+            homestay_booking.payment_status = "paid"
+            homestay_booking.payment_method = "online"
+
+            homestay = db.query(Homestay).filter(Homestay.id == homestay_booking.homestay_id).first()
+            h_name = homestay.name if homestay else ""
+
+            create_notification(
+                db=db,
+                user_id=homestay_booking.user_id,
+                title="Online Payment Successful!",
+                message=f"Your payment of {payhere_amount} {payhere_currency} for {h_name} was received.",
+                notification_type="payment_success",
+                link_url=f"/bookings/{homestay_booking.id}",
+            )
+
+            provider_user_id = homestay.owner_id if homestay else None
+            if not provider_user_id and homestay and homestay.provider_profile:
+                provider_user_id = homestay.provider_profile.user_id
+
+            if provider_user_id:
+                create_notification(
+                    db=db,
+                    user_id=provider_user_id,
+                    title="Online Payment Received",
+                    message=f"Traveler paid {payhere_amount} {payhere_currency} online for booking #{homestay_booking.id}.",
+                    notification_type="payment_received",
+                    link_url=f"/provider/bookings/{homestay_booking.id}",
+                )
 
     elif status_code in ("-1", "-2"):
         tx.payment_status = "failed"
         create_notification(
             db=db,
-            user_id=booking.user_id,
+            user_id=target_user_id,
             title="Online Payment Failed",
-            message=f"Payment for booking #{booking.id} was unsuccessful. You may retry payment.",
+            message=f"Payment for booking #{booking_ref.target_booking_id} was unsuccessful. You may retry payment.",
             notification_type="payment_failed",
-            link_url=f"/bookings/{booking.id}",
+            link_url=f"/bookings/{booking_ref.target_booking_id}",
         )
 
     db.commit()

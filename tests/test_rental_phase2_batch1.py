@@ -98,8 +98,8 @@ def seed_test_fleet(db):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # 1. Users
-    u_prov1 = User(id=1, full_name="Provider One", email="provider1@ceylongo.com", password_hash="pw", role="service_provider")
-    u_prov2 = User(id=2, full_name="Provider Two", email="provider2@ceylongo.com", password_hash="pw", role="service_provider")
+    u_prov1 = User(id=1, full_name="Provider One", email="provider1@ceylongo.com", password_hash="pw", role="provider")
+    u_prov2 = User(id=2, full_name="Provider Two", email="provider2@ceylongo.com", password_hash="pw", role="provider")
     u_traveler = User(id=3, full_name="Traveler Bob", email="traveler@ceylongo.com", password_hash="pw", role="traveler")
     db.add_all([u_prov1, u_prov2, u_traveler])
     db.flush()
@@ -227,14 +227,13 @@ def test_discovery_returns_only_approved_and_available_vehicles(test_app_and_cli
     assert "pages" in data
     assert "items" in data
 
-    # 4 approved and available vehicles (V1, V2, V3, V6)
-    # V4 (unapproved) and V5 (unavailable) must NOT be returned
-    assert data["total"] == 4
+    # Only V1, V2 and V3 are published by an approved provider.
+    assert data["total"] == 3
     returned_ids = [item["id"] for item in data["items"]]
     assert 1 in returned_ids
     assert 2 in returned_ids
     assert 3 in returned_ids
-    assert 6 in returned_ids
+    assert 6 not in returned_ids
     assert 4 not in returned_ids
     assert 5 not in returned_ids
 
@@ -255,7 +254,7 @@ def test_discovery_pagination_controls(test_app_and_client):
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["items"]) == 2
-    assert data["total"] == 4
+    assert data["total"] == 3
     assert data["pages"] == 2
     assert data["page"] == 1
 
@@ -263,7 +262,7 @@ def test_discovery_pagination_controls(test_app_and_client):
     resp2 = client.get("/api/v1/rental-vehicles?page=2&limit=2")
     assert resp2.status_code == 200
     data2 = resp2.json()
-    assert len(data2["items"]) == 2
+    assert len(data2["items"]) == 1
     assert data2["page"] == 2
 
 
@@ -361,9 +360,9 @@ def test_search_by_date_availability_excludes_booked_and_blocked(test_app_and_cl
     # V1 and V2 must be excluded because of booking and maintenance block
     assert 1 not in avail_ids
     assert 2 not in avail_ids
-    # V3 (Bicycle) and V6 (Kandy) are free and must be included
+    # V3 is free. V6 belongs to a pending provider.
     assert 3 in avail_ids
-    assert 6 in avail_ids
+    assert 6 not in avail_ids
 
 
 def test_search_date_availability_invalid_range_rejected(test_app_and_client):
@@ -682,6 +681,9 @@ def test_sponsored_vehicle_boosted_to_top_of_discovery(test_app_and_client):
     seed_test_fleet(db)
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # A paid campaign cannot publish a pending provider's listing.
+    # Approve the provider in this positive ranking scenario.
+    db.get(ProviderProfile, 2).approval_status = "approved"
     # Create active promotion campaign for Provider 2 (owning V6 in Kandy)
     camp = PromotionCampaign(
         provider_profile_id=2, campaign_name="Kandy Super Promo",

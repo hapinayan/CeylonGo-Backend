@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import case, func, or_, select, true
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_rental
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
@@ -21,7 +22,7 @@ from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import PromotionCampaign
 from app.models.user import User
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, get_optional_current_user
 from app.schemas.rental_vehicle import (
     FuelPolicy,
     RentalCategoryItem,
@@ -424,8 +425,7 @@ def get_rental_vehicles(
         .outerjoin(RentalVehicle.location)
         .outerjoin(RentalVehicle.provider)
         .filter(
-            RentalVehicle.approval_status == "approved",
-            RentalVehicle.status == "available",
+            public_rental(),
         )
     )
 
@@ -604,14 +604,26 @@ def get_rental_vehicles(
 def get_rental_vehicle(
     vehicle_id: int,
     db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User | None, Depends(get_optional_current_user)],
 ):
     """
     Returns full technical specifications, location details, gallery images, active
     rate plans, and provider verification status. Returns 404 for unapproved vehicles.
     """
-    vehicle = db.get(RentalVehicle, vehicle_id)
-
-    if not vehicle or vehicle.approval_status != "approved":
+    visibility = public_rental()
+    if user is not None and user.role == "admin":
+        visibility = true()
+    elif user is not None and user.role == "provider":
+        owned_profiles = db.query(ProviderProfile.id).filter(
+            ProviderProfile.user_id == user.id,
+            ProviderProfile.provider_type == "rental",
+            ProviderProfile.approval_status == "approved",
+        )
+        visibility = or_(visibility, RentalVehicle.provider_id.in_(owned_profiles.statement))
+    vehicle = db.query(RentalVehicle).filter(
+        RentalVehicle.id == vehicle_id, visibility,
+    ).first()
+    if vehicle is None:
         raise HTTPException(
             status_code=404,
             detail="Rental vehicle not found",

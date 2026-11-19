@@ -48,6 +48,7 @@ security_scheme = HTTPBearer(
     description="JWT Bearer token. Enter your token in format: <token>",
     auto_error=True,
 )
+optional_security_scheme = HTTPBearer(scheme_name="OptionalProviderPreviewBearer", auto_error=False)
 
 
 def get_current_user(
@@ -102,6 +103,15 @@ def get_current_user(
         )
 
     return user
+
+
+def get_optional_current_user(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(optional_security_scheme)
+    ],
+    db: Annotated[Session, Depends(get_db)],
+) -> User | None:
+    return get_current_user(credentials, db) if credentials is not None else None
 
 
 def rate_limit_check_email(request: Request) -> None:

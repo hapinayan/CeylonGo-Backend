@@ -80,6 +80,9 @@ from app.routers.admin_providers import (
 from app.routers.provider_auth import (
     router as provider_auth_router,
 )
+from app.routers.provider_workspace import router as provider_workspace_router
+from app.routers.provider_reservations import router as provider_reservations_router
+from app.routers.eco_reservations import router as eco_reservations_router
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES ROUTER IMPORTS
@@ -288,6 +291,9 @@ app.include_router(provider_otp_router)
 app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
+app.include_router(provider_workspace_router)
+app.include_router(provider_reservations_router)
+app.include_router(eco_reservations_router)
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES MODULE

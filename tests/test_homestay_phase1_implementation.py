@@ -410,7 +410,7 @@ def test_photo_management_workflow(client: TestClient, provider_user: User):
 
 
 def test_availability_blackout_blocks_and_booking_validation(
-    client: TestClient, provider_user: User, traveler_user: User
+    client: TestClient, provider_user: User, traveler_user: User, admin_user: User
 ):
     """Verifies blackout date blocks prevent overlapping blocks and overlapping bookings."""
     prov_headers = auth_header(provider_user)
@@ -422,11 +422,34 @@ def test_availability_blackout_blocks_and_booking_validation(
         json={"name": "Blackout Test Homestay", "location": "Ella", "price_per_night": 7000.00, "max_guests": 4},
         headers=prov_headers,
     )
+    assert create_res.status_code == 201, create_res.text
     h_id = create_res.json()["id"]
 
     today = date.today()
     block_start = today + timedelta(days=10)
     block_end = today + timedelta(days=15)
+    dates = {
+        "check_in": (block_start + timedelta(days=1)).isoformat(),
+        "check_out": (block_start + timedelta(days=3)).isoformat(),
+    }
+    booking_request = {"homestay_id": h_id, **dates, "guests": 2}
+    assert client.get(
+        f"/api/v1/homestays/{h_id}/availability", params=dates
+    ).status_code == 404
+    assert client.post(
+        "/api/v1/bookings", json=booking_request, headers=traveler_headers
+    ).status_code == 404
+
+    submission = client.post(
+        f"/api/v1/homestays/{h_id}/submit-approval", headers=prov_headers,
+    )
+    assert submission.status_code == 200, submission.text
+    review = client.post(
+        f"/api/v1/admin/homestays/{h_id}/review",
+        json={"decision": "approved"},
+        headers=auth_header(admin_user),
+    )
+    assert review.status_code == 200, review.text
 
     # 1. Add blackout block
     block_res = client.post(
@@ -458,10 +481,7 @@ def test_availability_blackout_blocks_and_booking_validation(
     # 3. Check availability API reports False for blocked dates
     avail_res = client.get(
         f"/api/v1/homestays/{h_id}/availability",
-        params={
-            "check_in": (block_start + timedelta(days=1)).isoformat(),
-            "check_out": (block_start + timedelta(days=3)).isoformat(),
-        },
+        params=dates,
     )
     assert avail_res.status_code == 200
     assert avail_res.json()["available"] is False
@@ -469,12 +489,7 @@ def test_availability_blackout_blocks_and_booking_validation(
     # 4. Traveler booking attempt on blocked dates rejected with 409
     book_res = client.post(
         "/api/v1/bookings",
-        json={
-            "homestay_id": h_id,
-            "check_in": (block_start + timedelta(days=1)).isoformat(),
-            "check_out": (block_start + timedelta(days=3)).isoformat(),
-            "guests": 2,
-        },
+        json=booking_request,
         headers=traveler_headers,
     )
     assert book_res.status_code == 409
@@ -489,10 +504,7 @@ def test_availability_blackout_blocks_and_booking_validation(
     # 6. Check availability is now True
     avail_after = client.get(
         f"/api/v1/homestays/{h_id}/availability",
-        params={
-            "check_in": (block_start + timedelta(days=1)).isoformat(),
-            "check_out": (block_start + timedelta(days=3)).isoformat(),
-        },
+        params=dates,
     )
     assert avail_after.status_code == 200
     assert avail_after.json()["available"] is True

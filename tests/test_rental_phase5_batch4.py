@@ -97,8 +97,8 @@ def seed_batch4_data(isolated_db_session):
     # 1. Users
     traveler = User(id=1, full_name="Kasun Silva", email="kasun@traveler.lk", password_hash="pw", role="traveler")
     traveler_other = User(id=2, full_name="Sneaky Intruder", email="sneaky@traveler.lk", password_hash="pw", role="traveler")
-    provider_user = User(id=3, full_name="Lanka Fleet Owner", email="owner@rentals.lk", password_hash="pw", role="service_provider")
-    other_provider_user = User(id=4, full_name="Other Provider", email="other@rentals.lk", password_hash="pw", role="service_provider")
+    provider_user = User(id=3, full_name="Lanka Fleet Owner", email="owner@rentals.lk", password_hash="pw", role="provider")
+    other_provider_user = User(id=4, full_name="Other Provider", email="other@rentals.lk", password_hash="pw", role="provider")
     admin_user = User(id=5, full_name="Platform Admin", email="admin@ceylongo.lk", password_hash="pw", role="admin")
 
     db.add_all([traveler, traveler_other, provider_user, other_provider_user, admin_user])

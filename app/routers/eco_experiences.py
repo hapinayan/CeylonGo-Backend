@@ -66,8 +66,12 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import case, func, or_
+from sqlalchemy import true
+from sqlalchemy.sql import ColumnElement
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.publication import public_eco
+from app.routers.auth import get_optional_current_user
 from app.core.dependencies import (
     require_admin,
     require_approved_eco_provider,
@@ -352,8 +356,7 @@ def list_eco_experiences(
             selectinload(EcoExperience.verifications),
         )
         .filter(
-            EcoExperience.listing_status == "approved",
-            EcoExperience.is_published == True,
+            public_eco(),
         )
     )
 
@@ -654,8 +657,7 @@ def get_eco_districts(db: Annotated[Session, Depends(get_db)]):
     districts = (
         db.query(EcoExperience.district)
         .filter(
-            EcoExperience.listing_status == "approved",
-            EcoExperience.is_published == True,
+            public_eco(),
         )
         .distinct()
         .order_by(EcoExperience.district.asc())
@@ -681,7 +683,7 @@ def get_eco_experience_detail(
     """
     experience = (
         _load_full_eco_experience_query(db)
-        .filter(EcoExperience.id == experience_id)
+        .filter(EcoExperience.id == experience_id, public_eco())
         .first()
     )
     if not experience or not experience.is_publicly_visible:
@@ -1574,7 +1576,7 @@ def get_eco_safety_rules(
     """
     experience = (
         db.query(EcoExperience)
-        .filter(EcoExperience.id == experience_id)
+        .filter(EcoExperience.id == experience_id, public_eco())
         .first()
     )
     if not experience:
@@ -2571,69 +2573,67 @@ def delete_eco_experience_image(
     return None
 
 
-@router.get(
-    "/{experience_id}/images",
-    response_model=list[EcoExperienceImageResponse],
-    summary="List photo gallery images for an eco experience",
-)
-def list_eco_experience_images(
-    experience_id: int,
+def eco_media_visibility(
+    user: Annotated[User | None, Depends(get_optional_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    """
-    Public/Provider endpoint: Lists gallery images for an eco experience ordered by sort_order.
-    """
-    experience = (
-        db.query(EcoExperience)
-        .filter(EcoExperience.id == experience_id)
-        .first()
-    )
-    if not experience:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Eco experience not found",
+    if user is None:
+        return public_eco()
+    if user.role == "admin":
+        return true()
+    if user.role == "provider":
+        own_profile = db.query(ProviderProfile.id).filter(
+            ProviderProfile.user_id == user.id,
+            ProviderProfile.provider_type == "eco_tourism",
+            ProviderProfile.approval_status == "approved",
         )
+        return or_(public_eco(), EcoExperience.provider_profile_id.in_(own_profile.statement))
+    return public_eco()
+
+
+EcoMediaVisibility = Annotated[ColumnElement[bool], Depends(eco_media_visibility)]
+
+
+@router.get("/{experience_id}/images", response_model=list[EcoExperienceImageResponse])
+def list_eco_experience_images(
+    experience_id: int, db: Annotated[Session, Depends(get_db)],
+    visible: EcoMediaVisibility,
+):
+    experience = db.query(EcoExperience.id).filter(
+        EcoExperience.id == experience_id, visible,
+    ).first()
+    if experience is None:
+        raise HTTPException(404, detail="Eco experience not found")
     images = (
         db.query(EcoExperienceImage)
-        .filter(EcoExperienceImage.eco_experience_id == experience.id)
+        .filter(EcoExperienceImage.eco_experience_id == experience_id)
         .order_by(EcoExperienceImage.sort_order.asc(), EcoExperienceImage.id.asc())
         .all()
     )
     return [EcoExperienceImageResponse.model_validate(img) for img in images]
 
 
-@router.get(
-    "/images/{filename}",
-    summary="Publicly view an eco experience gallery image",
-)
-def get_eco_experience_image(filename: str):
-    """
-    Public endpoint: Serves verified eco experience gallery images from uploads/eco_experiences.
-    Prevents path traversal and only serves image files.
-    """
-    clean_filename = os.path.basename(filename)
-    upload_dir = get_eco_experience_images_dir().resolve()
-    target_path = (upload_dir / clean_filename).resolve()
+@router.get("/images/{filename}")
+@uploads_router.get("/uploads/eco_experiences/{filename}")
+def get_eco_experience_image(
+    filename: str, db: Annotated[Session, Depends(get_db)], visible: EcoMediaVisibility,
+):
+    root = get_eco_experience_images_dir().resolve()
+    target = (root / filename).resolve()
     if (
-        not str(target_path).startswith(str(upload_dir))
-        or not target_path.is_file()
-        or target_path == upload_dir
+        filename != os.path.basename(filename) or target.parent != root
+        or target.suffix.lower() not in ALLOWED_ECO_IMAGE_EXTENSIONS
     ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Eco experience image not found",
-        )
-    ext = target_path.suffix.lower()
-    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
-    return FileResponse(target_path, media_type=media_type)
-
-
-@uploads_router.get(
-    "/uploads/eco_experiences/{filename}",
-    summary="Publicly view an eco experience gallery image via upload path",
-)
-def serve_eco_experience_upload(filename: str):
-    """
-    Upload path alias for public eco experience gallery images.
-    """
-    return get_eco_experience_image(filename)
+        raise HTTPException(404, detail="Eco experience image not found")
+    registered = db.query(EcoExperienceImage.id).join(EcoExperience).filter(
+        EcoExperienceImage.image_url.in_((
+            f"/uploads/eco_experiences/{filename}",
+            f"/api/v1/eco-experiences/images/{filename}",
+        )),
+        visible,
+    ).first()
+    if not registered or not target.is_file():
+        raise HTTPException(404, detail="Eco experience image not found")
+    ext = target.suffix.lower()
+    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext[1:]}"
+    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, no-store"})

@@ -95,7 +95,7 @@ def seed_phase6b_data(isolated_db_session):
 
     traveler = User(id=1, full_name="Kamal Traveler", email="kamal@ceylon.lk", password_hash="pw", role="traveler")
     foreign_traveler = User(id=2, full_name="Alex Smith", email="alex@uk.com", password_hash="pw", role="traveler")
-    provider_user = User(id=3, full_name="Rides Host", email="host@rides.lk", password_hash="pw", role="service_provider")
+    provider_user = User(id=3, full_name="Rides Host", email="host@rides.lk", password_hash="pw", role="provider")
     admin_user = User(id=4, full_name="Admin Reviewer", email="admin@ceylongo.lk", password_hash="pw", role="admin")
 
     db.add_all([traveler, foreign_traveler, provider_user, admin_user])

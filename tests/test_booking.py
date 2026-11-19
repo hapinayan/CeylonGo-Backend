@@ -14,6 +14,7 @@ from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import Homestay, HomestayAvailabilityBlock
 from app.models.user import User, Base
+from app.models.provider_profile import ProviderProfile
 from app.routers.auth import get_current_user
 
 
@@ -76,6 +77,7 @@ def booking_test_db():
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
             HomestayAvailabilityBlock.__table__,
             Booking.__table__,

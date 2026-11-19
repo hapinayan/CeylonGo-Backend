@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, or_, text
 from sqlalchemy.orm import Session
 
+from app.core.dependencies import require_traveler
+from app.core.publication import public_rental
 from app.database.connection import get_db
 from app.core.notification_service import create_notification
 from app.models.user import User
@@ -51,6 +53,8 @@ from app.schemas.rental_booking import (
     TravelerInspectionAcknowledgementResponse,
 )
 
+
+from app.services.provider_reservations import record_native_event
 
 router = APIRouter(
     prefix="/api/v1/rental-bookings",
@@ -458,7 +462,7 @@ def get_rental_booking(
 def create_rental_booking(
     booking_data: RentalBookingCreate,
     db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(require_traveler)],
 ):
     pickup_at = normalize_utc(booking_data.pickup_at)
     return_at = normalize_utc(booking_data.return_at)
@@ -483,9 +487,11 @@ def create_rental_booking(
             booking_data.vehicle_id,
         )
 
-        vehicle = db.get(
-            RentalVehicle,
-            booking_data.vehicle_id,
+        vehicle = (
+            db.query(RentalVehicle)
+            .with_hint(RentalVehicle, "WITH (HOLDLOCK)", "mssql")
+            .filter(RentalVehicle.id == booking_data.vehicle_id, public_rental(hold=True))
+            .first()
         )
 
         if not vehicle:
@@ -843,6 +849,7 @@ def cancel_rental_booking(
                 detail="Cannot cancel after pickup time",
             )
 
+        previous = booking.status
         # Policy-aware cancellation evaluation (TR-14)
         hours_until_pickup = (booking.pickup_at - current_time).total_seconds() / 3600.0
         free_hours = booking.free_cancellation_hours_snapshot or 24
@@ -897,6 +904,12 @@ def cancel_rental_booking(
                 )
                 db.add(refund_audit)
                 refund_record_created = True
+        vehicle = db.get(RentalVehicle, booking.vehicle_id)
+        provider = db.get(ProviderProfile, vehicle.provider_id)
+        record_native_event(
+            db, booking, "rental_vehicle", provider.id, previous, "cancelled",
+            current_user.id, provider.user_id,
+        )
 
         db.commit()
         db.refresh(booking)
@@ -1114,7 +1127,12 @@ def update_rental_booking_status(
                 detail="Booking cannot be completed before return time",
             )
 
+        previous = booking.status
         booking.status = status_data.status
+        record_native_event(
+            db, booking, "rental_vehicle", provider.id, previous, booking.status,
+            current_user.id, booking.user_id,
+        )
 
         # Sync BookingReference
         booking_ref = (

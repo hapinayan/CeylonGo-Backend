@@ -11,6 +11,7 @@ from app.database.connection import get_db
 from app.main import app
 from app.models.homestay import Homestay
 from app.models.promotion import HomestayPromotion
+from app.models.provider_profile import ProviderProfile
 from app.models.user import Base, User
 
 
@@ -35,6 +36,7 @@ def test_public_promotions_filter_by_homestay():
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
             HomestayPromotion.__table__,
         ],
@@ -62,7 +64,15 @@ def test_public_promotions_filter_by_homestay():
                 is_active=True,
             )
 
-            db.add_all([homestay_a, homestay_b])
+            draft = Homestay(
+                name="Draft Homestay",
+                location="Jaffna",
+                price_per_night=Decimal("5000.00"),
+                max_guests=3,
+                is_active=True,
+                approval_status="draft",
+            )
+            db.add_all([homestay_a, homestay_b, draft])
             db.flush()
 
             db.add_all([
@@ -82,11 +92,20 @@ def test_public_promotions_filter_by_homestay():
                     end_date=today + timedelta(days=10),
                     is_active=True,
                 ),
+                HomestayPromotion(
+                    homestay_id=draft.id,
+                    title="Draft Offer",
+                    discount_percent=Decimal("10.00"),
+                    start_date=today - timedelta(days=1),
+                    end_date=today + timedelta(days=10),
+                    is_active=True,
+                ),
             ])
 
             db.commit()
             homestay_a_id = homestay_a.id
             homestay_b_id = homestay_b.id
+            draft_id = draft.id
 
         def override_get_db():
             with TestingSession() as db:
@@ -114,6 +133,12 @@ def test_public_promotions_filter_by_homestay():
                 item["homestay_id"] != homestay_b_id
                 for item in data["items"]
             )
+            draft_response = client.get(
+                "/api/v1/homestay-promotions", params={"homestay_id": draft_id},
+            )
+            assert draft_response.status_code == 200, draft_response.text
+            assert draft_response.json()["total"] == 0
+            assert draft_response.json()["items"] == []
 
         finally:
             app.dependency_overrides.pop(get_db, None)

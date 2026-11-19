@@ -9,6 +9,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from PIL import Image
 from sqlalchemy.orm import Session
 
+from sqlalchemy.exc import IntegrityError
+
+from app.core.provider_onboarding import lock_onboarding, require_live_authorization
 from app.core.dependencies import require_registration_authorization
 from app.core.rate_limiter import (
     provider_identity_upload_limiter,
@@ -246,6 +249,8 @@ def save_personal_details(
     db: Annotated[Session, Depends(get_db)],
 ):
     email = auth_record.email
+    lock_onboarding(db, email)
+    require_live_authorization(db, auth_record)
 
     doc_label = "Passport" if payload.identity_document_type == "passport" else "NIC"
 
@@ -320,6 +325,8 @@ def save_business_details(
     db: Annotated[Session, Depends(get_db)],
 ):
     email = auth_record.email
+    lock_onboarding(db, email)
+    require_live_authorization(db, auth_record)
     draft = get_or_create_draft(email, db)
 
     # Determine business address
@@ -378,6 +385,8 @@ def upload_identity_documents(
         )
 
     email = auth_record.email
+    lock_onboarding(db, email)
+    require_live_authorization(db, auth_record)
     draft = get_or_create_draft(email, db)
 
     if selfie:
@@ -417,6 +426,8 @@ def get_registration_draft(
     db: Annotated[Session, Depends(get_db)],
 ):
     email = auth_record.email
+    lock_onboarding(db, email)
+    require_live_authorization(db, auth_record)
     draft = (
         db.query(ProviderRegistrationDraft)
         .filter(ProviderRegistrationDraft.email == email)
@@ -450,6 +461,8 @@ def submit_provider_registration(
     db: Annotated[Session, Depends(get_db)],
 ):
     email = auth_record.email
+    lock_onboarding(db, email)
+    require_live_authorization(db, auth_record)
     draft = (
         db.query(ProviderRegistrationDraft)
         .filter(ProviderRegistrationDraft.email == email)
@@ -523,6 +536,11 @@ def submit_provider_registration(
     doc_type = draft.identity_document_type or "nic"
     doc_label = "Passport" if doc_type == "passport" else "NIC"
 
+    # The identity constraint is authoritative. Serialize matching documents as
+    # well so competing submissions receive the same existing conflict contract.
+    lock_onboarding(db, f"{doc_type}:{draft.nic_number}", scope="document")
+    require_live_authorization(db, auth_record, consume=True)
+
     # 2. Check Purpose & Apply Profile Changes
     if auth_record.purpose == "registration":
         # Ensure user does not already exist
@@ -557,7 +575,11 @@ def submit_provider_registration(
             is_active=False,
         )
         db.add(new_user)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(409, detail="A provider registration already exists.") from None
 
         # Create ProviderProfile record
         new_profile = ProviderProfile(
@@ -671,14 +693,12 @@ def submit_provider_registration(
         # Keep user inactive until re-approved
         existing_user.is_active = False
 
-    # 3. Atomically consume the authorization token
-    auth_record.is_consumed = True
-    auth_record.consumed_at = now
-
-    # 4. Clean up draft record
     db.delete(draft)
-
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, detail="A provider registration already exists.") from None
 
     return RegistrationSubmitResponse(
         submitted=True,

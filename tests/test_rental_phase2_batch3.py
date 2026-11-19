@@ -95,8 +95,8 @@ def seed_test_data(isolated_db_session):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Users
-    prov_user1 = User(id=1, full_name="Sunil Perera", email="sunil@rentals.lk", password_hash="pw", role="service_provider")
-    prov_user2 = User(id=2, full_name="Kamal Silva", email="kamal@rentals.lk", password_hash="pw", role="service_provider")
+    prov_user1 = User(id=1, full_name="Sunil Perera", email="sunil@rentals.lk", password_hash="pw", role="provider")
+    prov_user2 = User(id=2, full_name="Kamal Silva", email="kamal@rentals.lk", password_hash="pw", role="provider")
     traveler1 = User(id=3, full_name="Alice Smith", email="alice@traveler.com", password_hash="pw", role="traveler")
     traveler2 = User(id=4, full_name="Bob Jones", email="bob@traveler.com", password_hash="pw", role="traveler")
     db.add_all([prov_user1, prov_user2, traveler1, traveler2])
@@ -746,6 +746,8 @@ def test_sponsored_vehicle_boosted_and_labeled(isolated_db_session, seed_test_da
     prov1 = seed_test_data["prov1"]
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
+    # Both providers must be eligible for this ranking comparison.
+    db.get(ProviderProfile, 2).approval_status = "approved"
     # Provider 1 runs an active rental promotion campaign
     campaign = PromotionCampaign(
         id=1,
@@ -783,7 +785,7 @@ def test_sponsored_vehicle_boosted_and_labeled(isolated_db_session, seed_test_da
 # ==============================================================================
 
 def test_verified_provider_badge_flag_in_discovery_and_detail(isolated_db_session, seed_test_data):
-    """TR-20: is_provider_verified is True for approved providers and False for unverified."""
+    """TR-20: Approved providers have a badge and pending listings stay private."""
     db = isolated_db_session
     v1 = seed_test_data["v1"]  # Provider 1 is approved
     v3 = seed_test_data["v3"]  # Provider 2 is pending
@@ -797,8 +799,7 @@ def test_verified_provider_badge_flag_in_discovery_and_detail(isolated_db_sessio
     assert resp1.json()["provider_business_name"] == "Sunil Galle Rentals"
 
     resp3 = client.get(f"/api/v1/rental-vehicles/{v3.id}")
-    assert resp3.status_code == 200
-    assert resp3.json()["is_provider_verified"] is False
+    assert resp3.status_code == 404
 
 
 def test_discovery_filter_verified_only(isolated_db_session, seed_test_data):
@@ -806,12 +807,12 @@ def test_discovery_filter_verified_only(isolated_db_session, seed_test_data):
     db = isolated_db_session
     client = make_test_client(db)
 
-    # Without filter: returns both approved and unapproved providers' available vehicles
+    # Public discovery excludes pending providers even without the filter.
     resp_all = client.get("/api/v1/rental-vehicles")
     assert resp_all.status_code == 200
     all_provider_ids = {item["provider_id"] for item in resp_all.json()["items"]}
     assert 1 in all_provider_ids
-    assert 2 in all_provider_ids
+    assert 2 not in all_provider_ids
 
     # With verified_only=true: returns only vehicles from Provider 1
     resp_verified = client.get("/api/v1/rental-vehicles?verified_only=true")

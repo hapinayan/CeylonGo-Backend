@@ -5,9 +5,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.provider_onboarding import lock_onboarding
 from app.core.email import send_provider_otp_email
 from app.core.otp import (
     generate_authorization_token,
@@ -104,6 +104,7 @@ def send_provider_otp(
     6. Sends branded email via SMTP; aborts transaction with rollback if delivery fails.
     """
     email = request.email.strip().lower()
+    lock_onboarding(db, email)
 
     # 1. Determine account state and OTP purpose
     user = (
@@ -262,6 +263,7 @@ def verify_provider_otp_endpoint(
     6. Generates a 32-byte secure authorization token, stores only its SHA-256 hash, and revokes older tokens.
     """
     email = request.email.strip().lower()
+    lock_onboarding(db, email)
     submitted_otp = request.otp.strip()
     now = datetime.now(UTC)
 
@@ -276,10 +278,7 @@ def verify_provider_otp_endpoint(
         .order_by(ProviderEmailOtp.created_at.desc())
     )
 
-    try:
-        otp_record = otp_query.with_for_update().first()
-    except SQLAlchemyError:
-        otp_record = otp_query.first()
+    otp_record = otp_query.first()
 
     if not otp_record:
         raise HTTPException(
@@ -287,37 +286,36 @@ def verify_provider_otp_endpoint(
             detail="Invalid or expired verification code.",
         )
 
-    # 2. Check maximum attempts
-    if otp_record.attempts_count >= otp_record.max_attempts:
-        otp_record.is_used = True
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum verification attempts exceeded. Please request a new code.",
-        )
-
-    # 3. Verify OTP cryptographic digest
-    is_valid = verify_provider_otp(email, submitted_otp, otp_record.otp_hash)
+    # Update the observed challenge in SQL. An already-used or changed row loses.
+    attempts = otp_record.attempts_count
+    max_attempts = otp_record.max_attempts
+    is_valid = attempts < max_attempts and verify_provider_otp(
+        email, submitted_otp, otp_record.otp_hash,
+    )
+    next_attempts = attempts if is_valid else min(attempts + 1, max_attempts)
+    changes = {
+        "attempts_count": next_attempts,
+        "is_used": is_valid or next_attempts >= max_attempts,
+    }
+    if is_valid:
+        changes["used_at"] = now
+    updated = db.query(ProviderEmailOtp).filter(
+        ProviderEmailOtp.id == otp_record.id, ProviderEmailOtp.is_used == False,
+        ProviderEmailOtp.attempts_count == attempts, ProviderEmailOtp.expires_at > now,
+    ).update(changes, synchronize_session=False)
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(400, detail="Invalid or expired verification code.")
     if not is_valid:
-        otp_record.attempts_count += 1
-        if otp_record.attempts_count >= otp_record.max_attempts:
-            otp_record.is_used = True
         db.commit()
-
-        remaining = max(0, otp_record.max_attempts - otp_record.attempts_count)
+        remaining = max_attempts - next_attempts
         if remaining == 0:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Maximum verification attempts exceeded. Please request a new code.",
+                400, detail="Maximum verification attempts exceeded. Please request a new code.",
             )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid verification code. {remaining} attempt(s) remaining.",
+            400, detail=f"Invalid verification code. {remaining} attempt(s) remaining.",
         )
-
-    # 4. Mark successful OTP as consumed
-    otp_record.is_used = True
-    otp_record.used_at = now
 
     # 5. Recheck live account status before issuing authorization
     user = (

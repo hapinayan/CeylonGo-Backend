@@ -87,7 +87,7 @@ def seed_batch2_data(isolated_db_session):
     # 1. Users
     traveler = User(id=1, full_name="Saman Kumara", email="saman@traveler.lk", password_hash="pw", role="traveler")
     admin_user = User(id=2, full_name="System Admin", email="admin@ceylongo.lk", password_hash="pw", role="admin")
-    provider_user = User(id=3, full_name="Rental Host", email="host@rentals.lk", password_hash="pw", role="service_provider")
+    provider_user = User(id=3, full_name="Rental Host", email="host@rentals.lk", password_hash="pw", role="provider")
 
     db.add_all([traveler, admin_user, provider_user])
     db.flush()

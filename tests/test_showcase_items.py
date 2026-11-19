@@ -116,6 +116,7 @@ def approved_artisan_user(db_session) -> tuple[User, ProviderProfile, ArtisanLis
     db_session.refresh(profile)
 
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Sunil Kandy Mask Workshop",
         craft_category="Woodcarving & Masks",
@@ -157,6 +158,7 @@ def second_artisan_user(db_session) -> tuple[User, ProviderProfile, ArtisanListi
     db_session.refresh(profile)
 
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Galle Fort Batik Studio",
         craft_category="Batik & Textiles",

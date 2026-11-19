@@ -97,6 +97,10 @@ class HomestayResponse(BaseModel):
     owner_id: int | None = None
     provider_profile_id: int | None = None
     is_sponsored: bool = False
+    sponsored_campaign_id: int | None = None
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal | None = None
+    discounted_price_per_night: Decimal | None = None
 
     images: list[HomestayImageResponse] = Field(default_factory=list)
     amenities: list[HomestayAmenityResponse] = Field(default_factory=list)

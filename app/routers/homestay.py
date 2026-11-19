@@ -1,9 +1,9 @@
 from datetime import date, datetime, time, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_, text
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.dependencies import require_approved_provider
@@ -12,7 +12,10 @@ from app.core.homestay_permissions import (
     require_homestay_manager,
 )
 from app.core.listing_sync import sync_homestay_listing_reference
-from app.core.promotion_pricing import calculate_booking_price
+from app.core.promotion_pricing import (
+    calculate_booking_price,
+    calculate_detailed_booking_price,
+)
 from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import (
@@ -24,6 +27,7 @@ from app.models.homestay import (
 from app.models.promotion import HomestayPromotion
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import (
+    AdvertisingPayment,
     ListingReference,
     PromotionCampaign,
     ProviderSettlement,
@@ -99,6 +103,141 @@ def _get_homestay_for_management(
         )
 
     return homestay
+
+
+def populate_homestay_promotions_and_sponsorship(
+    db: Session,
+    homestays: list[Homestay],
+    now: datetime | None = None,
+) -> list[HomestayResponse]:
+    """
+    Populate is_sponsored, sponsored_campaign_id, and active promotion discount details
+    for a list of homestays based on verified advertising payments and active promotion records.
+    """
+    if not homestays:
+        return []
+
+    if now is None:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today = now.date()
+
+    homestay_ids = [h.id for h in homestays]
+
+    # 1. Listing references
+    listing_refs = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "homestay",
+            ListingReference.target_id.in_(homestay_ids),
+        )
+        .all()
+    )
+    listing_ref_id_to_homestay_id = {lr.id: lr.target_id for lr in listing_refs}
+
+    # 2. Paid active campaigns
+    # Only campaigns that:
+    # - target_module == 'homestay'
+    # - status == 'active'
+    # - starts_at <= now <= ends_at
+    # - verified server-side payment completed in advertising_payments
+    paid_campaign_ids = {
+        row[0]
+        for row in db.query(AdvertisingPayment.campaign_id)
+        .filter(AdvertisingPayment.payment_status == "completed")
+        .all()
+    }
+
+    active_campaigns = (
+        db.query(PromotionCampaign)
+        .filter(
+            PromotionCampaign.target_module == "homestay",
+            PromotionCampaign.status == "active",
+            PromotionCampaign.starts_at <= now,
+            PromotionCampaign.ends_at >= now,
+            PromotionCampaign.id.in_(paid_campaign_ids),
+        )
+        .all()
+    ) if paid_campaign_ids else []
+
+    listing_campaign_map: dict[int, int] = {}
+
+    for camp in active_campaigns:
+        # Phase 09: Strict listing-specific attribution only.
+        # Historical campaigns without listing_reference_id must NOT sponsor provider homestays.
+        if camp.listing_reference_id is not None:
+            target_hid = listing_ref_id_to_homestay_id.get(camp.listing_reference_id)
+            if target_hid is not None:
+                # Authoritative provider ownership check:
+                # If homestay has a provider_profile_id, it must match the campaign's provider_profile_id.
+                h_obj = next((x for x in homestays if x.id == target_hid), None)
+                if h_obj and h_obj.provider_profile_id is not None:
+                    if h_obj.provider_profile_id == camp.provider_profile_id:
+                        listing_campaign_map[target_hid] = camp.id
+                elif h_obj:
+                    listing_campaign_map[target_hid] = camp.id
+
+    # 3. Active promotions
+    promotions = (
+        db.query(HomestayPromotion)
+        .filter(
+            HomestayPromotion.homestay_id.in_(homestay_ids),
+            HomestayPromotion.is_active == True,
+            HomestayPromotion.start_date <= today,
+            HomestayPromotion.end_date >= today,
+        )
+        .all()
+    )
+
+    promo_map: dict[int, list[HomestayPromotion]] = {}
+    for promo in promotions:
+        promo_map.setdefault(promo.homestay_id, []).append(promo)
+
+    results: list[HomestayResponse] = []
+    for h in homestays:
+        item = HomestayResponse.model_validate(h)
+
+        # Sponsorship attribution strictly via listing_campaign_map
+        if h.id in listing_campaign_map:
+            item.is_sponsored = True
+            item.sponsored_campaign_id = listing_campaign_map[h.id]
+        else:
+            item.is_sponsored = False
+            item.sponsored_campaign_id = None
+
+        # Discount attribution
+        h_promos = promo_map.get(h.id, [])
+        best_promo = None
+        best_savings = Decimal("0.00")
+        base_price = Decimal(str(h.price_per_night))
+
+        for promo in h_promos:
+            savings = Decimal("0.00")
+            if promo.discount_type == "percentage" and promo.discount_percent is not None:
+                savings = (
+                    base_price * Decimal(str(promo.discount_percent)) / Decimal("100")
+                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            elif promo.discount_type == "fixed" and promo.discount_amount is not None:
+                savings = min(Decimal(str(promo.discount_amount)), base_price).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            if savings > best_savings:
+                best_savings = savings
+                best_promo = promo
+
+        if best_promo:
+            item.discount_percent = best_promo.discount_percent
+            item.discount_amount = best_promo.discount_amount
+            item.discounted_price_per_night = max(
+                Decimal("0.00"), base_price - best_savings
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        else:
+            item.discount_percent = None
+            item.discount_amount = None
+            item.discounted_price_per_night = None
+
+        results.append(item)
+
+    return results
 
 
 # PUBLIC: List and search approved, active homestays
@@ -216,30 +355,7 @@ def list_homestays(
     )
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    active_sponsored_provider_ids = set()
-    try:
-        active_campaigns = (
-            db.query(PromotionCampaign.provider_profile_id)
-            .filter(
-                PromotionCampaign.target_module == "homestay",
-                PromotionCampaign.status == "active",
-                PromotionCampaign.starts_at <= now,
-                PromotionCampaign.ends_at >= now,
-                PromotionCampaign.spent_amount > Decimal("0.00"),
-            )
-            .all()
-        )
-        active_sponsored_provider_ids = {row[0] for row in active_campaigns}
-    except Exception:
-        active_sponsored_provider_ids = set()
-
-    items = []
-    for h in homestays:
-        item = HomestayResponse.model_validate(h)
-        # Note: Listing-specific verified advertising attribution is not supported in the schema
-        # (dbo.promotion_campaigns lacks listing_reference_id). Always returns False safely.
-        item.is_sponsored = False
-        items.append(item)
+    items = populate_homestay_promotions_and_sponsorship(db, homestays, now=now)
 
     return HomestayListResponse(
         items=items,
@@ -296,8 +412,10 @@ def list_my_homestays(
         .all()
     )
 
+    items = populate_homestay_promotions_and_sponsorship(db, homestays)
+
     return HomestayListResponse(
-        items=homestays,
+        items=items,
         total=total,
         page=page,
         page_size=page_size,
@@ -500,7 +618,8 @@ def get_homestay(
             detail="Homestay not found",
         )
 
-    return homestay
+    items = populate_homestay_promotions_and_sponsorship(db, [homestay])
+    return items[0]
 
 
 # PUBLIC: Secure provider contact info for approved homestay
@@ -594,14 +713,25 @@ def check_homestay_availability(
             detail="Homestay not found",
         )
 
-    # Check for overlapping confirmed bookings
+    # Check for active inventory reservations:
+    # Confirmed bookings, in-progress bookings, and unexpired awaiting_payment bookings.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     overlapping_booking = (
         db.query(Booking)
         .filter(
             Booking.homestay_id == homestay_id,
-            Booking.status == "confirmed",
             Booking.check_in < check_out,
             Booking.check_out > check_in,
+            or_(
+                Booking.status.in_(["confirmed", "in_progress"]),
+                and_(
+                    Booking.status == "awaiting_payment",
+                    or_(
+                        Booking.payment_expires_at.is_(None),
+                        Booking.payment_expires_at > now_utc,
+                    ),
+                ),
+            ),
         )
         .first()
     )
@@ -663,10 +793,7 @@ def preview_homestay_price(
             detail="Homestay not found",
         )
 
-    nights = (check_out - check_in).days
-    original_price = homestay.price_per_night * nights
-
-    final_price = calculate_booking_price(
+    breakdown = calculate_detailed_booking_price(
         db=db,
         homestay_id=homestay.id,
         check_in=check_in,
@@ -674,17 +801,19 @@ def preview_homestay_price(
         price_per_night=homestay.price_per_night,
     )
 
-    discount_amount = original_price - final_price
-
     return {
         "homestay_id": homestay.id,
         "check_in": check_in,
         "check_out": check_out,
-        "nights": nights,
-        "price_per_night": homestay.price_per_night,
-        "original_price": original_price,
-        "discount_amount": discount_amount,
-        "final_price": final_price,
+        "nights": breakdown["nights"],
+        "price_per_night": breakdown["price_per_night"],
+        "original_price": breakdown["original_price"],
+        "discount_amount": breakdown["discount_amount"],
+        "final_price": breakdown["final_price"],
+        "savings": breakdown["savings"],
+        "discount_type": breakdown["discount_type"],
+        "discount_percent": breakdown["discount_percent"],
+        "discount_fixed_amount": breakdown["discount_amount"],
     }
 
 
@@ -1197,6 +1326,29 @@ def reorder_homestay_images(
     }
 
 
+def _acquire_homestay_lock(db: Session, homestay_id: int):
+    """Acquire exclusive transaction app lock on SQL Server to prevent concurrent race conditions."""
+    if db.bind and db.bind.dialect.name == "mssql":
+        lock_result = db.execute(
+            text("""
+                DECLARE @result INT;
+                EXEC @result = sp_getapplock
+                    @Resource = :resource,
+                    @LockMode = 'Exclusive',
+                    @LockOwner = 'Transaction',
+                    @LockTimeout = 10000;
+                SELECT @result;
+            """),
+            {"resource": f"homestay_booking_{homestay_id}"},
+        ).scalar()
+        if lock_result is None or lock_result < 0:
+            db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="Booking service is busy. Please try again.",
+            )
+
+
 # ==========================================
 # AVAILABILITY & BLACKOUT DATES ENDPOINTS
 # ==========================================
@@ -1214,6 +1366,7 @@ def create_availability_block(
     current_user: Annotated[User, Depends(require_homestay_manager)],
 ):
     _get_homestay_for_management(homestay_id, current_user, db)
+    _acquire_homestay_lock(db, homestay_id)
 
     # 1. Check for overlapping active blocks
     overlapping_block = (
@@ -1232,21 +1385,31 @@ def create_availability_block(
             detail="Blackout range overlaps with an existing availability block",
         )
 
-    # 2. Check for overlapping confirmed bookings
+    # 2. Check for active inventory reservations (confirmed, in-progress, unexpired awaiting_payment)
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     overlapping_booking = (
         db.query(Booking)
         .filter(
             Booking.homestay_id == homestay_id,
-            Booking.status == "confirmed",
             Booking.check_in < request.end_date,
             Booking.check_out > request.start_date,
+            or_(
+                Booking.status.in_(["confirmed", "in_progress"]),
+                and_(
+                    Booking.status == "awaiting_payment",
+                    or_(
+                        Booking.payment_expires_at.is_(None),
+                        Booking.payment_expires_at > now_utc,
+                    ),
+                ),
+            ),
         )
         .first()
     )
     if overlapping_booking:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Cannot block dates that overlap with an existing confirmed booking",
+            detail="Cannot block dates that overlap with an existing active booking reservation",
         )
 
     block = HomestayAvailabilityBlock(

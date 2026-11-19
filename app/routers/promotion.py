@@ -83,7 +83,9 @@ def create_promotion(
         homestay_id=homestay.id,
         title=request.title,
         description=request.description,
+        discount_type=request.discount_type,
         discount_percent=request.discount_percent,
+        discount_amount=request.discount_amount,
         start_date=request.start_date,
         end_date=request.end_date,
         is_active=True,
@@ -160,7 +162,9 @@ def update_promotion(
 
     promotion.title = request.title
     promotion.description = request.description
+    promotion.discount_type = request.discount_type
     promotion.discount_percent = request.discount_percent
+    promotion.discount_amount = request.discount_amount
     promotion.start_date = request.start_date
     promotion.end_date = request.end_date
     promotion.is_active = request.is_active

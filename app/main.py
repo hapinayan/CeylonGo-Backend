@@ -1,5 +1,6 @@
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -125,6 +126,36 @@ from app.routers.rental_bookings import (
     router as rental_bookings_router,
 )
 
+from app.services.booking_expiration import (
+    start_expiration_worker,
+    stop_expiration_worker,
+)
+
+# ==========================================
+# LIFESPAN & APPLICATION LIFECYCLE
+# ==========================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Only run background expiration worker in runtime/production, strictly bypass during test suites
+    is_testing = (
+        "pytest" in sys.modules
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+        or os.getenv("TESTING") == "1"
+    )
+    if not is_testing:
+        start_expiration_worker(interval_seconds=60)
+        try:
+            yield
+        finally:
+            await stop_expiration_worker()
+    else:
+        yield
+
+# Avoid deadlocking Starlette TestClient / anyio under pytest
+import sys
+app_lifespan = None if ("pytest" in sys.modules or os.getenv("TESTING") == "1") else lifespan
+
 # ==========================================
 # LOCAL TOUR GUIDE MODULE 05 ROUTER IMPORT
 # ==========================================
@@ -141,6 +172,7 @@ app = FastAPI(
     title="CeylonGo API",
     description="Backend API for the CeylonGo tourism platform",
     version="1.0.0",
+    lifespan=app_lifespan,
 )
 
 # ==========================================

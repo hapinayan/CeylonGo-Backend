@@ -38,7 +38,7 @@ class Booking(Base):
             name="CK_bookings_total_price",
         ),
         CheckConstraint(
-            "status IN ('pending', 'confirmed', 'in_progress', 'completed', 'cancelled', 'rejected', 'expired')",
+            "status IN ('pending', 'awaiting_payment', 'confirmed', 'in_progress', 'completed', 'cancelled', 'rejected', 'expired')",
             name="CK_bookings_status",
         ),
         CheckConstraint(
@@ -123,6 +123,39 @@ class Booking(Base):
 
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime().with_variant(mssql.DATETIME2(), "mssql"),
+        nullable=True,
+    )
+
+    # Provider Approval & Payment Expiration
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime().with_variant(mssql.DATETIME2(), "mssql"),
+        nullable=True,
+    )
+
+    payment_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime().with_variant(mssql.DATETIME2(), "mssql"),
+        nullable=True,
+        index=True,
+    )
+
+    expired_at: Mapped[datetime | None] = mapped_column(
+        DateTime().with_variant(mssql.DATETIME2(), "mssql"),
+        nullable=True,
+    )
+
+    # Commission & Financial Snapshots (10% online Homestay booking commission)
+    commission_rate: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2),
+        nullable=True,
+    )
+
+    commission_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+    )
+
+    provider_payable_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
         nullable=True,
     )
 

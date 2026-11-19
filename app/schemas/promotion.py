@@ -211,10 +211,23 @@ class PromotionCreateRequest(BaseModel):
         max_length=1000,
     )
 
-    discount_percent: Decimal = Field(
+    discount_type: str = Field(
+        default="percentage",
+        pattern="^(percentage|fixed)$",
+    )
+
+    discount_percent: Decimal | None = Field(
+        default=None,
         gt=0,
         le=100,
         max_digits=5,
+        decimal_places=2,
+    )
+
+    discount_amount: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=12,
         decimal_places=2,
     )
 
@@ -235,6 +248,25 @@ class PromotionCreateRequest(BaseModel):
                 "End date cannot be before start date"
             )
 
+        if self.discount_type == "percentage":
+            if self.discount_percent is None:
+                raise ValueError(
+                    "discount_percent is required for percentage discount_type (1 to 100)"
+                )
+            if self.discount_amount is not None:
+                raise ValueError(
+                    "discount_amount must be None for percentage discount_type"
+                )
+        elif self.discount_type == "fixed":
+            if self.discount_amount is None:
+                raise ValueError(
+                    "discount_amount is required for fixed discount_type (must be positive)"
+                )
+            if self.discount_percent is not None:
+                raise ValueError(
+                    "discount_percent must be None for fixed discount_type"
+                )
+
         return self
 
 
@@ -248,10 +280,23 @@ class PromotionUpdateRequest(BaseModel):
         max_length=1000,
     )
 
-    discount_percent: Decimal = Field(
+    discount_type: str = Field(
+        default="percentage",
+        pattern="^(percentage|fixed)$",
+    )
+
+    discount_percent: Decimal | None = Field(
+        default=None,
         gt=0,
         le=100,
         max_digits=5,
+        decimal_places=2,
+    )
+
+    discount_amount: Decimal | None = Field(
+        default=None,
+        gt=0,
+        max_digits=12,
         decimal_places=2,
     )
 
@@ -273,6 +318,25 @@ class PromotionUpdateRequest(BaseModel):
                 "End date cannot be before start date"
             )
 
+        if self.discount_type == "percentage":
+            if self.discount_percent is None:
+                raise ValueError(
+                    "discount_percent is required for percentage discount_type (1 to 100)"
+                )
+            if self.discount_amount is not None:
+                raise ValueError(
+                    "discount_amount must be None for percentage discount_type"
+                )
+        elif self.discount_type == "fixed":
+            if self.discount_amount is None:
+                raise ValueError(
+                    "discount_amount is required for fixed discount_type (must be positive)"
+                )
+            if self.discount_percent is not None:
+                raise ValueError(
+                    "discount_percent must be None for fixed discount_type"
+                )
+
         return self
 
 
@@ -285,7 +349,9 @@ class HomestayPromotionResponse(BaseModel):
     homestay_id: int
     title: str
     description: str | None
-    discount_percent: Decimal
+    discount_type: str = "percentage"
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal | None = None
     start_date: date
     end_date: date
     is_active: bool

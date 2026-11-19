@@ -9,12 +9,18 @@ class BookingCreate(BaseModel):
     check_in: date
     check_out: date
     guests: int = Field(gt=0)
+    payment_method: str = Field(default="online")
+    attribution_token: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def validate_dates(self):
         if self.check_out <= self.check_in:
             raise ValueError(
                 "Check-out date must be after check-in date"
+            )
+        if self.payment_method not in ("online", "pay_at_location"):
+            raise ValueError(
+                "payment_method must be either 'online' or 'pay_at_location'"
             )
         return self
 
@@ -58,6 +64,12 @@ class BookingResponse(BaseModel):
     cancellation_reason: str | None = None
     cancelled_at: datetime | None = None
     cancelled_by: int | None = None
+    approved_at: datetime | None = None
+    payment_expires_at: datetime | None = None
+    expired_at: datetime | None = None
+    commission_rate: Decimal | None = None
+    commission_amount: Decimal | None = None
+    provider_payable_amount: Decimal | None = None
     created_at: datetime
     updated_at: datetime | None = None
 

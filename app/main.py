@@ -163,6 +163,7 @@ app_lifespan = None if ("pytest" in sys.modules or os.getenv("TESTING") == "1") 
 from app.routers.tour_guide import (
     router as tour_guide_router,
 )
+from app.routers.weather import router as weather_router
 
 # ==========================================
 # FASTAPI APPLICATION
@@ -299,6 +300,7 @@ app.include_router(rental_bookings_router)
 # ==========================================
 
 app.include_router(tour_guide_router)
+app.include_router(weather_router)
 
 # ==========================================
 # HEALTH CHECK API

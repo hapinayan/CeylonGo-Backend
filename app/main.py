@@ -126,6 +126,14 @@ from app.routers.rental_bookings import (
 )
 
 # ==========================================
+# LOCAL TOUR GUIDE MODULE 05 ROUTER IMPORT
+# ==========================================
+
+from app.routers.tour_guide import (
+    router as tour_guide_router,
+)
+
+# ==========================================
 # FASTAPI APPLICATION
 # ==========================================
 
@@ -253,6 +261,12 @@ app.include_router(admin_eco_promotions_router)
 
 app.include_router(rental_vehicles_router)
 app.include_router(rental_bookings_router)
+
+# ==========================================
+# LOCAL TOUR GUIDE MODULE 05
+# ==========================================
+
+app.include_router(tour_guide_router)
 
 # ==========================================
 # HEALTH CHECK API

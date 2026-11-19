@@ -69,6 +69,7 @@ from app.models.homestay import (
     Homestay,
     HomestayImage,
     HomestayAmenity,
+    HomestayAvailabilityBlock,
 )
 
 
@@ -89,6 +90,7 @@ def homestay_test_client():
         tables=[
             User.__table__,
             Homestay.__table__,
+            HomestayAvailabilityBlock.__table__,
             HomestayImage.__table__,
             HomestayAmenity.__table__,
             Booking.__table__,

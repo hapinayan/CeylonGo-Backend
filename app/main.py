@@ -126,6 +126,24 @@ from app.routers.rental_vehicles import (
 from app.routers.rental_bookings import (
     router as rental_bookings_router,
 )
+from app.routers.rental_locations import (
+    router as rental_locations_router,
+)
+from app.routers.rental_reviews import (
+    router as rental_reviews_router,
+)
+from app.routers.rental_wishlists import (
+    router as rental_wishlists_router,
+)
+from app.routers.rental_providers import (
+    router as rental_providers_router,
+)
+from app.routers.admin_rentals import (
+    router as admin_rentals_router,
+)
+from app.routers.rental_eligibility import (
+    router as rental_eligibility_router,
+)
 
 from app.services.booking_expiration import (
     start_expiration_worker,
@@ -298,6 +316,12 @@ app.include_router(admin_eco_promotions_router)
 app.include_router(rental_vehicles_router)
 app.include_router(rental_pickups_router)
 app.include_router(rental_bookings_router)
+app.include_router(rental_locations_router)
+app.include_router(rental_reviews_router)
+app.include_router(rental_wishlists_router)
+app.include_router(rental_providers_router)
+app.include_router(admin_rentals_router)
+app.include_router(rental_eligibility_router)
 
 # ==========================================
 # LOCAL TOUR GUIDE MODULE 05

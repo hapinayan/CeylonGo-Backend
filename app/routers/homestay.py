@@ -819,7 +819,7 @@ def preview_homestay_price(
         "savings": breakdown["savings"],
         "discount_type": breakdown["discount_type"],
         "discount_percent": breakdown["discount_percent"],
-        "discount_fixed_amount": breakdown["discount_amount"],
+        "discount_fixed_amount": breakdown.get("discount_fixed_amount"),
     }
 
 

@@ -1,9 +1,8 @@
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     CheckConstraint,
-    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -21,7 +20,7 @@ class RentalBooking(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "end_date >= start_date",
+            "return_at > pickup_at",
             name="CK_rental_booking_dates",
         ),
         CheckConstraint(
@@ -48,12 +47,12 @@ class RentalBooking(Base):
         index=True,
     )
 
-    start_date: Mapped[date] = mapped_column(
-        Date, nullable=False
+    pickup_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False
     )
 
-    end_date: Mapped[date] = mapped_column(
-        Date, nullable=False
+    return_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False
     )
 
     total_price: Mapped[Decimal] = mapped_column(
@@ -95,3 +94,9 @@ class RentalBooking(Base):
 
     vehicle = relationship("RentalVehicle", backref="bookings")
     user = relationship("User", foreign_keys=[user_id])
+    cancelled_by_user = relationship("User", foreign_keys=[cancelled_by])
+    pickup_location = relationship("RentalLocation", foreign_keys=[pickup_location_id])
+    return_location = relationship("RentalLocation", foreign_keys=[return_location_id])
+    inspections = relationship("RentalInspection", back_populates="booking", cascade="all, delete-orphan")
+    incidents = relationship("RentalIncident", back_populates="booking", cascade="all, delete-orphan")
+    deposits = relationship("RentalDeposit", back_populates="booking", cascade="all, delete-orphan")

@@ -1056,7 +1056,9 @@ def test_active_promotions_filter_by_homestay_id():
     promotion.homestay_id = 5
     promotion.title = "Test Promotion"
     promotion.description = None
+    promotion.discount_type = "percentage"
     promotion.discount_percent = "20.00"
+    promotion.discount_amount = None
     promotion.start_date = date.today()
     promotion.end_date = date.today()
     promotion.is_active = True

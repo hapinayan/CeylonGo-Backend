@@ -9,6 +9,12 @@ from app.core.dependencies import (
     require_admin,
     require_approved_provider,
 )
+from app.core.location_validation import (
+    ARTISAN_LOCATION_FIELDS,
+    ARTISAN_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
+)
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
 from app.models.provider_profile import ProviderProfile
@@ -165,6 +171,7 @@ def create_artisan_listing(
             detail="Access forbidden: only artisan service providers can create artisan listings",
         )
 
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     new_listing = ArtisanListing(
         provider_profile_id=provider_profile.id,
         title=payload.title,
@@ -216,8 +223,20 @@ def update_artisan_listing(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    if {"latitude", "longitude"} & update_data.keys():
+        validate_coordinate_pair(
+            update_data.get("latitude", listing.latitude),
+            update_data.get("longitude", listing.longitude),
+        )
+    if any(
+        field in update_data and update_data[field] != getattr(listing, field)
+        for field in ARTISAN_LOCATION_FIELDS
+    ):
+        update_data["is_verified"] = False
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
 
     db.commit()
     db.refresh(listing)
@@ -274,8 +293,11 @@ def update_listing_status(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    if "is_verified" in update_data:
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
 
     db.commit()
     db.refresh(listing)

@@ -5,6 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_approved_provider
+from app.core.location_validation import (
+    ACTIVITY_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
+)
 from app.database.connection import get_db
 from app.models.activity import Activity
 from app.models.provider_profile import ProviderProfile
@@ -75,6 +80,7 @@ def create_activity(
     ],
     db: Annotated[Session, Depends(get_db)],
 ):
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     activity = Activity(
         **payload.model_dump(),
         provider_profile_id=provider_profile.id,
@@ -169,18 +175,21 @@ def update_activity(
         )
 
     updates = payload.model_dump(exclude_unset=True)
-
-    for field, value in updates.items():
-        setattr(activity, field, value)
+    if {"latitude", "longitude"} & updates.keys():
+        validate_coordinate_pair(
+            updates.get("latitude", activity.latitude),
+            updates.get("longitude", activity.longitude),
+        )
 
     if activity.approval_status == "rejected":
-        activity.approval_status = "draft"
-        activity.rejection_reason = None
-        activity.reviewed_by = None
-        activity.reviewed_at = None
-        activity.is_active = False
+        updates.update(
+            approval_status="draft", rejection_reason=None, reviewed_by=None,
+            reviewed_at=None, is_active=False,
+        )
 
     try:
+        if updates:
+            write_review_snapshot(db, activity, ACTIVITY_REVIEW_STATE, updates)
         db.commit()
         db.refresh(activity)
     except Exception:

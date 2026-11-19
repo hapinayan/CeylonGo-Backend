@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.dependencies import require_admin
 from app.core.listing_sync import sync_homestay_listing_reference
+from app.core.location_validation import HOMESTAY_REVIEW_STATE, write_review_snapshot
 from app.core.notification_service import create_notification
 from app.database.connection import get_db
 from app.models.booking import Booking
@@ -237,17 +238,20 @@ def review_homestay(
 ):
     homestay = _get_homestay_or_404(homestay_id, db)
 
-    homestay.approval_status = payload.decision
-    homestay.reviewed_by = admin.id
-    homestay.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    changes = {
+        "approval_status": payload.decision,
+        "reviewed_by": admin.id,
+        "reviewed_at": datetime.now(timezone.utc).replace(tzinfo=None),
+    }
 
     if payload.decision == "approved":
-        homestay.rejection_reason = None
-        homestay.is_active = True
+        changes.update(rejection_reason=None, is_active=True)
     elif payload.decision == "rejected":
-        homestay.rejection_reason = payload.reason
+        changes["rejection_reason"] = payload.reason
     elif payload.decision == "suspended":
-        homestay.is_active = False
+        changes["is_active"] = False
+
+    write_review_snapshot(db, homestay, HOMESTAY_REVIEW_STATE, changes)
 
     # Synchronize with central listing_references
     sync_homestay_listing_reference(db, homestay)

@@ -74,6 +74,12 @@ from app.core.dependencies import (
     require_approved_provider,
 )
 from app.core.email import send_eco_badge_decision_email
+from app.core.location_validation import (
+    ECO_LOCATION_FIELDS,
+    ECO_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
+)
 from app.core.security import create_sponsored_tracking_token
 from app.database.connection import get_db
 from app.models.eco_experience import (
@@ -846,6 +852,7 @@ def create_eco_experience(
         db, payload.linked_homestay_id, payload.eco_category
     )
 
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     experience = EcoExperience(
         provider_profile_id=provider_profile.id,
         linked_homestay_id=payload.linked_homestay_id,
@@ -1012,8 +1019,26 @@ def update_eco_experience(
             detail="conservation_factual_contribution must be distinct from conservation_marketing_statement",
         )
 
-    for key, value in update_data.items():
-        setattr(experience, key, value)
+    if {"latitude", "longitude"} & update_data.keys():
+        validate_coordinate_pair(
+            update_data.get("latitude", experience.latitude),
+            update_data.get("longitude", experience.longitude),
+        )
+    if any(
+        field in update_data and update_data[field] != getattr(experience, field)
+        for field in ECO_LOCATION_FIELDS
+    ):
+        if experience.listing_status == "pending_approval":
+            raise HTTPException(409, detail="Location is currently under review")
+        if experience.listing_status == "approved":
+            update_data.update(
+                listing_status="draft", is_published=False,
+                approval_reviewed_by=None, approval_reviewed_at=None,
+            )
+        write_review_snapshot(db, experience, ECO_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(experience, key, value)
 
     experience.updated_at = datetime.now(UTC)
     db.commit()
@@ -1123,12 +1148,11 @@ def toggle_eco_experience_publication(
             detail=f"Cannot publish an eco experience with status '{experience.listing_status}'. Only admin-approved listings can be published.",
         )
 
-    experience.is_published = payload.is_published
-    if not payload.is_published:
-        experience.listing_status = "deactivated"
-    else:
-        experience.listing_status = "approved"
-    experience.updated_at = datetime.now(UTC)
+    write_review_snapshot(db, experience, ECO_REVIEW_STATE, {
+        "is_published": payload.is_published,
+        "listing_status": "approved" if payload.is_published else "deactivated",
+        "updated_at": datetime.now(UTC),
+    })
 
     db.commit()
     db.refresh(experience)
@@ -1412,11 +1436,13 @@ def admin_approve_eco_experience(
         )
 
     now = datetime.now(UTC)
-    experience.listing_status = "approved"
-    experience.approval_reviewed_by = admin_user.id
-    experience.approval_reviewed_at = now
-    experience.approval_rejection_reason = None
-    experience.updated_at = now
+    write_review_snapshot(db, experience, ECO_REVIEW_STATE, {
+        "listing_status": "approved",
+        "approval_reviewed_by": admin_user.id,
+        "approval_reviewed_at": now,
+        "approval_rejection_reason": None,
+        "updated_at": now,
+    })
 
     db.commit()
     db.refresh(experience)

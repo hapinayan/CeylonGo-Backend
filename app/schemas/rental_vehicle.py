@@ -150,6 +150,7 @@ class RentalCategoryItem(BaseModel):
 
 class RentalVehicleCreate(BaseModel):
     vehicle_type: VehicleType
+    location_id: int | None = Field(default=None, gt=0)
 
     vehicle_name: str = Field(
         min_length=2,
@@ -174,7 +175,6 @@ class RentalVehicleCreate(BaseModel):
     fuel_type: str = Field(default="petrol", max_length=20)
     district: str | None = Field(default=None, max_length=100)
     city: str | None = Field(default=None, max_length=100)
-    location_id: int | None = None
     cancellation_policy: str | None = Field(default=None, max_length=1000)
     free_cancellation_hours: int = Field(default=24, ge=0)
     helmet_count: int | None = Field(default=0, ge=0)
@@ -211,7 +211,7 @@ class RentalVehicleUpdate(BaseModel):
     fuel_type: str | None = Field(default=None, max_length=20)
     district: str | None = Field(default=None, max_length=100)
     city: str | None = Field(default=None, max_length=100)
-    location_id: int | None = None
+    location_id: int | None = Field(default=None, gt=0)
     cancellation_policy: str | None = Field(default=None, max_length=1000)
     free_cancellation_hours: int | None = Field(default=None, ge=0)
     helmet_count: int | None = Field(default=None, ge=0)
@@ -231,6 +231,7 @@ class RentalVehicleResponse(BaseModel):
     description: str | None
     price_per_day: Decimal
     status: VehicleStatus
+    location_id: int | None = None
     created_at: datetime
 
 
@@ -341,3 +342,25 @@ class RentalProviderContactResponse(BaseModel):
     is_verified: bool
 
 
+class RentalPickupInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    location_name: str = Field(min_length=2, max_length=150)
+    district: str = Field(min_length=2, max_length=100)
+    city: str = Field(min_length=2, max_length=100)
+    address: str | None = Field(default=None, max_length=500)
+    latitude: Decimal = Field(ge=-90, le=90, max_digits=9, decimal_places=6)
+    longitude: Decimal = Field(ge=-180, le=180, max_digits=9, decimal_places=6)
+
+
+class RentalPickupResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    location_name: str
+    district: str
+    city: str
+    address: str | None
+    latitude: Decimal | None
+    longitude: Decimal | None
+    is_active: bool

@@ -105,8 +105,14 @@ def update_tour_guide(payload: TourGuideUpdate, guide: OwnedGuide, db: DatabaseS
     if (latitude is None) != (longitude is None):
         raise HTTPException(status_code=422, detail="Latitude and longitude must be provided together")
 
-    if "base_latitude" in changes or "base_longitude" in changes:
-        # A partial PATCH depends on the coordinate pair read by this request.
+    location_fields = ("base_latitude", "base_longitude", "base_city", "base_district")
+    if any(key in changes and changes[key] != getattr(guide, key) for key in location_fields):
+        if guide.approval_status == "pending":
+            raise HTTPException(409, detail="Location is currently under review")
+        if guide.approval_status == "approved":
+            changes.update(
+                approval_status="draft", is_active=False, reviewed_by=None, reviewed_at=None,
+            )
         try:
             updated = (
                 db.query(TourGuide)
@@ -114,6 +120,9 @@ def update_tour_guide(payload: TourGuideUpdate, guide: OwnedGuide, db: DatabaseS
                     TourGuide.id == guide.id,
                     TourGuide.base_latitude == guide.base_latitude,
                     TourGuide.base_longitude == guide.base_longitude,
+                    TourGuide.base_city == guide.base_city,
+                    TourGuide.base_district == guide.base_district,
+                    TourGuide.approval_status == guide.approval_status,
                 )
                 .update(changes, synchronize_session=False)
             )
@@ -132,6 +141,29 @@ def update_tour_guide(payload: TourGuideUpdate, guide: OwnedGuide, db: DatabaseS
     for field, value in changes.items():
         setattr(guide, field, value)
     commit_changes(db)
+    return guide
+
+
+@router.post("/submit", response_model=TourGuideResponse)
+def submit_guide_for_location_review(guide: OwnedGuide, db: DatabaseSession):
+    if guide.base_latitude is None or guide.base_longitude is None:
+        raise HTTPException(422, detail="Provide a public base location before submission")
+    if guide.approval_status not in ("draft", "rejected"):
+        raise HTTPException(409, detail="Only draft or rejected profiles can be submitted")
+    updated = db.query(TourGuide).filter(
+        TourGuide.id == guide.id, TourGuide.approval_status == guide.approval_status,
+        TourGuide.base_latitude == guide.base_latitude,
+        TourGuide.base_longitude == guide.base_longitude,
+        TourGuide.base_city == guide.base_city, TourGuide.base_district == guide.base_district,
+    ).update(
+        {"approval_status": "pending", "is_active": False, "rejection_reason": None},
+        synchronize_session=False,
+    )
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(409, detail="Tour guide location or review status changed")
+    commit_changes(db)
+    db.expire(guide)
     return guide
 
 

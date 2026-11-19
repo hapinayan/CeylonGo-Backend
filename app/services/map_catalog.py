@@ -15,6 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
+from app.core.publication import public_homestay
 from app.models.activity import Activity
 from app.models.activity_image import ActivityImage
 from app.models.artisan_listing import ArtisanListing
@@ -131,7 +132,10 @@ def with_provider(query, provider_id):
     return (
         query.join(ProviderProfile, ProviderProfile.id == provider_id)
         .join(User, User.id == ProviderProfile.user_id)
-        .where(ProviderProfile.approval_status == "approved", User.is_active == true())
+        .where(
+            ProviderProfile.approval_status == "approved", User.is_active == true(),
+            User.role == "provider",
+        )
     )
 
 
@@ -150,7 +154,7 @@ def source_queries():
         (activity.category == "community", "community_activity"),
         else_=activity.category,
     )
-    yield with_provider(
+    yield (
         projection(
             "homestay",
             home,
@@ -169,11 +173,7 @@ def source_queries():
             rating=published_rating("homestay", home.id),
             price=home.price_per_night,
             currency="LKR",
-        ),
-        home.provider_profile_id,
-    ).where(
-        home.approval_status == "approved",
-        home.is_active == true(),
+        ).where(public_homestay())
     )
     yield with_provider(
         projection(

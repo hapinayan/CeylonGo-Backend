@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import lock_booking_resource
 from app.core.dependencies import require_admin
 from app.core.homestay_permissions import require_homestay_manager
 from app.core.listing_sync import (
@@ -12,6 +13,7 @@ from app.core.listing_sync import (
     sync_homestay_listing_reference,
 )
 from app.core.notification_service import create_notification
+from app.core.publication import public_homestay
 from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import Homestay
@@ -32,8 +34,13 @@ router = APIRouter(
 )
 
 
-def _get_homestay_listing_ref(db: Session, homestay_id: int) -> tuple[Homestay, ListingReference]:
-    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+def _get_homestay_listing_ref(
+    db: Session, homestay_id: int, *, public: bool = False,
+) -> tuple[Homestay, ListingReference]:
+    query = db.query(Homestay).filter(Homestay.id == homestay_id)
+    if public:
+        query = query.filter(public_homestay())
+    homestay = query.first()
     if not homestay or not homestay.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -73,7 +80,6 @@ def submit_homestay_review(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    homestay, listing_ref = _get_homestay_listing_ref(db, homestay_id)
 
     # Validate booking exists and belongs to this traveler
     booking = (
@@ -91,6 +97,10 @@ def submit_homestay_review(
             detail="Eligible booking not found for this homestay",
         )
 
+    lock_booking_resource(db, f"homestay_booking_{homestay_id}")
+    db.refresh(booking)
+    homestay, listing_ref = _get_homestay_listing_ref(db, homestay_id)
+
     # Review eligibility: only completed bookings can be reviewed
     if booking.status != "completed":
         raise HTTPException(
@@ -99,7 +109,9 @@ def submit_homestay_review(
         )
 
     booking_ref = sync_homestay_booking_reference(db, booking, homestay)
-    booking_ref_id = booking_ref.id if booking_ref else None
+    if booking_ref is None:
+        raise HTTPException(409, "Booking has no review reference")
+    booking_ref_id = booking_ref.id
 
     # Enforce strictly one review per booking
     if booking_ref_id:
@@ -123,6 +135,7 @@ def submit_homestay_review(
         comment=payload.comment,
         is_verified_booking=True,
         is_published=True,
+        updated_at=func.sysutcdatetime(),
     )
     db.add(review)
     db.flush()
@@ -172,7 +185,7 @@ def list_homestay_reviews(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=50)] = 10,
 ):
-    _, listing_ref = _get_homestay_listing_ref(db, homestay_id)
+    _, listing_ref = _get_homestay_listing_ref(db, homestay_id, public=True)
 
     query = (
         db.query(Review, User.full_name)

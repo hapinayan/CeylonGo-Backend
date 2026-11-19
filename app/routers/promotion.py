@@ -11,6 +11,7 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_homestay
 from app.core.homestay_permissions import (
     check_homestay_ownership,
     require_homestay_manager,
@@ -208,7 +209,7 @@ def list_active_promotions(
             HomestayPromotion.is_active == True,
             HomestayPromotion.start_date <= today,
             HomestayPromotion.end_date >= today,
-            Homestay.is_active == True,
+            public_homestay(),
         )
     )
 

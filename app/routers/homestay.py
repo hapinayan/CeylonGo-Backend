@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, and_, or_, text
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.publication import public_homestay
 from app.core.dependencies import require_approved_provider
 from app.core.homestay_permissions import (
     check_homestay_ownership,
@@ -59,7 +60,9 @@ from app.schemas.homestay_dashboard import (
     HomestayProviderMarketingSummary,
     HomestayProviderRatingSummary,
 )
+from app.schemas.provider_workspace import DashboardPeriod
 from app.services.map_location_management import record_location_correction
+from app.services.provider_dashboard_finance import finance_totals
 
 router = APIRouter(
     prefix="/api/v1/homestays",
@@ -270,8 +273,7 @@ def list_homestays(
     ] = None,
 ):
     query = db.query(Homestay).filter(
-        Homestay.is_active == True,
-        Homestay.approval_status == "approved",
+        public_homestay(),
     )
 
     if location and location.strip():
@@ -442,14 +444,25 @@ def get_provider_dashboard(
     ],
 ):
     """Aggregate dashboard metrics for the authenticated homestay provider."""
+    if current_provider.provider_type != "homestay":
+        raise HTTPException(403, detail="Homestay provider access required")
+
     # 1. Owned homestays
     homestays = (
         db.query(Homestay)
         .filter(
-            (Homestay.provider_profile_id == current_provider.id)
-            | (
-                (Homestay.provider_profile_id == None)
-                & (Homestay.owner_id == current_provider.user_id)
+            or_(
+                and_(
+                    Homestay.provider_profile_id == current_provider.id,
+                    or_(
+                        Homestay.owner_id.is_(None),
+                        Homestay.owner_id == current_provider.user_id,
+                    ),
+                ),
+                and_(
+                    Homestay.provider_profile_id.is_(None),
+                    Homestay.owner_id == current_provider.user_id,
+                ),
             )
         )
         .all()
@@ -492,14 +505,12 @@ def get_provider_dashboard(
     )
 
     # 3. Finances
-    online_earnings = Decimal("0.00")
-    cash_received = Decimal("0.00")
-
-    for b in bookings:
-        if b.payment_method == "cash" and b.cash_received_amount:
-            cash_received += Decimal(str(b.cash_received_amount))
-        elif b.status in ("confirmed", "completed"):
-            online_earnings += Decimal(str(b.total_price))
+    receipts = finance_totals(
+        db, current_provider.id, Homestay.id.in_(homestay_ids), DashboardPeriod()
+    ).get((), [])
+    lkr = next((receipt for receipt in receipts if receipt.currency == "LKR"), None)
+    online_earnings = lkr.verified_revenue if lkr else Decimal("0.00")
+    cash_received = lkr.cash_collections if lkr else Decimal("0.00")
 
     total_earnings = online_earnings + cash_received
 
@@ -513,7 +524,7 @@ def get_provider_dashboard(
         .all()
     )
     pending_settlements_amount = sum(
-        (Decimal(str(s.net_amount)) for s in pending_settlements),
+        (s.net_payable for s in pending_settlements),
         Decimal("0.00"),
     )
 
@@ -567,21 +578,20 @@ def get_provider_dashboard(
             .filter(
                 ListingReference.module_type == "homestay",
                 ListingReference.target_id.in_(homestay_ids),
+                    ListingReference.provider_profile_id == current_provider.id,
             )
             .all()
         ]
         if listing_ref_ids:
-            reviews = (
-                db.query(Review)
+            total_reviews, mean_rating = (
+                db.query(func.count(Review.id), func.avg(Review.rating))
                 .filter(
                     Review.listing_reference_id.in_(listing_ref_ids),
-                    Review.moderation_status == "approved",
+                    Review.is_published == True,
                 )
-                .all()
+                .one()
             )
-            total_reviews = len(reviews)
-            if total_reviews > 0:
-                avg_rating = round(sum(r.rating for r in reviews) / total_reviews, 2)
+            avg_rating = round(float(mean_rating), 2) if mean_rating is not None else 0.0
 
     ratings_summary = HomestayProviderRatingSummary(
         average_rating=avg_rating,
@@ -613,7 +623,7 @@ def get_homestay(
         )
         .filter(
             Homestay.id == homestay_id,
-            Homestay.is_active == True,
+            public_homestay(),
         )
         .first()
     )
@@ -642,8 +652,7 @@ def get_homestay_provider_contact(
         db.query(Homestay)
         .filter(
             Homestay.id == homestay_id,
-            Homestay.is_active == True,
-            Homestay.approval_status == "approved",
+            public_homestay(),
         )
         .first()
     )
@@ -708,7 +717,7 @@ def check_homestay_availability(
         db.query(Homestay)
         .filter(
             Homestay.id == homestay_id,
-            Homestay.is_active == True,
+            public_homestay(),
         )
         .first()
     )
@@ -788,7 +797,7 @@ def preview_homestay_price(
         db.query(Homestay)
         .filter(
             Homestay.id == homestay_id,
-            Homestay.is_active == True,
+            public_homestay(),
         )
         .first()
     )
@@ -819,7 +828,7 @@ def preview_homestay_price(
         "savings": breakdown["savings"],
         "discount_type": breakdown["discount_type"],
         "discount_percent": breakdown["discount_percent"],
-        "discount_fixed_amount": breakdown.get("discount_fixed_amount"),
+        "discount_fixed_amount": breakdown["discount_fixed_amount"],
     }
 
 

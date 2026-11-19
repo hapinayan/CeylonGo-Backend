@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PaymentInitiateResponse(BaseModel):
@@ -35,6 +35,10 @@ class PaymentStatusResponse(BaseModel):
     transaction_id: int | None = None
 
 
+class GuidePaymentStatusResponse(PaymentStatusResponse):
+    payment_expires_at: datetime | None = None
+
+
 class RefundRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -60,6 +64,11 @@ class RefundResponse(BaseModel):
     processed_by: int | None = None
     processed_at: datetime | None = None
     created_at: datetime
+
+    @field_validator("refund_status", mode="before")
+    @classmethod
+    def public_refund_status(cls, value: str) -> str:
+        return "completed" if value == "processed" else value
 
 
 class ProviderEarningsSummaryResponse(BaseModel):

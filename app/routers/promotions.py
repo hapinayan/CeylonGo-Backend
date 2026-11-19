@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -58,7 +59,7 @@ def list_promotions(
             Promotion.is_active == True,
             Promotion.start_date <= now,
             Promotion.end_date >= now,
-            ArtisanListing.is_active == True,
+            public_artisan(),
             or_(Promotion.showcase_item_id == None, ShowcaseItem.is_active == True),
         )
     )
@@ -157,7 +158,7 @@ def get_promotion(
             Promotion.is_active == True,
             Promotion.start_date <= now,
             Promotion.end_date >= now,
-            ArtisanListing.is_active == True,
+            public_artisan(),
             or_(Promotion.showcase_item_id == None, ShowcaseItem.is_active == True),
         )
         .first()
@@ -186,7 +187,7 @@ def get_listing_promotions(
     """
     listing = (
         db.query(ArtisanListing)
-        .filter(ArtisanListing.id == listing_id, ArtisanListing.is_active == True)
+        .filter(ArtisanListing.id == listing_id, public_artisan())
         .first()
     )
     if not listing:

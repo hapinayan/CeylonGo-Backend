@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_activity, public_eco
 from app.database.connection import get_db
 from app.models.activity import Activity
+from app.models.eco_experience import EcoExperience
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
 from app.routers.provider_activities import (
@@ -76,7 +79,7 @@ def create_activity_slot(
         db.query(ActivitySlot)
         .filter(
             ActivitySlot.activity_id == activity_id,
-            ActivitySlot.is_active.is_(True),
+            ActivitySlot.is_active == True,
             ActivitySlot.starts_at < ends_at,
             ActivitySlot.ends_at > starts_at,
         )
@@ -148,8 +151,7 @@ def list_public_activity_slots(
         db.query(Activity)
         .filter(
             Activity.id == activity_id,
-            Activity.approval_status == "approved",
-            Activity.is_active.is_(True),
+            public_activity(),
         )
         .first()
     )
@@ -166,8 +168,11 @@ def list_public_activity_slots(
         db.query(ActivitySlot)
         .filter(
             ActivitySlot.activity_id == activity_id,
-            ActivitySlot.is_active.is_(True),
+            ActivitySlot.is_active == True,
             ActivitySlot.starts_at > now,
+            or_(ActivitySlot.eco_experience_id.is_(None), db.query(EcoExperience.id).filter(
+                EcoExperience.id == ActivitySlot.eco_experience_id, public_eco(),
+            ).exists()),
         )
         .order_by(ActivitySlot.starts_at.asc())
         .all()

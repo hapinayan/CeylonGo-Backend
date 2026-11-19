@@ -374,8 +374,8 @@ def test_create_booking_rejects_unapproved_vehicle(isolated_db_session, test_set
         "return_at": (now + timedelta(days=2)).isoformat(),
     }
     response = client.post("/api/v1/rental-bookings", json=payload)
-    assert response.status_code == 400
-    assert "not approved" in response.json()["detail"].lower()
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Rental vehicle not found"
 
 
 def test_create_booking_detects_overlap_pending_and_active(isolated_db_session, test_setup_data):

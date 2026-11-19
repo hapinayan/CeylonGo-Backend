@@ -1,11 +1,16 @@
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
-from sqlalchemy import func, text
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import (
+    CAPTURED, EXECUTED_REFUNDS, RESERVED_REFUNDS, capture_status,
+    executed_refund_status, lock_booking_resource,
+)
 from app.core.dependencies import require_admin
 from app.core.homestay_permissions import (
     check_homestay_ownership,
@@ -25,6 +30,7 @@ from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import (
+    AdminAuditLog,
     AdvertisingPayment,
     BookingReference,
     BookingStatusHistory,
@@ -49,6 +55,8 @@ from app.schemas.payment import (
     SettlementResponse,
 )
 from app.services.booking_expiration import expire_single_booking
+from app.services.guide_payments import handle_guide_callback
+from app.services.payhere_bookings import capture_amount, checkout_response, lock_capture
 
 router = APIRouter(
     prefix="/api/v1/payments",
@@ -83,6 +91,8 @@ def initiate_booking_payment(
             detail="You can only initiate payment for your own bookings",
         )
 
+    lock_booking_resource(db, f"homestay_booking_{booking.homestay_id}")
+    db.refresh(booking)
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Permit online checkout only for valid awaiting_payment bookings (or unexpired legacy confirmed)
@@ -125,28 +135,6 @@ def initiate_booking_payment(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot initiate payment for booking with status '{booking.status}'",
         )
-
-    # Concurrency lock on SQL Server
-    if db.bind and db.bind.dialect.name == "mssql":
-        lock_result = db.execute(
-            text("""
-                DECLARE @result INT;
-                EXEC @result = sp_getapplock
-                    @Resource = :resource,
-                    @LockMode = 'Exclusive',
-                    @LockOwner = 'Transaction',
-                    @LockTimeout = 10000;
-                SELECT @result;
-            """),
-            {"resource": f"homestay_booking_{booking.homestay_id}"},
-        ).scalar()
-        if lock_result is None or lock_result < 0:
-            db.rollback()
-            raise HTTPException(
-                status_code=503,
-                detail="Payment processing is busy. Please retry.",
-            )
-        db.refresh(booking)
 
     if booking.payment_status == "paid":
         raise HTTPException(
@@ -205,13 +193,13 @@ def initiate_booking_payment(
                 commission_amount=Decimal("0.00"),
                 provider_payable_amount=Decimal("0.00"),
                 currency=booking.currency or "LKR",
-                payment_status="paid",
+                payment_status=capture_status(db),
                 payment_method="online",
                 paid_at=now_utc,
             )
             db.add(tx)
         else:
-            tx.payment_status = "paid"
+            tx.payment_status = capture_status(db)
             tx.amount = Decimal("0.00")
             tx.gross_amount = Decimal("0.00")
             tx.commission_rate = Decimal("10.00")
@@ -302,34 +290,13 @@ def initiate_booking_payment(
 
     db.commit()
 
-    order_id = booking_ref.booking_reference
-    checkout_hash = payhere_service.generate_checkout_hash(
-        order_id=order_id,
-        amount=booking.total_price,
-        currency=booking.currency or "LKR",
-    )
-
-    name_parts = current_user.full_name.split(" ", 1)
-    first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else "Traveler"
-
-    return PaymentInitiateResponse(
-        booking_id=booking.id,
-        booking_reference=order_id,
-        merchant_id=payhere_service.merchant_id,
-        checkout_url=payhere_service.checkout_url,
-        order_id=order_id,
-        items=f"Homestay: {homestay.name} ({booking.check_in} to {booking.check_out})",
-        amount=booking.total_price,
-        currency=booking.currency or "LKR",
-        hash=checkout_hash,
-        first_name=first_name,
-        last_name=last_name,
-        email=current_user.email,
-        phone=None,
-        return_url=payhere_service.return_url,
-        cancel_url=payhere_service.cancel_url,
-        notify_url=payhere_service.notify_url,
+    return checkout_response(
+        booking.id,
+        booking_ref.booking_reference,
+        f"Homestay: {homestay.name} ({booking.check_in} to {booking.check_out})",
+        booking.total_price,
+        booking.currency or "LKR",
+        current_user,
     )
 
 
@@ -468,6 +435,9 @@ def initiate_rental_booking_payment(
             detail="You can only initiate payment for your own bookings",
         )
 
+    lock_booking_resource(db, f"rental_vehicle_booking_{rental_booking.vehicle_id}")
+    db.refresh(rental_booking)
+
     if rental_booking.status in ("cancelled", "rejected", "expired", "completed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -503,7 +473,7 @@ def initiate_rental_booking_payment(
             booking_reference=ref_code,
             module_type="rental_vehicle",
             target_booking_id=rental_booking.id,
-            user_id=current_user.id,
+            user_id=rental_booking.user_id,
             provider_profile_id=vehicle.provider_id,
             total_price=rental_booking.total_price,
             currency=rental_booking.currency or "LKR",
@@ -527,7 +497,7 @@ def initiate_rental_booking_payment(
     if not tx:
         tx = PaymentTransaction(
             booking_reference_id=booking_ref.id,
-            user_id=current_user.id,
+            user_id=rental_booking.user_id,
             gateway_name="payhere",
             amount=rental_booking.total_price,
             currency=rental_booking.currency or "LKR",
@@ -576,6 +546,71 @@ def initiate_rental_booking_payment(
 # 2. PAYHERE WEBHOOK / NOTIFICATION LISTENER
 # ==========================================
 
+def _handle_rental_capture(db, ref, payment_id, raw_amount, currency, status_code):
+    booking = db.get(RentalBooking, ref.target_booking_id)
+    if booking is None:
+        raise HTTPException(404, "Associated rental booking not found")
+    amount = capture_amount(raw_amount)
+    if status_code == "2":
+        lock_capture(db, payment_id, ref.id)
+    lock_booking_resource(db, f"rental_vehicle_booking_{booking.vehicle_id}")
+    db.refresh(booking)
+    db.refresh(ref)
+    if ref.user_id != booking.user_id or amount != booking.total_price or currency != (booking.currency or "LKR"):
+        raise HTTPException(400, "Payment does not match rental booking")
+    if booking.payment_status in ("paid", "refund_pending", "refunded"):
+        return {"status": "already_processed"}
+    tx = db.scalar(select(PaymentTransaction).where(
+        PaymentTransaction.booking_reference_id == ref.id,
+        PaymentTransaction.user_id == booking.user_id,
+        PaymentTransaction.gateway_name == "payhere",
+    ).order_by(PaymentTransaction.id.desc()).limit(1))
+    if tx is None:
+        tx = PaymentTransaction(
+            booking_reference_id=ref.id, user_id=booking.user_id,
+            gateway_name="payhere", payment_method="online", amount=amount, currency=currency,
+        )
+        db.add(tx)
+    tx.gateway_transaction_id = payment_id
+    if status_code == "2":
+        tx.payment_status = capture_status(db)
+        tx.paid_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        tx.gross_amount = amount
+        tx.commission_rate = Decimal("10.00")
+        tx.commission_amount = (amount * Decimal("0.10")).quantize(Decimal("0.01"))
+        tx.provider_payable_amount = amount - tx.commission_amount
+        if booking.status in ("cancelled", "rejected", "expired"):
+            db.flush()
+            db.add(PaymentRefund(
+                payment_transaction_id=tx.id, amount=amount, currency=currency,
+                refund_status="pending", refund_reason="Verified late rental capture requires reconciliation.",
+            ))
+            booking.payment_status = ref.payment_status = "refund_pending"
+            record_booking_status_change(
+                db, ref.id, booking.status, booking.status, None,
+                notes="Late PayHere rental capture queued for reconciliation",
+            )
+            db.commit()
+            return {"status": "requires_reconciliation", "payment_status": "refund_pending"}
+        booking.payment_status = ref.payment_status = "paid"
+        booking.payment_method = "online"
+        record_booking_status_change(
+            db, ref.id, booking.status, booking.status, None,
+            notes="PayHere rental payment confirmed",
+        )
+        create_notification(db, booking.user_id, "Rental Payment Successful!",
+                            "Your online rental payment was received.", "payment_success",
+                            f"/rentals/bookings/{booking.id}")
+        if booking.vehicle and booking.vehicle.provider:
+            create_notification(db, booking.vehicle.provider.user_id, "Rental Payment Received",
+                                "An online rental payment was received.", "payment_received",
+                                f"/provider/rentals/bookings/{booking.id}")
+    elif status_code in ("-1", "-2"):
+        tx.payment_status = "failed"
+    db.commit()
+    return {"status": "ok", "payment_status": "paid" if tx.payment_status in CAPTURED else tx.payment_status}
+
+
 def handle_payhere_callback(form_data: dict, db: Session):
     """
     Synchronous processing of PayHere IPN callback data for bookings and advertising.
@@ -594,6 +629,9 @@ def handle_payhere_callback(form_data: dict, db: Session):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing required PayHere notification parameters",
         )
+
+    if merchant_id != payhere_service.merchant_id:
+        raise HTTPException(400, "Payment merchant mismatch")
 
     # 1. Verify PayHere signature
     is_valid_sig = payhere_service.verify_ipn_signature(
@@ -633,103 +671,64 @@ def handle_payhere_callback(form_data: dict, db: Session):
             detail="Booking reference not found",
         )
 
-    # Resolve target booking strictly by module_type (Conditions 2 & 3)
-    rental_booking = None
-    homestay_booking = None
-
     if booking_ref.module_type == "rental_vehicle":
-        rental_booking = (
-            db.query(RentalBooking)
-            .filter(RentalBooking.id == booking_ref.target_booking_id)
-            .first()
+        return _handle_rental_capture(
+            db, booking_ref, payment_id, payhere_amount, payhere_currency, status_code,
         )
-        if not rental_booking:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Associated rental booking not found",
-            )
-        expected_total = rental_booking.total_price
-        expected_currency = rental_booking.currency or "LKR"
-        target_user_id = rental_booking.user_id
-        is_already_paid = (rental_booking.payment_status == "paid")
-        current_booking_status = rental_booking.status
-
-    elif booking_ref.module_type == "homestay":
-        homestay_booking = (
-            db.query(Booking)
-            .filter(Booking.id == booking_ref.target_booking_id)
-            .first()
+    if booking_ref.module_type == "tour_guide":
+        return handle_guide_callback(
+            db, booking_ref, payment_id, payhere_amount, payhere_currency, status_code,
         )
-        if not homestay_booking:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Associated homestay booking not found",
-            )
-        expected_total = homestay_booking.total_price
-        expected_currency = homestay_booking.currency or "LKR"
-        target_user_id = homestay_booking.user_id
-        is_already_paid = (homestay_booking.payment_status == "paid")
-        current_booking_status = homestay_booking.status
+    if booking_ref.module_type != "homestay":
+        raise HTTPException(400, "Unsupported booking reference module type")
 
-    else:
-        # Strictly reject unknown module types rather than falling back (Condition 3)
+    booking = db.query(Booking).filter(Booking.id == booking_ref.target_booking_id).first()
+    if not booking:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported booking reference module type '{booking_ref.module_type}'",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Associated booking not found",
         )
 
-    # 3. Verify amount and currency (Condition 4)
-    received_amt = Decimal(payhere_amount)
-    if received_amt != expected_total or payhere_currency != expected_currency:
+    # 3. Verify amount and currency
+    received_amt = capture_amount(payhere_amount)
+    if received_amt != booking.total_price or payhere_currency != (booking.currency or "LKR"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payment amount or currency mismatch with booking record",
         )
 
-    # 4. Idempotency & Concurrency: acquire transaction lock if on SQL Server
-    if homestay_booking and db.bind and db.bind.dialect.name == "mssql":
-        lock_result = db.execute(
-            text("""
-                DECLARE @result INT;
-                EXEC @result = sp_getapplock
-                    @Resource = :resource,
-                    @LockMode = 'Exclusive',
-                    @LockOwner = 'Transaction',
-                    @LockTimeout = 10000;
-                SELECT @result;
-            """),
-            {"resource": f"homestay_booking_{homestay_booking.homestay_id}"},
-        ).scalar()
-        if lock_result is None or lock_result < 0:
-            db.rollback()
-            raise HTTPException(
-                status_code=503,
-                detail="Payment processing is busy. Please retry.",
-            )
-        # Re-read booking state under lock
-        db.refresh(homestay_booking)
-        is_already_paid = (homestay_booking.payment_status == "paid")
-    elif rental_booking and db.bind and db.bind.dialect.name == "mssql":
-        db.refresh(rental_booking)
-        is_already_paid = (rental_booking.payment_status == "paid")
-
-    # Idempotency: if already paid, return 200 immediately
-    if is_already_paid:
+    if booking_ref.user_id != booking.user_id or booking.payment_method != "online":
+        raise HTTPException(409, "Payment does not match the booking checkout")
+    if status_code == "2":
+        lock_capture(db, payment_id, booking_ref.id)
+    lock_booking_resource(db, f"homestay_booking_{booking.homestay_id}")
+    db.refresh(booking)
+    db.refresh(booking_ref)
+    if booking_ref.user_id != booking.user_id or booking.payment_method != "online":
+        raise HTTPException(409, "Checkout has changed")
+    if received_amt != booking.total_price or payhere_currency != booking.currency:
+        raise HTTPException(409, "Checkout amount or currency has changed")
+    if booking.payment_status in ("paid", "refund_pending", "refunded"):
         return {"status": "already_processed"}
 
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
 
     tx = (
         db.query(PaymentTransaction)
-        .filter(PaymentTransaction.booking_reference_id == booking_ref.id)
+        .filter(
+            PaymentTransaction.booking_reference_id == booking_ref.id,
+            PaymentTransaction.gateway_name == "payhere",
+            PaymentTransaction.user_id == booking.user_id,
+        )
         .order_by(PaymentTransaction.id.desc())
         .first()
     )
     if not tx:
         tx = PaymentTransaction(
             booking_reference_id=booking_ref.id,
-            user_id=target_user_id,
+            user_id=booking.user_id,
             gateway_name="payhere",
+            payment_method="online",
             amount=received_amt,
             currency=payhere_currency,
         )
@@ -737,7 +736,6 @@ def handle_payhere_callback(form_data: dict, db: Session):
         db.flush()
 
     tx.gateway_transaction_id = payment_id
-    tx.gateway_response_payload = str(dict(form_data))
 
     # PayHere Status Code: 2 = Success, 0 = Pending, -1 = Canceled, -2 = Failed
     if status_code == "2":
@@ -746,220 +744,181 @@ def handle_payhere_callback(form_data: dict, db: Session):
         commission_amount = (received_amt * Decimal("0.10")).quantize(Decimal("0.01"))
         provider_payable_amount = received_amt - commission_amount
 
-        tx.payment_status = "paid"
+        tx.payment_status = capture_status(db)
         tx.paid_at = now_utc
         tx.gross_amount = received_amt
         tx.commission_rate = commission_rate
         tx.commission_amount = commission_amount
         tx.provider_payable_amount = provider_payable_amount
 
-        if rental_booking:
-            booking_ref.payment_status = "paid"
+        homestay = db.query(Homestay).filter(Homestay.id == booking.homestay_id).first()
+        h_name = homestay.name if homestay else ""
+        provider_user_id = homestay.owner_id if homestay else None
+        if not provider_user_id and homestay and homestay.provider_profile:
+            provider_user_id = homestay.provider_profile.user_id
+
+        # Check whether payment arrived after expiration, cancellation or rejection
+        is_late_or_invalid = False
+        if booking.status not in ("awaiting_payment", "confirmed"):
+            is_late_or_invalid = True
+        elif (
+            booking.status == "awaiting_payment"
+            and booking.payment_expires_at is not None
+            and booking.payment_expires_at <= now_utc
+        ):
+            is_late_or_invalid = True
+
+        if is_late_or_invalid:
+            # Verified late payment received after deadline:
+            # Preserve verified payment transaction, DO NOT confirm or reactivate booking,
+            # and flag for refund/reconciliation.
+            if booking.status == "awaiting_payment":
+                booking.status = "expired"
+                booking.expired_at = booking.expired_at or now_utc
+
+            booking.payment_status = "refund_pending"
+            booking.payment_method = "online"
+            booking_ref.payment_status = "refund_pending"
+            booking_ref.booking_status = booking.status
+
+            # Create pending refund request for manual/automated execution
+            existing_refund = (
+                db.query(PaymentRefund)
+                .filter(
+                    PaymentRefund.payment_transaction_id == tx.id,
+                    PaymentRefund.refund_status.in_(RESERVED_REFUNDS),
+                )
+                .first()
+            )
+            if not existing_refund:
+                refund = PaymentRefund(
+                    payment_transaction_id=tx.id,
+                    amount=received_amt,
+                    currency=payhere_currency,
+                    refund_reason=(
+                        f"Late payment verified after booking {booking.status} status. "
+                        f"Order: {order_id}. Flagged for reconciliation and refund."
+                    ),
+                    refund_status="pending",
+                )
+                db.add(refund)
 
             record_booking_status_change(
                 db,
                 booking_reference_id=booking_ref.id,
-                from_status=current_booking_status,
-                to_status=current_booking_status,
+                from_status=booking.status,
+                to_status=booking.status,
+                changed_by=None,
+                notes=f"PayHere Online Payment Received Late for {booking.status} booking (Payment ID: {payment_id}). Flagged for refund.",
+            )
+
+            create_notification(
+                db=db,
+                user_id=booking.user_id,
+                title="Payment Received After Expiration",
+                message=(
+                    f"We received your payment of {payhere_amount} {payhere_currency} for booking #{booking.id}, "
+                    f"but the payment window had already {booking.status}. Your payment has been flagged for refund."
+                ),
+                notification_type="payment_flagged_for_refund",
+                link_url=f"/bookings/{booking.id}",
+            )
+
+            if provider_user_id:
+                create_notification(
+                    db=db,
+                    user_id=provider_user_id,
+                    title="Late Payment on Expired/Cancelled Booking",
+                    message=(
+                        f"A late online payment of {payhere_amount} {payhere_currency} arrived for booking #{booking.id} "
+                        f"({booking.status}). It has been flagged for refund and did not reactivate the reservation."
+                    ),
+                    notification_type="payment_flagged_for_refund",
+                    link_url=f"/provider/bookings/{booking.id}",
+                )
+        else:
+            # Valid payment confirmed within deadline
+            old_status = booking.status
+            booking.status = "confirmed"
+            booking.payment_status = "paid"
+            booking.payment_method = "online"
+            booking.commission_rate = commission_rate
+            booking.commission_amount = commission_amount
+            booking.provider_payable_amount = provider_payable_amount
+
+            booking_ref.booking_status = "confirmed"
+            booking_ref.payment_status = "paid"
+
+            # Record attributed booking conversion if applicable
+            cid = None
+            try:
+                import re
+                history = (
+                    db.query(BookingStatusHistory)
+                    .filter(
+                        BookingStatusHistory.booking_reference_id == booking_ref.id,
+                        BookingStatusHistory.notes.like("%campaign_id:%"),
+                    )
+                    .first()
+                )
+                if history and history.notes:
+                    m = re.search(r"campaign_id:(\d+)", history.notes)
+                    if m:
+                        cid = int(m.group(1))
+            except Exception:
+                cid = None
+
+            record_campaign_booking_conversion(
+                db=db,
+                homestay_id=booking.homestay_id,
+                user_id=booking.user_id,
+                booking_reference_id=booking_ref.id,
+                campaign_id=cid,
+            )
+
+            record_booking_status_change(
+                db,
+                booking_reference_id=booking_ref.id,
+                from_status=old_status,
+                to_status="confirmed",
                 changed_by=None,
                 notes=f"PayHere Online Payment Confirmed (Payment ID: {payment_id})",
             )
 
-            rental_booking.payment_status = "paid"
-            rental_booking.payment_method = "online"
-
-            v_name = rental_booking.vehicle.vehicle_name if rental_booking.vehicle else "Vehicle"
+            # In-app notifications
             create_notification(
                 db=db,
-                user_id=rental_booking.user_id,
-                title="Rental Payment Successful!",
-                message=f"Your payment of {payhere_amount} {payhere_currency} for {v_name} was received.",
+                user_id=booking.user_id,
+                title="Online Payment Successful - Booking Confirmed!",
+                message=f"Your payment of {payhere_amount} {payhere_currency} for {h_name} was received. Your booking is confirmed!",
                 notification_type="payment_success",
-                link_url=f"/rentals/bookings/{rental_booking.id}",
+                link_url=f"/bookings/{booking.id}",
             )
 
-            p_user_id = None
-            if rental_booking.vehicle and rental_booking.vehicle.provider:
-                p_user_id = rental_booking.vehicle.provider.user_id
-
-            if p_user_id:
+            if provider_user_id:
                 create_notification(
                     db=db,
-                    user_id=p_user_id,
-                    title="Rental Payment Received",
-                    message=f"Traveler paid {payhere_amount} {payhere_currency} online for rental booking #{rental_booking.id}.",
+                    user_id=provider_user_id,
+                    title="Online Payment Received - Booking Confirmed",
+                    message=f"Traveler paid {payhere_amount} {payhere_currency} online for booking #{booking.id}. Booking is confirmed.",
                     notification_type="payment_received",
-                    link_url=f"/provider/rentals/bookings/{rental_booking.id}",
+                    link_url=f"/provider/bookings/{booking.id}",
                 )
-
-        elif homestay_booking:
-            booking = homestay_booking
-            homestay = db.query(Homestay).filter(Homestay.id == booking.homestay_id).first()
-            h_name = homestay.name if homestay else ""
-            provider_user_id = homestay.owner_id if homestay else None
-            if not provider_user_id and homestay and homestay.provider_profile:
-                provider_user_id = homestay.provider_profile.user_id
-
-            # Check whether payment arrived after expiration, cancellation or rejection
-            is_late_or_invalid = False
-            if booking.status in ("expired", "cancelled", "rejected"):
-                is_late_or_invalid = True
-            elif (
-                booking.status == "awaiting_payment"
-                and booking.payment_expires_at is not None
-                and booking.payment_expires_at <= now_utc
-            ):
-                is_late_or_invalid = True
-
-            if is_late_or_invalid:
-                # Verified late payment received after deadline:
-                # Preserve verified payment transaction, DO NOT confirm or reactivate booking,
-                # and flag for refund/reconciliation.
-                if booking.status == "awaiting_payment":
-                    booking.status = "expired"
-                    booking.expired_at = booking.expired_at or now_utc
-
-                booking.payment_status = "refund_pending"
-                booking.payment_method = "online"
-                booking_ref.payment_status = "refund_pending"
-
-                # Create pending refund request for manual/automated execution
-                existing_refund = (
-                    db.query(PaymentRefund)
-                    .filter(
-                        PaymentRefund.payment_transaction_id == tx.id,
-                        PaymentRefund.refund_status.in_(["pending", "completed"]),
-                    )
-                    .first()
-                )
-                if not existing_refund:
-                    refund = PaymentRefund(
-                        payment_transaction_id=tx.id,
-                        amount=received_amt,
-                        currency=payhere_currency,
-                        refund_reason=(
-                            f"Late payment verified after booking {booking.status} status. "
-                            f"Order: {order_id}. Flagged for reconciliation and refund."
-                        ),
-                        refund_status="pending",
-                    )
-                    db.add(refund)
-
-                record_booking_status_change(
-                    db,
-                    booking_reference_id=booking_ref.id,
-                    from_status=booking.status,
-                    to_status=booking.status,
-                    changed_by=None,
-                    notes=f"PayHere Online Payment Received Late for {booking.status} booking (Payment ID: {payment_id}). Flagged for refund.",
-                )
-
-                create_notification(
-                    db=db,
-                    user_id=booking.user_id,
-                    title="Payment Received After Expiration",
-                    message=(
-                        f"We received your payment of {payhere_amount} {payhere_currency} for booking #{booking.id}, "
-                        f"but the payment window had already {booking.status}. Your payment has been flagged for refund."
-                    ),
-                    notification_type="payment_flagged_for_refund",
-                    link_url=f"/bookings/{booking.id}",
-                )
-
-                if provider_user_id:
-                    create_notification(
-                        db=db,
-                        user_id=provider_user_id,
-                        title="Late Payment on Expired/Cancelled Booking",
-                        message=(
-                            f"A late online payment of {payhere_amount} {payhere_currency} arrived for booking #{booking.id} "
-                            f"({booking.status}). It has been flagged for refund and did not reactivate the reservation."
-                        ),
-                        notification_type="payment_flagged_for_refund",
-                        link_url=f"/provider/bookings/{booking.id}",
-                    )
-            else:
-                # Valid payment confirmed within deadline
-                old_status = booking.status
-                booking.status = "confirmed"
-                booking.payment_status = "paid"
-                booking.payment_method = "online"
-                booking.commission_rate = commission_rate
-                booking.commission_amount = commission_amount
-                booking.provider_payable_amount = provider_payable_amount
-
-                booking_ref.booking_status = "confirmed"
-                booking_ref.payment_status = "paid"
-
-                # Record attributed booking conversion if applicable
-                cid = None
-                try:
-                    import re
-                    history = (
-                        db.query(BookingStatusHistory)
-                        .filter(
-                            BookingStatusHistory.booking_reference_id == booking_ref.id,
-                            BookingStatusHistory.notes.like("%campaign_id:%"),
-                        )
-                        .first()
-                    )
-                    if history and history.notes:
-                        m = re.search(r"campaign_id:(\d+)", history.notes)
-                        if m:
-                            cid = int(m.group(1))
-                except Exception:
-                    cid = None
-
-                record_campaign_booking_conversion(
-                    db=db,
-                    homestay_id=booking.homestay_id,
-                    user_id=booking.user_id,
-                    booking_reference_id=booking_ref.id,
-                    campaign_id=cid,
-                )
-
-                record_booking_status_change(
-                    db,
-                    booking_reference_id=booking_ref.id,
-                    from_status=old_status,
-                    to_status="confirmed",
-                    changed_by=None,
-                    notes=f"PayHere Online Payment Confirmed (Payment ID: {payment_id})",
-                )
-
-                # In-app notifications
-                create_notification(
-                    db=db,
-                    user_id=booking.user_id,
-                    title="Online Payment Successful - Booking Confirmed!",
-                    message=f"Your payment of {payhere_amount} {payhere_currency} for {h_name} was received. Your booking is confirmed!",
-                    notification_type="payment_success",
-                    link_url=f"/bookings/{booking.id}",
-                )
-
-                if provider_user_id:
-                    create_notification(
-                        db=db,
-                        user_id=provider_user_id,
-                        title="Online Payment Received - Booking Confirmed",
-                        message=f"Traveler paid {payhere_amount} {payhere_currency} online for booking #{booking.id}. Booking is confirmed.",
-                        notification_type="payment_received",
-                        link_url=f"/provider/bookings/{booking.id}",
-                    )
 
     elif status_code in ("-1", "-2"):
         tx.payment_status = "failed"
         create_notification(
             db=db,
-            user_id=target_user_id,
+            user_id=booking.user_id,
             title="Online Payment Failed",
-            message=f"Payment for booking #{booking_ref.target_booking_id} was unsuccessful. You may retry payment.",
+            message=f"Payment for booking #{booking.id} was unsuccessful. You may retry payment.",
             notification_type="payment_failed",
-            link_url=f"/bookings/{booking_ref.target_booking_id}",
+            link_url=f"/bookings/{booking.id}",
         )
 
     db.commit()
-    return {"status": "ok", "payment_status": tx.payment_status}
+    public_status = "paid" if tx.payment_status in CAPTURED else tx.payment_status
+    return {"status": "ok", "payment_status": public_status}
 
 
 @router.post(
@@ -997,6 +956,7 @@ def get_booking_payment_status(
 
     # Permission check: traveler, homestay provider, or admin
     if booking.user_id != current_user.id and current_user.role != "admin":
+        require_homestay_manager(current_user, db)
         homestay = db.query(Homestay).filter(Homestay.id == booking.homestay_id).first()
         profile = None
         if homestay and (homestay.provider_profile_id or current_user.role == "provider"):
@@ -1020,6 +980,8 @@ def get_booking_payment_status(
         .filter(
             BookingReference.module_type == "homestay",
             BookingReference.target_booking_id == booking.id,
+            BookingReference.user_id == booking.user_id,
+            PaymentTransaction.user_id == booking.user_id,
         )
         .order_by(PaymentTransaction.id.desc())
         .first()
@@ -1066,6 +1028,8 @@ def request_booking_refund(
             detail="You can only request refunds for your own bookings",
         )
 
+    lock_booking_resource(db, f"homestay_booking_{booking.homestay_id}")
+    db.refresh(booking)
     if booking.status != "cancelled":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1082,7 +1046,10 @@ def request_booking_refund(
         .filter(
             BookingReference.module_type == "homestay",
             BookingReference.target_booking_id == booking.id,
-            PaymentTransaction.payment_status == "paid",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            PaymentTransaction.payment_method == "online",
+            PaymentTransaction.user_id == booking.user_id,
+            BookingReference.user_id == booking.user_id,
         )
         .order_by(PaymentTransaction.id.desc())
         .first()
@@ -1098,7 +1065,7 @@ def request_booking_refund(
         db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
         .filter(
             PaymentRefund.payment_transaction_id == tx.id,
-            PaymentRefund.refund_status.in_(["pending", "approved", "completed"]),
+            PaymentRefund.refund_status.in_(RESERVED_REFUNDS),
         )
         .scalar()
     )
@@ -1118,6 +1085,8 @@ def request_booking_refund(
         refund_status="pending",
     )
     db.add(refund)
+    booking.payment_status = "refund_pending"
+    db.get(BookingReference, tx.booking_reference_id).payment_status = "refund_pending"
 
     # In-app notification to traveler and admin
     create_notification(
@@ -1152,45 +1121,75 @@ def process_refund(
             detail="Refund record not found",
         )
 
-    valid_statuses = {"approved", "rejected", "completed"}
-    if payload.status not in valid_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Refund status must be one of {valid_statuses}",
-        )
-
+    tx = db.get(PaymentTransaction, refund.payment_transaction_id)
+    ref = db.get(BookingReference, tx.booking_reference_id) if tx else None
+    booking = (
+        db.get(Booking, ref.target_booking_id)
+        if ref and ref.module_type == "homestay" else None
+    )
+    if booking is None or ref.user_id != booking.user_id or tx.user_id != booking.user_id:
+        raise HTTPException(409, "Refund has no matching Homestay booking")
+    lock_booking_resource(db, f"homestay_booking_{booking.homestay_id}")
+    for record in (refund, tx, ref, booking):
+        db.refresh(record)
+    if payload.status not in ("approved", "rejected", "completed"):
+        raise HTTPException(400, "Invalid refund decision")
+    if refund.refund_status not in ("pending", "approved"):
+        raise HTTPException(409, "Refund already has a final decision")
+    if payload.status == "approved" and db.get_bind().dialect.name == "mssql":
+        raise HTTPException(409, "Separate approval is unavailable for this refund ledger")
+    if tx.payment_status not in CAPTURED or refund.currency != tx.currency:
+        raise HTTPException(409, "Refund does not match a captured payment")
     if payload.status == "completed":
-        if refund.refund_status == "rejected":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Cannot complete a rejected refund without reopening or re-approving it",
-            )
-        if not payload.notes or len(payload.notes.strip()) < 5:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Refund cannot be marked as completed without verified refund execution evidence (gateway transaction ID or bank transfer proof recorded in notes)",
-            )
-        refund.refund_reason = f"{refund.refund_reason} | Execution: {payload.notes.strip()}"
-
-    refund.refund_status = payload.status
+        evidence = payload.notes.strip() if payload.notes else ""
+        if not re.fullmatch(
+            r"(?:bank(?: transfer)?|gateway|payhere) "
+            r"(?:ref(?:erence)?|transaction(?: id)?):\s*[a-z0-9][a-z0-9_/-]{4,100}",
+            evidence, flags=re.IGNORECASE,
+        ):
+            raise HTTPException(400, "Provide externally verified refund execution evidence")
+        lock_booking_resource(db, f"refund_external_{evidence.casefold()}")
+        if db.scalar(select(PaymentRefund.id).where(
+            PaymentRefund.id != refund.id,
+            PaymentRefund.refund_status.in_(EXECUTED_REFUNDS),
+            func.lower(PaymentRefund.refund_reason).endswith(
+                f" | execution: {evidence.casefold()}", autoescape=True,
+            ),
+        ).limit(1)) is not None:
+            raise HTTPException(409, "Refund execution evidence has already been used")
+        refund.refund_reason = f"{refund.refund_reason[:480]} | Execution: {evidence}"
+        refund.refund_status = executed_refund_status(db)
+    else:
+        refund.refund_status = payload.status
     refund.processed_by = admin.id
     refund.processed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.flush()
 
-    # Notify traveler
-    tx = (
-        db.query(PaymentTransaction)
-        .filter(PaymentTransaction.id == refund.payment_transaction_id)
-        .first()
+    executed, awaiting = db.execute(
+        select(
+            func.coalesce(func.sum(case(
+                (PaymentRefund.refund_status.in_(EXECUTED_REFUNDS), PaymentRefund.amount),
+                else_=0,
+            )), 0),
+            func.count(case((PaymentRefund.refund_status.in_(("pending", "approved")), 1))),
+        ).where(PaymentRefund.payment_transaction_id == tx.id)
+    ).one()
+    if executed > tx.amount:
+        db.rollback()
+        raise HTTPException(409, "Refund exceeds captured amount")
+    payment_status = "refund_pending" if awaiting else "paid"
+    if executed == tx.amount:
+        payment_status = "refunded"
+    booking.payment_status = ref.payment_status = payment_status
+    db.add(AdminAuditLog(
+        admin_user_id=admin.id, action=f"refund_{payload.status}",
+        entity_name="payment_refunds", entity_id=refund.id,
+    ))
+    create_notification(
+        db=db, user_id=booking.user_id, title=f"Refund Request {payload.status.title()}",
+        message=f"Your refund of {refund.amount} {refund.currency} was marked {payload.status}.",
+        notification_type=f"refund_{payload.status}", link_url=f"/bookings/{booking.id}",
     )
-    if tx:
-        create_notification(
-            db=db,
-            user_id=tx.user_id,
-            title=f"Refund Request {payload.status.title()}",
-            message=f"Your refund of {refund.amount} {refund.currency} has been marked {payload.status}.",
-            notification_type=f"refund_{payload.status}",
-            link_url="/notifications",
-        )
 
     db.commit()
     db.refresh(refund)
@@ -1226,10 +1225,25 @@ def calculate_provider_earnings_balances(
         db.query(PaymentTransaction, Booking)
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .join(Booking, BookingReference.target_booking_id == Booking.id)
+        .join(Homestay, Homestay.id == Booking.homestay_id)
+        .join(ProviderProfile, ProviderProfile.id == BookingReference.provider_profile_id)
         .filter(
             BookingReference.module_type == "homestay",
             BookingReference.provider_profile_id == provider_profile_id,
-            PaymentTransaction.payment_status == "paid",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            PaymentTransaction.payment_method == "online",
+            PaymentTransaction.user_id == Booking.user_id,
+            BookingReference.user_id == Booking.user_id,
+            PaymentTransaction.currency == "LKR",
+            BookingReference.currency == "LKR",
+            Booking.currency == "LKR",
+            or_(
+                and_(
+                    Homestay.provider_profile_id == ProviderProfile.id,
+                    or_(Homestay.owner_id.is_(None), Homestay.owner_id == ProviderProfile.user_id),
+                ),
+                and_(Homestay.provider_profile_id.is_(None), Homestay.owner_id == ProviderProfile.user_id),
+            ),
         )
         .all()
     )
@@ -1290,7 +1304,8 @@ def calculate_provider_earnings_balances(
             db.query(PaymentRefund)
             .filter(
                 PaymentRefund.payment_transaction_id.in_(tx_ids),
-                PaymentRefund.refund_status == "completed",
+                PaymentRefund.refund_status.in_(EXECUTED_REFUNDS),
+                PaymentRefund.currency == "LKR",
             )
             .all()
         )
@@ -1310,7 +1325,10 @@ def calculate_provider_earnings_balances(
     # Historical and reserved settlements
     settlements = (
         db.query(ProviderSettlement)
-        .filter(ProviderSettlement.provider_profile_id == provider_profile_id)
+        .filter(
+            ProviderSettlement.provider_profile_id == provider_profile_id,
+            ProviderSettlement.currency == "LKR",
+        )
         .all()
     )
     total_settled = Decimal("0.00")
@@ -1532,6 +1550,10 @@ def create_provider_settlement(
             detail="Provider profile not found",
         )
 
+    if payload.settlement_status not in ("pending", "approved", "completed", "paid"):
+        raise HTTPException(422, "Invalid settlement status")
+    lock_booking_resource(db, f"provider_settlement_{profile.id}")
+
     if payload.period_end < payload.period_start:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1587,13 +1609,25 @@ def create_provider_settlement(
     paid_at = None
 
     # Payout completion requires independently verifiable payment evidence
-    if settlement_status == "completed":
-        if not payout_ref or len(payout_ref.strip()) < 5:
+    if settlement_status in ("completed", "paid"):
+        if not payout_ref or not re.fullmatch(
+            r"(?:BANK|WIRE|PAYOUT)[-_][a-z0-9][a-z0-9_/-]{3,90}",
+            payout_ref.strip(), re.IGNORECASE,
+        ):
             # Preserve pending status if external verified payout integration is unavailable
             settlement_status = "pending"
             payout_ref = "Awaiting independently verified bank payout reference"
         else:
+            payout_ref = payout_ref.strip().upper()
+            lock_booking_resource(db, f"settlement_payout_{payout_ref}")
+            if db.scalar(select(ProviderSettlement.id).where(
+                ProviderSettlement.payout_reference == payout_ref,
+                ProviderSettlement.paid_at.is_not(None),
+            ).limit(1)) is not None:
+                raise HTTPException(409, "Payout reference has already been recorded")
             paid_at = now_utc
+            if db.get_bind().dialect.name == "mssql":
+                settlement_status = "paid"
 
     settlement = ProviderSettlement(
         provider_profile_id=payload.provider_profile_id,
@@ -1608,6 +1642,11 @@ def create_provider_settlement(
         paid_at=paid_at,
     )
     db.add(settlement)
+    db.flush()
+    db.add(AdminAuditLog(
+        admin_user_id=admin.id, action=f"settlement_{settlement_status}",
+        entity_name="provider_settlements", entity_id=settlement.id,
+    ))
 
     create_notification(
         db=db,
@@ -1638,7 +1677,11 @@ def admin_get_financial_summary(
     """
     tx_rows = (
         db.query(PaymentTransaction)
-        .filter(PaymentTransaction.payment_status == "paid")
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .filter(
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            BookingReference.module_type != "eco_experience",
+        )
         .all()
     )
     total_gross_booking = sum((t.gross_amount or t.amount or Decimal("0.00")) for t in tx_rows)
@@ -1646,7 +1689,7 @@ def admin_get_financial_summary(
 
     refund_rows = (
         db.query(PaymentRefund)
-        .filter(PaymentRefund.refund_status == "completed")
+        .filter(PaymentRefund.refund_status.in_(EXECUTED_REFUNDS))
         .all()
     )
     total_refunds = sum(r.amount for r in refund_rows)
@@ -1718,7 +1761,8 @@ def admin_get_reconciliation_queue(
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .join(Booking, BookingReference.target_booking_id == Booking.id)
         .filter(
-            PaymentTransaction.payment_status == "paid",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            BookingReference.module_type == "homestay",
             Booking.status.in_(["expired", "cancelled", "rejected"]),
         )
         .all()

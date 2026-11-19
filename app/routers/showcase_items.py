@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -48,7 +49,7 @@ def list_showcase_items(
         .join(ArtisanListing, ShowcaseItem.artisan_listing_id == ArtisanListing.id)
         .filter(
             ShowcaseItem.is_active == True,
-            ArtisanListing.is_active == True,
+            public_artisan(),
         )
     )
 
@@ -131,7 +132,7 @@ def get_showcase_item(
         .filter(
             ShowcaseItem.id == id,
             ShowcaseItem.is_active == True,
-            ArtisanListing.is_active == True,
+            public_artisan(),
         )
         .first()
     )
@@ -161,7 +162,7 @@ def get_listing_showcase_items(
     """
     listing = (
         db.query(ArtisanListing)
-        .filter(ArtisanListing.id == listing_id, ArtisanListing.is_active == True)
+        .filter(ArtisanListing.id == listing_id, public_artisan())
         .first()
     )
     if not listing:

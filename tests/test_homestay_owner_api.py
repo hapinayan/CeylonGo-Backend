@@ -854,8 +854,15 @@ def test_owner_create_list_update_flow():
         is_active=True,
     )
 
+    admin = User(
+        id=302,
+        full_name="Integration Test Reviewer",
+        email="integration.reviewer@example.com",
+        role="admin",
+        is_active=True,
+    )
     with TestingSession() as db:
-        db.add(owner)
+        db.add_all([owner, admin])
         db.add(make_homestay_profile(owner.id, "Integration Stay"))
         db.commit()
 
@@ -909,6 +916,28 @@ def test_owner_create_list_update_flow():
             assert update_response.status_code == 200, update_response.text
             assert update_response.json()["name"] == "Updated Integration Homestay"
 
+            private_response = client.get("/api/v1/homestays/mine")
+            assert private_response.status_code == 200, private_response.text
+            assert any(
+                item["id"] == homestay_id
+                and item["name"] == "Updated Integration Homestay"
+                for item in private_response.json()["items"]
+            )
+            assert client.get(f"/api/v1/homestays/{homestay_id}").status_code == 404
+
+            submission = client.post(f"/api/v1/homestays/{homestay_id}/submit-approval")
+            assert submission.status_code == 200, submission.text
+            assert submission.json()["approval_status"] == "pending"
+            assert client.get(f"/api/v1/homestays/{homestay_id}").status_code == 404
+
+            app.dependency_overrides[get_current_user] = lambda: admin
+            review = client.post(
+                f"/api/v1/admin/homestays/{homestay_id}/review",
+                json={"decision": "approved"},
+            )
+            assert review.status_code == 200, review.text
+            assert review.json()["approval_status"] == "approved"
+            app.dependency_overrides.pop(get_current_user)
             detail_response = client.get(
                 f"/api/v1/homestays/{homestay_id}"
             )

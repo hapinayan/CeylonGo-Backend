@@ -22,8 +22,9 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
 
+from app.core.database_guard import verify_safe_integration_database
 from app.models.rental import (
     RentalEligibilityCheck,
     RentalInspection,
@@ -39,7 +40,8 @@ from app.models.user import User
 def staging_db_session():
     """Provides a live database session connected to CeylonGoDB_Staging on (localdb)\\CeylonGoStaging."""
     server = os.getenv("DB_SERVER", r"(localdb)\CeylonGoStaging")
-    db_name = os.getenv("DB_NAME", "CeylonGoDB_Staging")
+    db_name = os.getenv("CEYLONGO_RENTAL_TEST_DB", "CeylonGoDB_Staging")
+    verify_safe_integration_database(db_name, {"CeylonGoDB_Staging", "CeylonGoDB_MergeTest"})
     driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
     trust_cert = os.getenv("DB_TRUST_CERTIFICATE", "yes")
 
@@ -54,19 +56,23 @@ def staging_db_session():
         },
     )
 
-    engine = create_engine(db_url, pool_pre_ping=True)
-    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    session = Session()
-
-    # Safety assertion: verify connected database is strictly CeylonGoDB_Staging
-    res = session.execute(text("SELECT DB_NAME() AS current_db;")).scalar()
-    assert res.lower() == "ceylongodb_staging", f"FATAL: Connected to {res}, expected CeylonGoDB_Staging!"
-
-    yield session
-
-    session.rollback()
-    session.close()
-    engine.dispose()
+    engine = create_engine(db_url, pool_pre_ping=True, connect_args={"timeout": 5})
+    try:
+        with engine.connect() as connection:
+            outer = connection.begin()
+            assert connection.scalar(text("SELECT DB_NAME()")) == db_name
+            connection.exec_driver_sql("SET LOCK_TIMEOUT 8000")
+            try:
+                with Session(
+                    bind=connection, join_transaction_mode="create_savepoint",
+                    autoflush=False, expire_on_commit=False,
+                ) as session:
+                    yield session
+            finally:
+                assert outer.is_active, "The enclosing fixture transaction was lost"
+                outer.rollback()
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture(scope="function")

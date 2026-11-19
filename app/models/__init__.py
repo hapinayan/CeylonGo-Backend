@@ -52,6 +52,7 @@ from app.models.activity_booking import (
     ActivityBooking,
     ActivityBookingParticipant,
 )
+from app.models.eco_reservation import EcoAvailabilitySlot, EcoReservation
 from app.models.eco_experience import (
     EcoEvidence,
     EcoExperience,
@@ -173,6 +174,8 @@ __all__ = [
     "ActivityBooking",
     "ActivityBookingParticipant",
     "EcoEvidence",
+    "EcoAvailabilitySlot",
+    "EcoReservation",
     "EcoExperience",
     "EcoExperienceImage",
     "EcoPractice",

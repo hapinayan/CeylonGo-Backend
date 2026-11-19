@@ -8,16 +8,17 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_admin
+from app.core.provider_onboarding import lock_onboarding
 from app.core.email import (
     send_provider_approval_email,
     send_provider_rejection_email,
 )
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
+from app.models.shared import AdminAuditLog
 from app.models.user import User
 from app.routers.provider_registration import get_upload_directory
 from app.schemas.admin_providers import (
@@ -292,10 +293,10 @@ def approve_provider_application(
     Dispatches approval email notification truthfully.
     """
     query = db.query(ProviderProfile).filter(ProviderProfile.id == provider_id)
-    try:
-        profile = query.with_for_update().first()
-    except SQLAlchemyError:
-        profile = query.first()
+    profile = query.first()
+    if profile is not None:
+        lock_onboarding(db, profile.user.email)
+        profile = query.populate_existing().first()
 
     if not profile:
         raise HTTPException(
@@ -325,16 +326,22 @@ def approve_provider_application(
     if not (
         profile.selfie_image_path
         and profile.nic_front_image_path
-        and profile.nic_back_image_path
+        and (profile.identity_document_type == "passport" or profile.nic_back_image_path)
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot approve application: identity documents (selfie, NIC front, and NIC back) are missing.",
+            detail="Cannot approve application: required identity documents are missing.",
         )
 
     now = datetime.now(UTC)
 
-    profile.approval_status = "approved"
+    changed = db.query(ProviderProfile).filter(
+        ProviderProfile.id == provider_id, ProviderProfile.approval_status == "pending",
+    ).update({"approval_status": "approved"}, synchronize_session=False)
+    if changed != 1:
+        db.rollback()
+        raise HTTPException(409, detail="Provider approval state changed. Please refresh.")
+    db.refresh(profile)
     profile.reviewed_by = admin_user.id
     profile.reviewed_at = now
     profile.rejection_reason = None
@@ -343,6 +350,10 @@ def approve_provider_application(
     profile.user.password_hash = None
     profile.user.is_active = False
 
+    db.add(AdminAuditLog(
+        admin_user_id=admin_user.id, action="provider_approved",
+        entity_name="provider_profiles", entity_id=provider_id,
+    ))
     db.commit()
     db.refresh(profile)
 
@@ -381,10 +392,10 @@ def reject_provider_application(
     Enables provider to resubmit via fresh OTP verification.
     """
     query = db.query(ProviderProfile).filter(ProviderProfile.id == provider_id)
-    try:
-        profile = query.with_for_update().first()
-    except SQLAlchemyError:
-        profile = query.first()
+    profile = query.first()
+    if profile is not None:
+        lock_onboarding(db, profile.user.email)
+        profile = query.populate_existing().first()
 
     if not profile:
         raise HTTPException(
@@ -412,13 +423,23 @@ def reject_provider_application(
 
     now = datetime.now(UTC)
 
-    profile.approval_status = "rejected"
+    changed = db.query(ProviderProfile).filter(
+        ProviderProfile.id == provider_id, ProviderProfile.approval_status == "pending",
+    ).update({"approval_status": "rejected"}, synchronize_session=False)
+    if changed != 1:
+        db.rollback()
+        raise HTTPException(409, detail="Provider approval state changed. Please refresh.")
+    db.refresh(profile)
     profile.rejection_reason = payload.reason
     profile.reviewed_by = admin_user.id
     profile.reviewed_at = now
 
     profile.user.is_active = False
 
+    db.add(AdminAuditLog(
+        admin_user_id=admin_user.id, action="provider_rejected",
+        entity_name="provider_profiles", entity_id=provider_id,
+    ))
     db.commit()
     db.refresh(profile)
 

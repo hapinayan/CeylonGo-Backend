@@ -92,7 +92,7 @@ def seed_test_data(isolated_db_session):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Users
-    prov_user = User(id=1, full_name="Sunil Perera", email="sunil@rentals.lk", password_hash="pw", role="service_provider")
+    prov_user = User(id=1, full_name="Sunil Perera", email="sunil@rentals.lk", password_hash="pw", role="provider")
     traveler_user = User(id=2, full_name="Alice Smith", email="alice@traveler.com", password_hash="pw", role="traveler")
     admin_user = User(id=3, full_name="Admin CeylonGo", email="admin@ceylongo.com", password_hash="pw", role="admin")
     db.add_all([prov_user, traveler_user, admin_user])
@@ -548,7 +548,7 @@ def test_existing_homestay_payment_preserved(seed_test_data):
         check_in=datetime.now().date() + timedelta(days=2),
         check_out=datetime.now().date() + timedelta(days=4),
         guests=2,
-        total_price=Decimal("16000.00"), status="confirmed", payment_status="unpaid", currency="LKR"
+        total_price=Decimal("16000.00"), status="confirmed", payment_status="unpaid", payment_method="online", currency="LKR"
     )
     db.add(b_hs)
     db.flush()

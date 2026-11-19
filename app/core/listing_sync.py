@@ -3,6 +3,7 @@ from decimal import Decimal
 import uuid
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import capture_status
 from app.models.booking import Booking
 from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
@@ -162,7 +163,7 @@ def record_cash_payment_transaction(
         gateway_transaction_id=tx_code,
         amount=amount,
         currency=booking_reference.currency or "LKR",
-        payment_status="paid",
+        payment_status=capture_status(db),
         payment_method="cash",
         gateway_response_payload=notes or "Cash received at property",
         paid_at=now,

@@ -56,6 +56,7 @@ class PromotionCampaignResponse(BaseModel):
 
     id: int
     provider_profile_id: int
+    listing_reference_id: int | None = None
     campaign_name: str
     target_module: str
     budget: Decimal
@@ -79,6 +80,7 @@ class PromotionEventResponse(BaseModel):
 
     id: int
     campaign_id: int
+    booking_reference_id: int | None = None
     event_type: str
     user_id: int | None
     ip_address: str | None
@@ -94,6 +96,7 @@ class PromotionAnalyticsSummary(BaseModel):
     currency: str
     impressions: int
     clicks: int
+    inquiries: int = 0
     bookings: int
     ctr: float
     conversion_rate: float
@@ -109,3 +112,38 @@ class CampaignPaymentInitiateResponse(BaseModel):
     sandbox: bool
     status: str
     note: str
+
+
+class AdvertisingPaymentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    campaign_id: int
+    provider_profile_id: int
+    order_reference: str
+    gateway_transaction_id: str | None = None
+    amount: Decimal
+    currency: str
+    gateway_name: str
+    payment_status: str
+    initiated_at: datetime
+    verified_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdvertisingRevenueSummaryResponse(BaseModel):
+    total_verified_revenue: Decimal
+    total_transactions_count: int
+    completed_transactions_count: int
+    failed_transactions_count: int
+    pending_transactions_count: int
+    currency: str = "LKR"
+
+
+class CampaignAttributionTokenResponse(BaseModel):
+    campaign_id: int
+    homestay_id: int
+    attribution_token: str
+    expires_in_hours: int = 48
+

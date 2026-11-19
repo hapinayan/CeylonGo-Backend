@@ -12,6 +12,11 @@ from app.core.homestay_permissions import (
     require_homestay_manager,
 )
 from app.core.listing_sync import sync_homestay_listing_reference
+from app.core.location_validation import (
+    HOMESTAY_LOCATION_FIELDS,
+    HOMESTAY_REVIEW_STATE,
+    write_review_snapshot,
+)
 from app.core.promotion_pricing import (
     calculate_booking_price,
     calculate_detailed_booking_price,
@@ -54,6 +59,7 @@ from app.schemas.homestay_dashboard import (
     HomestayProviderMarketingSummary,
     HomestayProviderRatingSummary,
 )
+from app.services.map_location_management import record_location_correction
 
 router = APIRouter(
     prefix="/api/v1/homestays",
@@ -994,15 +1000,29 @@ def update_homestay(
                 detail="Cannot deactivate homestay with active or upcoming confirmed bookings",
             )
 
+    before = (homestay.latitude, homestay.longitude)
+    after = (request.latitude, request.longitude)
+    was_approved = homestay.approval_status == "approved"
+    location_changes = {
+        field: getattr(request, field) for field in HOMESTAY_LOCATION_FIELDS
+        if getattr(homestay, field) != getattr(request, field)
+    }
+    location_changed = bool(location_changes)
+    if location_changed and current_user.role != "admin":
+        if homestay.approval_status == "pending":
+            raise HTTPException(409, detail="Location is currently under review")
+        if was_approved:
+            location_changes.update(approval_status="draft", reviewed_by=None, reviewed_at=None)
+    if location_changed:
+        write_review_snapshot(db, homestay, HOMESTAY_REVIEW_STATE, location_changes)
+    if before != after and current_user.role == "admin":
+        record_location_correction(
+            db, current_user.id, "homestays", homestay.id, before, after,
+            "Coordinates changed through the administrative homestay update",
+        )
+
     homestay.name = request.name
     homestay.description = request.description
-    homestay.location = request.location
-    homestay.province = request.province
-    homestay.district = request.district
-    homestay.city = request.city
-    homestay.address = request.address
-    homestay.latitude = request.latitude
-    homestay.longitude = request.longitude
     homestay.price_per_night = request.price_per_night
     homestay.max_guests = request.max_guests
     homestay.is_active = request.is_active
@@ -1071,8 +1091,8 @@ def update_homestay(
             if key not in existing_amenities_by_lower:
                 homestay.amenities.append(HomestayAmenity(name=orig_name))
 
-    # Synchronize with central listing_references if approved
-    if homestay.approval_status == "approved":
+    # Republish current data or deactivate the shared reference on re-review.
+    if was_approved:
         sync_homestay_listing_reference(db, homestay)
 
     try:

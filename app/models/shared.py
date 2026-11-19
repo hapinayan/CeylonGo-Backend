@@ -306,9 +306,9 @@ class AdminAuditLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     admin_user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    action: Mapped[str] = mapped_column(Unicode(100), nullable=False)
-    entity_name: Mapped[str] = mapped_column(Unicode(100), nullable=False)
-    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    action: Mapped[str] = mapped_column("action_type", Unicode(50), nullable=False)
+    entity_name: Mapped[str] = mapped_column("entity_type", Unicode(50), nullable=False)
+    entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
     details: Mapped[str | None] = mapped_column(UnicodeText, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(Unicode(45), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

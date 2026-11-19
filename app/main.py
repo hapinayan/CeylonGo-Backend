@@ -119,6 +119,7 @@ from app.routers.wishlists import (
 # RENTAL MODULE ROUTER IMPORTS
 # ==========================================
 
+from app.routers.rental_vehicles import pickup_router as rental_pickups_router
 from app.routers.rental_vehicles import (
     router as rental_vehicles_router,
 )
@@ -164,6 +165,8 @@ from app.routers.tour_guide import (
     router as tour_guide_router,
 )
 from app.routers.weather import router as weather_router
+from app.routers.interactive_map import admin_router as admin_map_router
+from app.routers.interactive_map import router as interactive_map_router
 
 # ==========================================
 # FASTAPI APPLICATION
@@ -293,6 +296,7 @@ app.include_router(admin_eco_promotions_router)
 # ==========================================
 
 app.include_router(rental_vehicles_router)
+app.include_router(rental_pickups_router)
 app.include_router(rental_bookings_router)
 
 # ==========================================
@@ -301,6 +305,8 @@ app.include_router(rental_bookings_router)
 
 app.include_router(tour_guide_router)
 app.include_router(weather_router)
+app.include_router(interactive_map_router)
+app.include_router(admin_map_router)
 
 # ==========================================
 # HEALTH CHECK API

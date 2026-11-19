@@ -2,16 +2,17 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import true
+from sqlalchemy import or_, true
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_rental
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.rental import RentalLocation
 from app.models.rental_vehicle import RentalVehicle
 from app.models.provider_profile import ProviderProfile
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, get_optional_current_user
 from app.schemas.rental_vehicle import (
     RentalPickupInput,
     RentalPickupResponse,
@@ -110,7 +111,7 @@ def get_rental_vehicles(
     vehicles = (
         db.query(RentalVehicle)
         .filter(
-            RentalVehicle.status == "available"
+            public_rental()
         )
         .order_by(
             RentalVehicle.created_at.desc()
@@ -132,18 +133,23 @@ def get_rental_vehicles(
 def get_rental_vehicle(
     vehicle_id: int,
     db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User | None, Depends(get_optional_current_user)],
 ):
-    vehicle = db.get(
-        RentalVehicle,
-        vehicle_id,
-    )
-
-    if not vehicle:
-        raise HTTPException(
-            status_code=404,
-            detail="Rental vehicle not found",
+    visibility = public_rental()
+    if user is not None and user.role == "admin":
+        visibility = true()
+    elif user is not None and user.role == "provider":
+        owned_profiles = db.query(ProviderProfile.id).filter(
+            ProviderProfile.user_id == user.id,
+            ProviderProfile.provider_type == "rental",
+            ProviderProfile.approval_status == "approved",
         )
-
+        visibility = or_(visibility, RentalVehicle.provider_id.in_(owned_profiles.statement))
+    vehicle = db.query(RentalVehicle).filter(
+        RentalVehicle.id == vehicle_id, visibility,
+    ).first()
+    if vehicle is None:
+        raise HTTPException(404, detail="Rental vehicle not found")
     return vehicle
 
 

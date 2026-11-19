@@ -74,6 +74,9 @@ from app.models.homestay import (
 
 
 from app.models.booking import Booking
+from app.models.promotion import HomestayPromotion
+from app.models.provider_profile import ProviderProfile
+from app.models.shared import AdvertisingPayment, ListingReference, PromotionCampaign
 
 from datetime import datetime, timezone
 
@@ -89,11 +92,16 @@ def homestay_test_client():
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
             HomestayAvailabilityBlock.__table__,
             HomestayImage.__table__,
             HomestayAmenity.__table__,
             Booking.__table__,
+            ListingReference.__table__,
+            PromotionCampaign.__table__,
+            AdvertisingPayment.__table__,
+            HomestayPromotion.__table__,
 
         ],
     )

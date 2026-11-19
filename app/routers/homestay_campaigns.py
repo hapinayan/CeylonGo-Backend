@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import require_admin, require_approved_provider
 from app.core.listing_sync import sync_homestay_listing_reference
 from app.core.attribution import generate_attribution_token, verify_attribution_token
+from app.core.publication import public_homestay
 from app.core.payhere import PayHereService, payhere_service
 from app.database.connection import get_db
 from app.models.homestay import Homestay
@@ -947,6 +948,8 @@ def issue_campaign_attribution_token(
         )
 
     homestay_id = listing_ref.target_id
+    if not db.query(Homestay.id).filter(Homestay.id == homestay_id, public_homestay()).first():
+        raise HTTPException(404, detail="Homestay not found")
     token = generate_attribution_token(campaign_id=campaign.id, homestay_id=homestay_id, valid_hours=48)
 
     return CampaignAttributionTokenResponse(
@@ -969,7 +972,7 @@ def get_homestay_active_attribution_token(
     """
     Retrieve an attribution token for the currently active sponsored campaign of a homestay.
     """
-    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id, public_homestay()).first()
     if not homestay:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

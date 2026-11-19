@@ -87,7 +87,11 @@ def calculate_detailed_booking_price(
         "applied_promotion_id": best_promo.id if best_promo else None,
         "discount_type": best_promo.discount_type if best_promo else None,
         "discount_percent": best_promo.discount_percent if best_promo else None,
-        "discount_amount": best_promo.discount_amount if best_promo else None,
+        "discount_fixed_amount": (
+            best_promo.discount_amount
+            if best_promo and best_promo.discount_type == "fixed"
+            else None
+        ),
     }
 
 

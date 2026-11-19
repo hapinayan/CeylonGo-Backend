@@ -197,9 +197,9 @@ def get_admin_dashboard(
 
     review_summary = HomestayAdminReviewSummary(
         total_reviews=len(reviews),
-        pending_moderation=sum(1 for r in reviews if r.moderation_status == "pending"),
-        approved_reviews=sum(1 for r in reviews if r.moderation_status == "approved"),
-        rejected_reviews=sum(1 for r in reviews if r.moderation_status == "rejected"),
+        pending_moderation=0,
+        approved_reviews=sum(1 for r in reviews if r.is_published),
+        rejected_reviews=sum(1 for r in reviews if not r.is_published),
     )
 
     return HomestayAdminDashboardResponse(

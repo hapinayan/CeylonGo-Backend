@@ -406,6 +406,7 @@ def test_workflow_13_late_payment_reconciliation(db_session, test_setup):
         guests=2,
         total_price=Decimal("15000.00"),
         status="expired",
+        payment_method="online",
         payment_status="unpaid",
     )
     db_session.add(booking)
@@ -495,6 +496,7 @@ def test_workflow_14_cancellation_and_proportional_refund(db_session, test_setup
         user_id=traveler.id,
         gateway_name="payhere",
         amount=Decimal("10000.00"),
+        payment_method="online",
         gross_amount=Decimal("10000.00"),
         commission_rate=Decimal("10.00"),
         commission_amount=Decimal("1000.00"),
@@ -545,7 +547,8 @@ def test_workflow_14_cancellation_and_proportional_refund(db_session, test_setup
 # Workflow 15: Provider Settlement Eligibility & Duplicate Protection
 # ==============================================================================
 def test_workflow_15_settlement_eligibility_and_duplicate_protection(db_session, test_setup):
-    profile = test_setup["profile2"]
+    profile = test_setup["profile1"]
+    unrelated_profile = test_setup["profile2"]
     traveler = test_setup["traveler"]
     admin = test_setup["admin"]
 
@@ -571,7 +574,7 @@ def test_workflow_15_settlement_eligibility_and_duplicate_protection(db_session,
         module_type="homestay",
         target_booking_id=booking.id,
         user_id=traveler.id,
-        provider_profile_id=profile.id,
+        provider_profile_id=unrelated_profile.id,
         total_price=Decimal("10000.00"),
         booking_status="completed",
         payment_status="paid",
@@ -583,6 +586,7 @@ def test_workflow_15_settlement_eligibility_and_duplicate_protection(db_session,
         booking_reference_id=b_ref.id,
         user_id=traveler.id,
         gateway_name="payhere",
+        payment_method="online",
         amount=Decimal("10000.00"),
         gross_amount=Decimal("10000.00"),
         commission_rate=Decimal("10.00"),
@@ -592,6 +596,12 @@ def test_workflow_15_settlement_eligibility_and_duplicate_protection(db_session,
         paid_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db_session.add(tx)
+    db_session.commit()
+
+    # A ledger row that points at another provider's listing cannot fund payouts.
+    unrelated = calculate_provider_earnings_balances(db_session, unrelated_profile.id)
+    assert unrelated["available_settlement_balance"] == Decimal("0.00")
+    b_ref.provider_profile_id = profile.id
     db_session.commit()
 
     # Create settlement for period including the checkout

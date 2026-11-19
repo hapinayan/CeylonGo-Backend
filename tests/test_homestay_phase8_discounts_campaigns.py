@@ -414,6 +414,8 @@ def test_booking_price_non_negative_cap(db_session, seed_data):
     # Savings must be capped at base_price (5000), final_price must be 0.00, never negative
     assert breakdown["original_price"] == Decimal("5000.00")
     assert breakdown["savings"] == Decimal("5000.00")
+    assert breakdown["discount_amount"] == Decimal("5000.00")
+    assert breakdown["discount_fixed_amount"] == Decimal("15000.00")
     assert breakdown["final_price"] == Decimal("0.00")
 
     # Also test calculate_booking_price wrapper

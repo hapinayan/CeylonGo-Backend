@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_artisan
 from app.core.dependencies import (
     require_admin,
     require_approved_provider,
@@ -46,7 +47,7 @@ def list_artisan_listings(
     Public discovery endpoint.
     Retrieves active artisan listings with search, category, district, and featured filters.
     """
-    query = db.query(ArtisanListing).filter(ArtisanListing.is_active == True)
+    query = db.query(ArtisanListing).filter(public_artisan())
 
     if search and search.strip():
         search_pattern = f"%{search.strip().lower()}%"
@@ -93,7 +94,7 @@ def get_craft_categories(db: Annotated[Session, Depends(get_db)]):
     """
     db_categories = (
         db.query(ArtisanListing.craft_category)
-        .filter(ArtisanListing.is_active == True)
+        .filter(public_artisan())
         .distinct()
         .all()
     )
@@ -109,7 +110,7 @@ def get_active_districts(db: Annotated[Session, Depends(get_db)]):
     """
     results = (
         db.query(ArtisanListing.district)
-        .filter(ArtisanListing.is_active == True)
+        .filter(public_artisan())
         .distinct()
         .order_by(ArtisanListing.district)
         .all()
@@ -145,7 +146,7 @@ def get_artisan_listing(
     """
     listing = (
         db.query(ArtisanListing)
-        .filter(ArtisanListing.id == id, ArtisanListing.is_active == True)
+        .filter(ArtisanListing.id == id, public_artisan())
         .first()
     )
     if not listing:

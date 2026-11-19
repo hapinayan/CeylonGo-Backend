@@ -1,5 +1,5 @@
--- Rollback Script: 030_extend_rental_module_final_gaps_rollback.sql
--- Description: Reverses all schema changes applied by 030_extend_rental_module_final_gaps.sql
+-- Rollback Script: 033_extend_rental_module_final_gaps_rollback.sql
+-- Description: Reverses all schema changes applied by 033_extend_rental_module_final_gaps.sql
 -- Module: Module 09 (Vehicle Rentals)
 -- Target Database: Microsoft SQL Server (CeylonGoDB)
 -- Safe & Idempotent: Can be executed multiple times safely without error.
@@ -154,5 +154,5 @@ BEGIN
 END;
 GO
 
-PRINT 'Rollback of migration 030_extend_rental_module_final_gaps completed successfully.';
+PRINT 'Rollback of migration 033_extend_rental_module_final_gaps completed successfully.';
 GO

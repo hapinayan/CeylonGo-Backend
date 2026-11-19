@@ -40,7 +40,10 @@ class SlidingWindowRateLimiter:
         Record the request and verify if the client has exceeded the rate limit.
         Raises HTTPException(429) if limit is exceeded.
         """
-        client_id = self.get_client_identifier(request)
+        self.check_identifier(self.get_client_identifier(request))
+
+    def check_identifier(self, client_id: str) -> None:
+        """Apply the same window to an explicitly scoped quota."""
         now = time.time()
 
         with self._lock:

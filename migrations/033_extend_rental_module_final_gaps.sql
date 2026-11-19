@@ -1,4 +1,4 @@
--- Migration: 030_extend_rental_module_final_gaps.sql
+-- Migration: 033_extend_rental_module_final_gaps.sql
 -- Description: Centralized Vehicle Rental Module Final Gaps (AR-02, AR-03, AR-04, AR-05, AR-06, AR-11, AR-12)
 -- Module: Module 09 (Vehicle Rentals, Eligibility, Inspections, Rate Plans & Insurance)
 -- Target Database: Microsoft SQL Server (CeylonGoDB)
@@ -162,5 +162,5 @@ BEGIN
 END;
 GO
 
-PRINT 'Migration 030_extend_rental_module_final_gaps applied successfully.';
+PRINT 'Migration 033_extend_rental_module_final_gaps applied successfully.';
 GO

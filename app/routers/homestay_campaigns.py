@@ -7,11 +7,14 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_admin, require_approved_provider
-from app.core.payhere import PayHereService
+from app.core.listing_sync import sync_homestay_listing_reference
+from app.core.attribution import generate_attribution_token, verify_attribution_token
+from app.core.payhere import PayHereService, payhere_service
 from app.database.connection import get_db
 from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import (
+    AdvertisingPayment,
     ListingReference,
     PromotionCampaign,
     PromotionEvent,
@@ -20,6 +23,9 @@ from app.models.shared import (
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.promotion_campaign import (
+    AdvertisingPaymentResponse,
+    AdvertisingRevenueSummaryResponse,
+    CampaignAttributionTokenResponse,
     CampaignPaymentInitiateResponse,
     PromotionAnalyticsSummary,
     PromotionCampaignCreate,
@@ -210,8 +216,16 @@ def create_homestay_campaign(
             detail="ends_at must be strictly after starts_at",
         )
 
+    listing_ref = sync_homestay_listing_reference(db, homestay)
+    if not listing_ref:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to establish listing reference for homestay",
+        )
+
     campaign = PromotionCampaign(
         provider_profile_id=current_provider.id,
+        listing_reference_id=listing_ref.id,
         campaign_name=payload.campaign_name,
         target_module="homestay",
         budget=payload.budget,
@@ -299,9 +313,9 @@ def initiate_campaign_payment(
     current_provider: Annotated[ProviderProfile, Depends(require_approved_provider)],
 ):
     """
-    Advertising payment initiation is disabled until reliable campaign payment persistence is available.
-    dbo.payment_transactions strictly enforces a foreign key to dbo.booking_references, which cannot
-    be safely created for advertising transactions without database schema modification.
+    Initiate PayHere advertising checkout for an approved, owned sponsored campaign.
+    Requires administrator approval, valid homestay listing ownership, unexpired schedule,
+    and server-side amount determination.
     """
     campaign = (
         db.query(PromotionCampaign)
@@ -314,39 +328,170 @@ def initiate_campaign_payment(
             detail=f"Campaign {campaign_id} not found",
         )
 
+    # 1. Validate campaign ownership
     if campaign.provider_profile_id != current_provider.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only initiate payment for your own campaigns",
         )
 
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Advertising payment initiation is disabled until reliable advertising transaction persistence is available in the database schema.",
+    # 2. Validate associated Homestay listing
+    if not campaign.listing_reference_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign is not linked to a specific homestay listing",
+        )
+
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.id == campaign.listing_reference_id,
+            ListingReference.module_type == "homestay",
+        )
+        .first()
+    )
+    if not listing_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Associated homestay listing reference not found",
+        )
+
+    homestay = db.query(Homestay).filter(Homestay.id == listing_ref.target_id).first()
+    if not homestay or not homestay.is_active or homestay.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Associated homestay listing must be approved and active",
+        )
+
+    # Authoritative provider ownership check
+    if homestay.provider_profile_id != current_provider.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only sponsor homestays owned by your provider profile",
+        )
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # 3. Schedule expiration check
+    if campaign.ends_at <= now_utc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign schedule has already expired. Cannot initiate payment for expired campaigns.",
+        )
+
+    # 4. Require administrator approval before payment
+    if campaign.status in ("cancelled", "rejected"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot initiate payment for {campaign.status} campaign",
+        )
+
+    if campaign.status == "pending_approval":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign requires administrator approval before payment can be initiated",
+        )
+
+    if campaign.status not in ("approved", "active"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Campaign status '{campaign.status}' is not eligible for payment",
+        )
+
+    # 5. Check if already paid
+    existing_completed = (
+        db.query(AdvertisingPayment)
+        .filter(
+            AdvertisingPayment.campaign_id == campaign.id,
+            AdvertisingPayment.payment_status == "completed",
+        )
+        .first()
+    )
+    if existing_completed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Advertising payment for this campaign has already been completed",
+        )
+
+    # 6. Determine payable advertising fees from trusted server-side pricing
+    # Real advertising checkout charges are disabled until an authoritative rate policy is approved by management.
+    # In sandbox/test mode, campaign budget is permitted strictly for test verification with an explicit notice.
+    if payhere_service.mode != "sandbox":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Real advertising checkout charges are disabled until an authoritative advertising pricing policy is officially approved by platform management.",
+        )
+
+    amount = Decimal(str(campaign.budget)).quantize(Decimal("0.01"))
+    if amount <= Decimal("0.00"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authoritative advertising fee is not defined for this campaign. Positive budget required.",
+        )
+
+    # 7. Prevent duplicate checkout attempts
+    pending_payment = (
+        db.query(AdvertisingPayment)
+        .filter(
+            AdvertisingPayment.campaign_id == campaign.id,
+            AdvertisingPayment.payment_status == "pending",
+        )
+        .order_by(AdvertisingPayment.id.desc())
+        .first()
+    )
+
+    if pending_payment:
+        order_ref = pending_payment.order_reference
+        pending_payment.amount = amount
+        pending_payment.updated_at = now_utc
+    else:
+        order_ref = f"AD-CAMP-{campaign.id}-{int(datetime.now(timezone.utc).timestamp())}"
+        pending_payment = AdvertisingPayment(
+            campaign_id=campaign.id,
+            provider_profile_id=current_provider.id,
+            order_reference=order_ref,
+            amount=amount,
+            currency="LKR",
+            gateway_name="payhere",
+            payment_status="pending",
+        )
+        db.add(pending_payment)
+
+    db.commit()
+    db.refresh(pending_payment)
+
+    # 8. Generate PayHere checkout hash
+    hash_value = payhere_service.generate_checkout_hash(
+        order_id=order_ref,
+        amount=amount,
+        currency="LKR",
+    )
+
+    return CampaignPaymentInitiateResponse(
+        campaign_id=campaign.id,
+        order_id=order_ref,
+        amount=amount,
+        currency="LKR",
+        merchant_id=payhere_service.merchant_id,
+        hash_value=hash_value,
+        sandbox=(payhere_service.mode == "sandbox"),
+        status="pending",
+        note=f"Payment for sponsored campaign: {campaign.campaign_name}",
     )
 
 
-@router.post(
-    "/api/v1/homestays/campaigns/{campaign_id}/verify-payment",
-    response_model=PromotionCampaignResponse,
-    summary="Verify payment and update campaign status",
+@router.get(
+    "/api/v1/homestays/campaigns/{campaign_id}/payments",
+    response_model=list[AdvertisingPaymentResponse],
+    summary="Provider view campaign payments",
 )
-def verify_campaign_payment(
+def get_campaign_payments(
     campaign_id: int,
     db: Annotated[Session, Depends(get_db)],
     current_provider: Annotated[ProviderProfile, Depends(require_approved_provider)],
 ):
-    """
-    Campaign payment verification is currently deferred.
-    Direct campaign payment activation is disabled because dbo.payment_transactions
-    strictly requires a booking_reference_id foreign key, which cannot be safely
-    created for advertising payments without database schema alterations.
-    """
-    campaign = (
-        db.query(PromotionCampaign)
-        .filter(PromotionCampaign.id == campaign_id)
-        .first()
-    )
+    """Retrieve all payment records for an owned campaign."""
+    campaign = db.query(PromotionCampaign).filter(PromotionCampaign.id == campaign_id).first()
     if not campaign:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -356,12 +501,104 @@ def verify_campaign_payment(
     if campaign.provider_profile_id != current_provider.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only verify payment for your own campaigns",
+            detail="You can only view payments for your own campaigns",
         )
 
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Direct client-side campaign payment activation is disabled. Paid campaign activation is deferred until reliable advertising transaction persistence and IPN gateway verification are supported.",
+    payments = (
+        db.query(AdvertisingPayment)
+        .filter(AdvertisingPayment.campaign_id == campaign_id)
+        .order_by(AdvertisingPayment.created_at.desc())
+        .all()
+    )
+    return payments
+
+
+@router.get(
+    "/api/v1/homestays/campaigns/payments/mine",
+    response_model=list[AdvertisingPaymentResponse],
+    summary="Provider view all own advertising payments",
+)
+def get_my_advertising_payments(
+    db: Annotated[Session, Depends(get_db)],
+    current_provider: Annotated[ProviderProfile, Depends(require_approved_provider)],
+):
+    """Retrieve all advertising payments made by the authenticated provider."""
+    payments = (
+        db.query(AdvertisingPayment)
+        .filter(AdvertisingPayment.provider_profile_id == current_provider.id)
+        .order_by(AdvertisingPayment.created_at.desc())
+        .all()
+    )
+    return payments
+
+
+@router.get(
+    "/api/v1/admin/advertising/payments",
+    response_model=list[AdvertisingPaymentResponse],
+    summary="Admin list advertising payments",
+)
+def admin_list_advertising_payments(
+    db: Annotated[Session, Depends(get_db)],
+    current_admin: Annotated[User, Depends(require_admin)],
+    payment_status: Annotated[str | None, Query(description="Filter by payment status")] = None,
+    campaign_id: Annotated[int | None, Query(description="Filter by campaign ID")] = None,
+    provider_profile_id: Annotated[int | None, Query(description="Filter by provider ID")] = None,
+):
+    """Admin retrieves advertising transactions with optional filters."""
+    query = db.query(AdvertisingPayment)
+    if payment_status:
+        query = query.filter(AdvertisingPayment.payment_status == payment_status)
+    if campaign_id:
+        query = query.filter(AdvertisingPayment.campaign_id == campaign_id)
+    if provider_profile_id:
+        query = query.filter(AdvertisingPayment.provider_profile_id == provider_profile_id)
+
+    return query.order_by(AdvertisingPayment.created_at.desc()).all()
+
+
+@router.get(
+    "/api/v1/admin/advertising/revenue-summary",
+    response_model=AdvertisingRevenueSummaryResponse,
+    summary="Admin advertising revenue summary",
+)
+def admin_get_advertising_revenue_summary(
+    db: Annotated[Session, Depends(get_db)],
+    current_admin: Annotated[User, Depends(require_admin)],
+):
+    """Admin summary of total verified advertising revenue, separate from booking fees."""
+    total_rev = (
+        db.query(func.coalesce(func.sum(AdvertisingPayment.amount), Decimal("0.00")))
+        .filter(AdvertisingPayment.payment_status == "completed")
+        .scalar()
+    ) or Decimal("0.00")
+
+    total_count = db.query(func.count(AdvertisingPayment.id)).scalar() or 0
+    completed_count = (
+        db.query(func.count(AdvertisingPayment.id))
+        .filter(AdvertisingPayment.payment_status == "completed")
+        .scalar()
+        or 0
+    )
+    failed_count = (
+        db.query(func.count(AdvertisingPayment.id))
+        .filter(AdvertisingPayment.payment_status.in_(["failed", "cancelled"]))
+        .scalar()
+        or 0
+    )
+    pending_count = (
+        db.query(func.count(AdvertisingPayment.id))
+        .filter(AdvertisingPayment.payment_status == "pending")
+        .scalar()
+        or 0
+    )
+
+    return AdvertisingRevenueSummaryResponse(
+        total_verified_revenue=Decimal(str(total_rev)),
+        total_transactions_count=total_count,
+        completed_transactions_count=completed_count,
+        failed_transactions_count=failed_count,
+        pending_transactions_count=pending_count,
+        currency="LKR",
     )
 
 
@@ -412,7 +649,7 @@ def admin_approve_campaign(
     if campaign.ends_at < now:
         campaign.status = "completed"
     else:
-        campaign.status = "active"
+        campaign.status = "approved"
 
     db.commit()
     db.refresh(campaign)
@@ -546,6 +783,15 @@ def get_campaign_analytics(
         .scalar()
         or 0
     )
+    inquiries = (
+        db.query(func.count(PromotionEvent.id))
+        .filter(
+            PromotionEvent.campaign_id == campaign_id,
+            PromotionEvent.event_type == "inquiry",
+        )
+        .scalar()
+        or 0
+    )
     bookings = (
         db.query(func.count(PromotionEvent.id))
         .filter(
@@ -568,6 +814,7 @@ def get_campaign_analytics(
         currency=campaign.currency,
         impressions=impressions,
         clicks=clicks,
+        inquiries=inquiries,
         bookings=bookings,
         ctr=ctr,
         conversion_rate=conversion_rate,
@@ -610,6 +857,15 @@ def admin_get_promotions_analytics(
             .scalar()
             or 0
         )
+        inq = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "inquiry",
+            )
+            .scalar()
+            or 0
+        )
         bks = (
             db.query(func.count(PromotionEvent.id))
             .filter(
@@ -632,6 +888,7 @@ def admin_get_promotions_analytics(
                 currency=c.currency,
                 impressions=imp,
                 clicks=clk,
+                inquiries=inq,
                 bookings=bks,
                 ctr=ctr,
                 conversion_rate=cvr,
@@ -639,3 +896,123 @@ def admin_get_promotions_analytics(
         )
 
     return summaries
+
+
+# ==============================================================================
+# 5. ADVERTISING ATTRIBUTION TOKENS (PHASE 12)
+# ==============================================================================
+
+@router.post(
+    "/api/v1/homestays/campaigns/{campaign_id}/attribution-token",
+    response_model=CampaignAttributionTokenResponse,
+    summary="Issue signed advertising attribution tracking token for an active campaign",
+)
+def issue_campaign_attribution_token(
+    campaign_id: int,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Issue a server-signed tracking token for an eligible active campaign.
+    Ensures attribution can only be linked to authentic campaigns.
+    """
+    campaign = (
+        db.query(PromotionCampaign)
+        .filter(PromotionCampaign.id == campaign_id)
+        .first()
+    )
+    if not campaign:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Campaign {campaign_id} not found",
+        )
+
+    if campaign.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot issue attribution token for campaign with status '{campaign.status}'. Campaign must be active.",
+        )
+
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.id == campaign.listing_reference_id,
+            ListingReference.module_type == "homestay",
+        )
+        .first()
+    )
+    if not listing_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign is not linked to a valid Homestay listing reference",
+        )
+
+    homestay_id = listing_ref.target_id
+    token = generate_attribution_token(campaign_id=campaign.id, homestay_id=homestay_id, valid_hours=48)
+
+    return CampaignAttributionTokenResponse(
+        campaign_id=campaign.id,
+        homestay_id=homestay_id,
+        attribution_token=token,
+        expires_in_hours=48,
+    )
+
+
+@router.get(
+    "/api/v1/homestays/{homestay_id}/attribution-token",
+    response_model=CampaignAttributionTokenResponse,
+    summary="Get signed advertising attribution token for a sponsored homestay listing",
+)
+def get_homestay_active_attribution_token(
+    homestay_id: int,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Retrieve an attribution token for the currently active sponsored campaign of a homestay.
+    """
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    if not homestay:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Homestay {homestay_id} not found",
+        )
+
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "homestay",
+            ListingReference.target_id == homestay_id,
+        )
+        .first()
+    )
+    if not listing_ref:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No listing reference found for homestay {homestay_id}",
+        )
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    campaign = (
+        db.query(PromotionCampaign)
+        .filter(
+            PromotionCampaign.listing_reference_id == listing_ref.id,
+            PromotionCampaign.status == "active",
+            PromotionCampaign.starts_at <= now_utc,
+            PromotionCampaign.ends_at >= now_utc,
+        )
+        .order_by(PromotionCampaign.id.desc())
+        .first()
+    )
+    if not campaign:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active sponsored campaign found for homestay {homestay_id}",
+        )
+
+    token = generate_attribution_token(campaign_id=campaign.id, homestay_id=homestay_id, valid_hours=48)
+    return CampaignAttributionTokenResponse(
+        campaign_id=campaign.id,
+        homestay_id=homestay_id,
+        attribution_token=token,
+        expires_in_hours=48,
+    )
+

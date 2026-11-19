@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -13,8 +14,9 @@ from sqlalchemy import (
     UnicodeText,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
+from app.models.provider_profile import ProviderProfile
 from app.models.user import Base, User
 
 
@@ -73,6 +75,10 @@ class PaymentTransaction(Base):
     payment_status: Mapped[str] = mapped_column(Unicode(30), default="pending", nullable=False)
     payment_method: Mapped[str] = mapped_column(Unicode(50), default="cash", nullable=False)
     gateway_response_payload: Mapped[str | None] = mapped_column(UnicodeText, nullable=True)
+    gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    commission_rate: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    commission_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    provider_payable_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
@@ -197,6 +203,9 @@ class PromotionCampaign(Base):
     provider_profile_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("provider_profiles.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    listing_reference_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("listing_references.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     campaign_name: Mapped[str] = mapped_column(Unicode(150), nullable=False)
     target_module: Mapped[str] = mapped_column(Unicode(30), default="homestay", nullable=False)
     budget: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -209,6 +218,49 @@ class PromotionCampaign(Base):
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )
 
+    listing_reference: Mapped["ListingReference | None"] = relationship(
+        "ListingReference",
+        foreign_keys=[listing_reference_id],
+    )
+
+
+class AdvertisingPayment(Base):
+    __tablename__ = "advertising_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("promotion_campaigns.id"), nullable=False, index=True
+    )
+    provider_profile_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("provider_profiles.id"), nullable=False, index=True
+    )
+    order_reference: Mapped[str] = mapped_column(Unicode(100), unique=True, nullable=False)
+    gateway_transaction_id: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(Unicode(3), default="LKR", nullable=False)
+    gateway_name: Mapped[str] = mapped_column(Unicode(50), default="payhere", nullable=False)
+    payment_status: Mapped[str] = mapped_column(Unicode(30), default="pending", nullable=False, index=True)
+    initiated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+
+    campaign: Mapped["PromotionCampaign"] = relationship(
+        "PromotionCampaign",
+        foreign_keys=[campaign_id],
+        backref=backref("advertising_payments", lazy="select"),
+    )
+    provider_profile: Mapped["ProviderProfile"] = relationship(
+        "ProviderProfile",
+        foreign_keys=[provider_profile_id],
+    )
+
 
 class PromotionEvent(Base):
     __tablename__ = "promotion_events"
@@ -217,11 +269,19 @@ class PromotionEvent(Base):
     campaign_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("promotion_campaigns.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    booking_reference_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("booking_references.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     event_type: Mapped[str] = mapped_column(Unicode(30), nullable=False)
     user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     ip_address: Mapped[str | None] = mapped_column(Unicode(45), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+
+    booking_reference: Mapped["BookingReference | None"] = relationship(
+        "BookingReference",
+        foreign_keys=[booking_reference_id],
     )
 
 

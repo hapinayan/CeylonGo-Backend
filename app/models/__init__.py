@@ -115,6 +115,7 @@ from app.models.community import (
     CommunityReport,
     CommunityHashtag,
     CommunityPostHashtag,
+    CommunityUserProfile,
 )
 
 # AI Smart Travel Planner Module
@@ -229,6 +230,7 @@ __all__ = [
     "CommunityReport",
     "CommunityHashtag",
     "CommunityPostHashtag",
+    "CommunityUserProfile",
 
     # AI Travel Planner
     "AIChatSession",

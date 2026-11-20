@@ -15,6 +15,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
+from app.models.shared import ListingReference
 from app.models.user import Base, User
 
 
@@ -24,6 +25,10 @@ class CommunityPost(Base):
     __table_args__ = (
         CheckConstraint("likes_count >= 0", name="CK_community_posts_likes"),
         CheckConstraint("comments_count >= 0", name="CK_community_posts_comments"),
+        CheckConstraint(
+            "moderation_status IN ('active', 'hidden_by_admin', 'removed_by_author')",
+            name="CK_community_posts_mod_status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -38,12 +43,23 @@ class CommunityPost(Base):
     likes_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     comments_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_published: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    listing_reference_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("listing_references.id", ondelete="SET NULL"), nullable=True
+    )
+    is_promotional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    moderation_status: Mapped[str] = mapped_column(
+        Unicode(20), default="active", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False, index=True
     )
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     author: Mapped["User"] = relationship("User", foreign_keys=[author_id])
+    listing_reference: Mapped["ListingReference | None"] = relationship(
+        "ListingReference", foreign_keys=[listing_reference_id]
+    )
 
 
 class CommunityPostMedia(Base):
@@ -96,6 +112,13 @@ class CommunityPostLike(Base):
 class CommunityComment(Base):
     __tablename__ = "community_comments"
 
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'deleted_by_author', 'removed_by_moderator')",
+            name="CK_community_comments_status",
+        ),
+    )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("community_posts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -107,6 +130,7 @@ class CommunityComment(Base):
         Integer, ForeignKey("community_comments.id"), nullable=True, index=True
     )
     content: Mapped[str] = mapped_column(Unicode(1000), nullable=False)
+    status: Mapped[str] = mapped_column(Unicode(30), default="active", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )
@@ -196,14 +220,57 @@ class CommunityHashtag(Base):
 
     __table_args__ = (
         CheckConstraint("usage_count >= 0", name="CK_community_hashtags_usage"),
+        CheckConstraint(
+            "NOT (is_blocked = 1 AND is_featured = 1)",
+            name="CK_community_hashtags_block_feature",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tag: Mapped[str] = mapped_column(Unicode(100), unique=True, nullable=False)
     usage_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )
+
+
+class CommunityUserProfile(Base):
+    """Community-only user moderation profile (isolated from dbo.users.is_active)."""
+
+    __tablename__ = "community_user_profiles"
+
+    __table_args__ = (
+        CheckConstraint(
+            "is_community_suspended = 0 OR (suspended_by IS NOT NULL AND suspended_at IS NOT NULL AND suspension_reason IS NOT NULL)",
+            name="CK_community_user_profiles_suspension",
+        ),
+        CheckConstraint(
+            "suspended_until IS NULL OR suspended_at IS NULL OR suspended_until > suspended_at",
+            name="CK_community_user_profiles_until",
+        ),
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id"), primary_key=True
+    )
+    is_community_suspended: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    suspended_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    suspension_reason: Mapped[str | None] = mapped_column(Unicode(500), nullable=True)
+    suspended_by: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    moderator: Mapped["User | None"] = relationship("User", foreign_keys=[suspended_by])
 
 
 class CommunityPostHashtag(Base):

@@ -234,6 +234,10 @@ from app.routers.tour_guide_public import (
 from app.routers.weather import router as weather_router
 from app.routers.interactive_map import admin_router as admin_map_router
 from app.routers.interactive_map import router as interactive_map_router
+from app.routers.community import (
+    router as community_router,
+    uploads_router as community_uploads_router,
+)
 
 # ==========================================
 # FASTAPI APPLICATION
@@ -403,6 +407,13 @@ app.include_router(admin_tour_guides_router)
 app.include_router(weather_router)
 app.include_router(interactive_map_router)
 app.include_router(admin_map_router)
+
+# ==========================================
+# TRAVEL COMMUNITY & SOCIAL FEED MODULE
+# ==========================================
+
+app.include_router(community_uploads_router)
+app.include_router(community_router)
 
 # ==========================================
 # HEALTH CHECK API

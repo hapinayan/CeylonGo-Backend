@@ -264,10 +264,33 @@ def reserve_guide(db, buyer, request):
     return reservation_payload(row, ref)
 
 
-def reserve_artisan(db, buyer, request):
+def validate_artisan_pickup_window(pickup_date):
     today = datetime.now(LOCAL).date()
-    if not today <= request.pickup_date <= today + timedelta(days=90):
+    if not today <= pickup_date <= today + timedelta(days=90):
         raise HTTPException(422, "Pickup must be scheduled within 90 days")
+
+
+def ensure_unique_artisan_pickup(db, item_id, traveler_id, pickup_date):
+    duplicate = db.scalar(
+        select(ArtisanReservation.id)
+        .where(
+            ArtisanReservation.showcase_item_id == item_id,
+            ArtisanReservation.traveler_id == traveler_id,
+            ArtisanReservation.pickup_date == pickup_date,
+            ArtisanReservation.reservation_status.in_(
+                ("pending", "confirmed", "ready_for_pickup")
+            ),
+        )
+        .limit(1)
+    )
+    if duplicate is not None:
+        raise HTTPException(
+            409, "An open pickup reservation already exists for this date"
+        )
+
+
+def reserve_artisan(db, buyer, request):
+    validate_artisan_pickup_window(request.pickup_date)
     lock_booking_resource(db, f"artisan_stock_{request.item_id}")
     item = db.scalar(
         select(ShowcaseItem)
@@ -288,22 +311,7 @@ def reserve_artisan(db, buyer, request):
         raise HTTPException(404, "Reservable product not found")
     if len(item.currency) != 3:
         raise HTTPException(409, "Product currency is unsupported")
-    duplicate = db.scalar(
-        select(ArtisanReservation.id)
-        .where(
-            ArtisanReservation.showcase_item_id == item.id,
-            ArtisanReservation.traveler_id == buyer.id,
-            ArtisanReservation.pickup_date == request.pickup_date,
-            ArtisanReservation.reservation_status.in_(
-                ("pending", "confirmed", "ready_for_pickup")
-            ),
-        )
-        .limit(1)
-    )
-    if duplicate is not None:
-        raise HTTPException(
-            409, "An open pickup reservation already exists for this date"
-        )
+    ensure_unique_artisan_pickup(db, item.id, buyer.id, request.pickup_date)
     changed = db.execute(
         update(ShowcaseItem)
         .where(

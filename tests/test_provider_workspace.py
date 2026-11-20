@@ -410,11 +410,18 @@ def test_refund_posting_month_currency_and_foreign_owner(catalog):
                 paid_at=january,
             )
         )
-        # Corrupt ledger link claims a booking owned by a different provider.
+        # Use a distinct booking so the ledger link respects the database's
+        # unique target constraint while still claiming another provider's booking.
+        foreign_booking = (
+            db.query(Booking)
+            .filter(Booking.homestay_id == 1, Booking.id != reference.target_booking_id)
+            .order_by(Booking.id)
+            .first()
+        )
         foreign = BookingReference(
             booking_reference="foreign-reference",
             module_type="homestay",
-            target_booking_id=reference.target_booking_id,
+            target_booking_id=foreign_booking.id,
             user_id=5,
             provider_profile_id=2,
             total_price=500,

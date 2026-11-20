@@ -176,6 +176,12 @@ def test_artisan_cancellation_restores_stock_and_pickup_completes(inventory):
     }
     path = f"{API}/artisan-reservations"
     first = client.post(path, json=payload).json()
+    detailed_payload = {
+        "showcase_item_id": item_id,
+        "quantity": 1,
+        "pickup_date": payload["pickup_date"],
+    }
+    assert client.post(path, json=detailed_payload).status_code == 409
     cancelled = client.post(
         f"{API}/reservations/artisan_reservation/{first['id']}/cancel",
         json={},
@@ -194,6 +200,11 @@ def test_artisan_cancellation_restores_stock_and_pickup_completes(inventory):
         ("complete", "completed"),
     ]:
         assert client.post(action, json={"action": step}).json()["status"] == status
+        if step == "cash":
+            blocked = client.post(f"{path}/{second['id']}/cancel", json={})
+            assert blocked.status_code == 409
+            with Session(engine) as db:
+                assert db.get(ShowcaseItem, item_id).stock_quantity == 1
 
 
 def test_homestay_cash_receipt_and_single_review(catalog):

@@ -3,7 +3,7 @@ import math
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.publication import public_artisan
@@ -47,7 +47,7 @@ def list_promotions(
     Public discovery endpoint.
     Retrieves currently active and non-expired promotions.
     Excludes inactive promotions, unstarted/expired promotions, and promotions
-    attached to inactive artisan listings or inactive showcase items.
+    attached to unapproved/inactive artisan listings, unapproved providers, or unapproved/inactive showcase items.
     """
     now = datetime.now(UTC)
 
@@ -60,7 +60,10 @@ def list_promotions(
             Promotion.start_date <= now,
             Promotion.end_date >= now,
             public_artisan(),
-            or_(Promotion.showcase_item_id == None, ShowcaseItem.is_active == True),
+            or_(
+                Promotion.showcase_item_id == None,
+                and_(ShowcaseItem.is_active == True, ShowcaseItem.approval_status == "approved"),
+            ),
         )
     )
 
@@ -123,6 +126,12 @@ def get_my_promotions(
     Protected endpoint: Returns all promotions (active, inactive, scheduled, expired)
     belonging to any artisan listing owned by the authenticated approved provider.
     """
+    if provider_profile.provider_type != "artisan":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: only artisan service providers can access promotions",
+        )
+
     promotions = (
         db.query(Promotion)
         .join(ArtisanListing, Promotion.artisan_listing_id == ArtisanListing.id)
@@ -145,7 +154,7 @@ def get_promotion(
     """
     Public endpoint: Returns details of an active, non-expired promotion.
     Excludes inactive promotions, expired promotions, and promotions
-    attached to inactive listings or inactive showcase items.
+    attached to unapproved/inactive listings, unapproved providers, or unapproved/inactive showcase items.
     """
     now = datetime.now(UTC)
 
@@ -159,7 +168,10 @@ def get_promotion(
             Promotion.start_date <= now,
             Promotion.end_date >= now,
             public_artisan(),
-            or_(Promotion.showcase_item_id == None, ShowcaseItem.is_active == True),
+            or_(
+                Promotion.showcase_item_id == None,
+                and_(ShowcaseItem.is_active == True, ShowcaseItem.approval_status == "approved"),
+            ),
         )
         .first()
     )
@@ -183,7 +195,7 @@ def get_listing_promotions(
     page_size: int = Query(default=12, ge=1, le=100, description="Items per page"),
 ):
     """
-    Public endpoint: Returns active and currently valid promotions for a specific artisan listing.
+    Public endpoint: Returns active and currently valid promotions for a specific active, approved artisan listing.
     """
     listing = (
         db.query(ArtisanListing)
@@ -206,7 +218,10 @@ def get_listing_promotions(
             Promotion.is_active == True,
             Promotion.start_date <= now,
             Promotion.end_date >= now,
-            or_(Promotion.showcase_item_id == None, ShowcaseItem.is_active == True),
+            or_(
+                Promotion.showcase_item_id == None,
+                and_(ShowcaseItem.is_active == True, ShowcaseItem.approval_status == "approved"),
+            ),
         )
     )
 
@@ -271,6 +286,12 @@ def create_promotion(
             detail="Access forbidden: you do not own this artisan listing",
         )
 
+    if not listing.is_active or listing.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot create promotions for an inactive or unapproved artisan listing",
+        )
+
     # Validate showcase_item_id belongs to the same artisan_listing_id
     if payload.showcase_item_id is not None:
         item = (
@@ -287,6 +308,11 @@ def create_promotion(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Showcase item does not belong to the specified artisan listing",
+            )
+        if not item.is_active or item.approval_status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot create promotions for an inactive or unapproved showcase product",
             )
 
     new_promo = Promotion(
@@ -323,6 +349,12 @@ def update_promotion(
     Protected endpoint: Allows an approved artisan to update their own promotion.
     Enforces ownership through parent ArtisanListing.
     """
+    if provider_profile.provider_type != "artisan":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: only artisan service providers can update promotions",
+        )
+
     promo = db.query(Promotion).filter(Promotion.id == id).first()
     if not promo:
         raise HTTPException(
@@ -334,6 +366,12 @@ def update_promotion(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access forbidden: you do not own this promotion",
+        )
+
+    if not promo.artisan_listing.is_active or promo.artisan_listing.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot update promotions for an inactive or unapproved artisan listing",
         )
 
     # Validate showcase_item_id if updated
@@ -350,6 +388,11 @@ def update_promotion(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Showcase item does not belong to the specified artisan listing",
+            )
+        if not item.is_active or item.approval_status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot link promotion to an inactive or unapproved showcase product",
             )
 
     # Validate merged date range
@@ -391,6 +434,12 @@ def delete_promotion(
     """
     Protected endpoint: Allows an approved artisan to soft delete their own promotion.
     """
+    if provider_profile.provider_type != "artisan":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: only artisan service providers can delete promotions",
+        )
+
     promo = db.query(Promotion).filter(Promotion.id == id).first()
     if not promo:
         raise HTTPException(

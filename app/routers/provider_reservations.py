@@ -13,7 +13,9 @@ from app.database.connection import get_db
 from app.models.shared import BookingReference, BookingStatusHistory
 from app.models.tour_guide import TourGuide, TourGuideAvailability, TourGuidePackage
 from app.models.user import User
+from app.routers.artisan_reservations import create_artisan_reservation
 from app.routers.provider_workspace import Period, Reader
+from app.schemas.artisan_reservation import ArtisanReservationCreate, ArtisanReservationResponse
 from app.schemas.eco_reservation import EcoReservationResponse
 from app.schemas.payment import GuidePaymentStatusResponse, PaymentInitiateResponse
 from app.services import eco_reservations
@@ -322,11 +324,15 @@ def guide_availability(
 
 
 @router.post(
-    "/artisan-reservations", response_model=ReservationResponse, status_code=201
+    "/artisan-reservations",
+    response_model=ReservationResponse | ArtisanReservationResponse,
+    status_code=201,
 )
 def request_artisan_reservation(
-    payload: ArtisanReservationRequest, buyer: Traveler, db: DB
+    payload: ArtisanReservationRequest | ArtisanReservationCreate, buyer: Traveler, db: DB
 ):
+    if isinstance(payload, ArtisanReservationCreate):
+        return create_artisan_reservation(payload, buyer, db)
     return reserve_artisan(db, buyer, payload)
 
 

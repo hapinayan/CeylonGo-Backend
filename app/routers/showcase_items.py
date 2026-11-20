@@ -42,7 +42,7 @@ def list_showcase_items(
 ):
     """
     Public discovery endpoint.
-    Retrieves active showcase items across active artisan listings with search, type, and listing filters.
+    Retrieves active and approved showcase items across active and approved artisan listings with search, type, and listing filters.
     """
     query = (
         db.query(ShowcaseItem)
@@ -50,6 +50,7 @@ def list_showcase_items(
         .filter(
             ShowcaseItem.is_active == True,
             public_artisan(),
+            ShowcaseItem.approval_status == "approved",
         )
     )
 
@@ -124,7 +125,7 @@ def get_showcase_item(
     db: Annotated[Session, Depends(get_db)],
 ):
     """
-    Public endpoint: Returns full details of an active showcase item under an active listing.
+    Public endpoint: Returns full details of an active, approved showcase item under an active, approved listing.
     """
     item = (
         db.query(ShowcaseItem)
@@ -133,6 +134,7 @@ def get_showcase_item(
             ShowcaseItem.id == id,
             ShowcaseItem.is_active == True,
             public_artisan(),
+            ShowcaseItem.approval_status == "approved",
         )
         .first()
     )
@@ -158,7 +160,7 @@ def get_listing_showcase_items(
     page_size: int = Query(default=12, ge=1, le=100, description="Items per page"),
 ):
     """
-    Public endpoint: Returns paginated showcase items for a specific active artisan listing.
+    Public endpoint: Returns paginated active, approved showcase items for a specific active, approved artisan listing.
     """
     listing = (
         db.query(ArtisanListing)
@@ -174,6 +176,7 @@ def get_listing_showcase_items(
     query = db.query(ShowcaseItem).filter(
         ShowcaseItem.artisan_listing_id == listing_id,
         ShowcaseItem.is_active == True,
+        ShowcaseItem.approval_status == "approved",
     )
 
     if item_type and item_type.strip():
@@ -250,6 +253,10 @@ def create_showcase_item(
         materials=payload.materials,
         duration_minutes=payload.duration_minutes,
         is_available=payload.is_available,
+        stock_quantity=payload.stock_quantity,
+        sku=payload.sku,
+        is_custom_order_available=payload.is_custom_order_available,
+        approval_status="pending",
         is_featured=False,
         is_active=True,
     )
@@ -289,6 +296,9 @@ def update_showcase_item(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
+    # Providers cannot self-modify approval_status
+    update_data.pop("approval_status", None)
+
     for key, value in update_data.items():
         setattr(item, key, value)
 

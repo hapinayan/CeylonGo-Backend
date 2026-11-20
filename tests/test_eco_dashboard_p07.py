@@ -522,11 +522,17 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
     data_p = resp_p.json()
     allowed_p_keys = {
         "total", "draft", "pending_approval", "approved", "rejected",
-        "deactivated", "published", "verified_badges", "pending_badges"
+        "deactivated", "published", "verified_badges", "pending_badges",
+        "total_bookings", "pending_bookings", "confirmed_bookings",
+        "completed_bookings", "cancelled_bookings", "rejected_bookings",
+        "total_revenue", "pending_cash_revenue", "refunded_amount",
     }
     assert set(data_p.keys()) == allowed_p_keys
     for k, v in data_p.items():
-        assert isinstance(v, int)
+        if k in {"total_revenue", "pending_cash_revenue", "refunded_amount"}:
+            assert isinstance(v, (int, float, str))
+        else:
+            assert isinstance(v, int)
 
     # Admin overview response keys check
     resp_a = client.get("/api/v1/admin/eco-experiences/overview", headers=auth_header(admin_user))
@@ -534,7 +540,7 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
     allowed_a_keys = {
         "total_listings", "published_listings", "verified_badges",
         "pending_badges", "total_active_providers", "by_status",
-        "by_category", "by_district"
+        "by_category", "by_district", "booking_metrics", "financial_metrics",
     }
     assert set(data_a.keys()) == allowed_a_keys
 

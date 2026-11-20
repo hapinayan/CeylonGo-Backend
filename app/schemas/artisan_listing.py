@@ -3,6 +3,9 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.schemas.artisan_business_hours import ArtisanBusinessHoursResponse
+from app.schemas.artisan_image import ArtisanBusinessImageResponse
+
 # Standard reference craft categories for Sri Lankan artisans
 VALID_CRAFT_CATEGORIES = (
     "Batik & Textiles",
@@ -108,6 +111,10 @@ class ArtisanListingSummary(BaseModel):
     is_active: bool
     is_verified: bool
     is_featured: bool
+    approval_status: str = "approved"
+    average_rating: float | None = None
+    total_reviews: int = 0
+    distance_km: float | None = Field(default=None, description="Calculated distance in km when queried via nearby discovery")
 
 
 class ArtisanListingResponse(ArtisanListingBase):
@@ -119,9 +126,30 @@ class ArtisanListingResponse(ArtisanListingBase):
     is_active: bool
     is_verified: bool
     is_featured: bool
+    approval_status: str = "approved"
+    verification_status: str = "unverified"
+    rejection_reason: str | None = None
+    reviewed_at: datetime | None = None
+    reviewed_by: int | None = None
     created_at: datetime
     updated_at: datetime
     provider_business_name: str | None = None
+    average_rating: float | None = None
+    total_reviews: int = 0
+    distance_km: float | None = Field(default=None, description="Calculated distance in km when queried via nearby discovery")
+    images: list[ArtisanBusinessImageResponse] = Field(default_factory=list)
+    business_images: list[ArtisanBusinessImageResponse] = Field(default_factory=list)
+    business_hours: list[ArtisanBusinessHoursResponse] = Field(default_factory=list)
+
+    @field_validator("business_hours", mode="before")
+    @classmethod
+    def sort_business_hours(cls, v: object) -> list:
+        if isinstance(v, (list, tuple, set)):
+            try:
+                return sorted(v, key=lambda x: getattr(x, "day_of_week", 0))
+            except Exception:
+                return list(v)
+        return []
 
 
 class ArtisanListingPagination(BaseModel):
@@ -133,8 +161,23 @@ class ArtisanListingPagination(BaseModel):
     total_pages: int = Field(ge=0, description="Total number of pages")
 
 
+class ArtisanNearbyListingPagination(BaseModel):
+    """Paginated listing response container for nearby discovery."""
+    items: list[ArtisanListingSummary]
+    total: int = Field(ge=0, description="Total items matching filter")
+    page: int = Field(ge=1, description="Current page number")
+    page_size: int = Field(ge=1, le=100, description="Number of items per page")
+    total_pages: int = Field(ge=0, description="Total number of pages")
+    origin_latitude: float = Field(description="Client search latitude")
+    origin_longitude: float = Field(description="Client search longitude")
+    radius_km: float = Field(description="Search radius in kilometers")
+
+
 class ArtisanListingStatusUpdate(BaseModel):
     """Admin-only status management schema."""
     is_verified: bool | None = None
     is_featured: bool | None = None
     is_active: bool | None = None
+    approval_status: str | None = None
+    verification_status: str | None = None
+    rejection_reason: str | None = None

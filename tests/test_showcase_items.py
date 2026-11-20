@@ -691,3 +691,338 @@ def test_soft_delete_showcase_item_other_provider_forbidden(client: TestClient, 
     )
     assert res.status_code == 403
     assert "do not own this showcase item" in res.json()["detail"].lower()
+
+
+# ==============================================================================
+# Phase P0 Step 2: Product Stock & Inventory API Tests
+# ==============================================================================
+
+def test_create_showcase_item_with_inventory_fields_defaults(client: TestClient, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+    payload = {
+        "artisan_listing_id": listing.id,
+        "title": "Default Inventory Product",
+        "item_type": "product",
+        "price": 2500.00,
+    }
+    res = client.post(
+        "/api/v1/showcase-items",
+        json=payload,
+        headers=auth_header(user),
+    )
+    assert res.status_code == 201
+    data = res.json()
+    assert data["stock_quantity"] == 0
+    assert data["sku"] is None
+    assert data["is_custom_order_available"] is False
+
+
+def test_create_showcase_item_with_explicit_inventory_fields(client: TestClient, db_session, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+    payload = {
+        "artisan_listing_id": listing.id,
+        "title": "Master Mask With Full Inventory",
+        "item_type": "product",
+        "price": 12500.00,
+        "stock_quantity": 35,
+        "sku": "MASK-SUNIL-001",
+        "is_custom_order_available": True,
+    }
+    res = client.post(
+        "/api/v1/showcase-items",
+        json=payload,
+        headers=auth_header(user),
+    )
+    assert res.status_code == 201
+    data = res.json()
+    assert data["stock_quantity"] == 35
+    assert data["sku"] == "MASK-SUNIL-001"
+    assert data["is_custom_order_available"] is True
+
+    # Verify directly in DB
+    item_in_db = db_session.query(ShowcaseItem).filter(ShowcaseItem.id == data["id"]).first()
+    assert item_in_db is not None
+    assert item_in_db.stock_quantity == 35
+    assert item_in_db.sku == "MASK-SUNIL-001"
+    assert item_in_db.is_custom_order_available is True
+
+
+def test_create_showcase_item_invalid_stock_quantity(client: TestClient, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+
+    # Negative stock
+    res_neg = client.post(
+        "/api/v1/showcase-items",
+        json={
+            "artisan_listing_id": listing.id,
+            "title": "Negative Stock Item",
+            "stock_quantity": -5,
+        },
+        headers=auth_header(user),
+    )
+    assert res_neg.status_code == 422
+
+    # Float stock with fraction
+    res_float = client.post(
+        "/api/v1/showcase-items",
+        json={
+            "artisan_listing_id": listing.id,
+            "title": "Float Stock Item",
+            "stock_quantity": 4.5,
+        },
+        headers=auth_header(user),
+    )
+    assert res_float.status_code == 422
+
+    # Boolean stock
+    res_bool = client.post(
+        "/api/v1/showcase-items",
+        json={
+            "artisan_listing_id": listing.id,
+            "title": "Bool Stock Item",
+            "stock_quantity": True,
+        },
+        headers=auth_header(user),
+    )
+    assert res_bool.status_code == 422
+
+    # String stock
+    res_str = client.post(
+        "/api/v1/showcase-items",
+        json={
+            "artisan_listing_id": listing.id,
+            "title": "String Stock Item",
+            "stock_quantity": "ten",
+        },
+        headers=auth_header(user),
+    )
+    assert res_str.status_code == 422
+
+
+def test_update_showcase_item_partial_inventory_preserves_other_fields(client: TestClient, db_session, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+
+    item = ShowcaseItem(
+        artisan_listing_id=listing.id,
+        title="Original Preserved Mask",
+        item_type="product",
+        price=Decimal("8000.00"),
+        currency="LKR",
+        stock_quantity=20,
+        sku="ORIG-SKU-99",
+        is_custom_order_available=False,
+        is_active=True,
+    )
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+
+    # 1. Partial update: Only update stock_quantity
+    res1 = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": 12},
+        headers=auth_header(user),
+    )
+    assert res1.status_code == 200
+    data1 = res1.json()
+    assert data1["stock_quantity"] == 12
+    assert data1["title"] == "Original Preserved Mask"
+    assert float(data1["price"]) == 8000.00
+    assert data1["sku"] == "ORIG-SKU-99"
+    assert data1["is_custom_order_available"] is False
+
+    # 2. Partial update: Only update is_custom_order_available
+    res2 = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"is_custom_order_available": True},
+        headers=auth_header(user),
+    )
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["is_custom_order_available"] is True
+    assert data2["stock_quantity"] == 12
+    assert data2["sku"] == "ORIG-SKU-99"
+
+    # 3. Partial update: Only update sku
+    res3 = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"sku": "NEW-UPDATED-SKU"},
+        headers=auth_header(user),
+    )
+    assert res3.status_code == 200
+    data3 = res3.json()
+    assert data3["sku"] == "NEW-UPDATED-SKU"
+    assert data3["stock_quantity"] == 12
+    assert data3["is_custom_order_available"] is True
+
+
+def test_update_showcase_item_stock_to_zero_allowed(client: TestClient, db_session, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+
+    item = ShowcaseItem(
+        artisan_listing_id=listing.id,
+        title="Item Soon Out of Stock",
+        item_type="product",
+        stock_quantity=5,
+        is_active=True,
+    )
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+
+    res = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": 0},
+        headers=auth_header(user),
+    )
+    assert res.status_code == 200
+    assert res.json()["stock_quantity"] == 0
+
+
+def test_update_showcase_item_invalid_inventory_values(client: TestClient, db_session, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+
+    item = ShowcaseItem(
+        artisan_listing_id=listing.id,
+        title="Validation Item",
+        item_type="product",
+        stock_quantity=10,
+        is_active=True,
+    )
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+
+    # Negative stock
+    res_neg = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": -1},
+        headers=auth_header(user),
+    )
+    assert res_neg.status_code == 422
+
+    # Null stock (cannot be null)
+    res_null = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": None},
+        headers=auth_header(user),
+    )
+    assert res_null.status_code == 422
+
+    # Boolean stock
+    res_bool = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": True},
+        headers=auth_header(user),
+    )
+    assert res_bool.status_code == 422
+
+    # Null is_custom_order_available (cannot be null)
+    res_null_custom = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"is_custom_order_available": None},
+        headers=auth_header(user),
+    )
+    assert res_null_custom.status_code == 422
+
+
+def test_showcase_item_inventory_in_retrieval_and_discovery(client: TestClient, db_session, approved_artisan_user):
+    user, _, listing = approved_artisan_user
+
+    item = ShowcaseItem(
+        artisan_listing_id=listing.id,
+        title="Showcase Mask with Inventory",
+        item_type="product",
+        price=Decimal("7500.00"),
+        currency="LKR",
+        stock_quantity=18,
+        sku="DISC-MASK-18",
+        is_custom_order_available=True,
+        is_active=True,
+    )
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+
+    # 1. Detail endpoint
+    res_detail = client.get(f"/api/v1/showcase-items/{item.id}")
+    assert res_detail.status_code == 200
+    data_detail = res_detail.json()
+    assert data_detail["stock_quantity"] == 18
+    assert data_detail["sku"] == "DISC-MASK-18"
+    assert data_detail["is_custom_order_available"] is True
+
+    # 2. Authenticated provider's items endpoint
+    res_me = client.get("/api/v1/showcase-items/me/items", headers=auth_header(user))
+    assert res_me.status_code == 200
+    items_me = res_me.json()
+    matched_me = [i for i in items_me if i["id"] == item.id]
+    assert len(matched_me) == 1
+    assert matched_me[0]["stock_quantity"] == 18
+    assert matched_me[0]["sku"] == "DISC-MASK-18"
+    assert matched_me[0]["is_custom_order_available"] is True
+
+    # 3. Public catalog list endpoint
+    res_list = client.get("/api/v1/showcase-items")
+    assert res_list.status_code == 200
+    items_list = res_list.json()["items"]
+    matched_list = [i for i in items_list if i["id"] == item.id]
+    assert len(matched_list) == 1
+    assert matched_list[0]["stock_quantity"] == 18
+    assert matched_list[0]["sku"] == "DISC-MASK-18"
+    assert matched_list[0]["is_custom_order_available"] is True
+
+    # 4. Listing specific showcase endpoint
+    res_listing_items = client.get(f"/api/v1/artisan-listings/{listing.id}/showcase-items")
+    assert res_listing_items.status_code == 200
+    listing_items = res_listing_items.json()["items"]
+    matched_listing = [i for i in listing_items if i["id"] == item.id]
+    assert len(matched_listing) == 1
+    assert matched_listing[0]["stock_quantity"] == 18
+    assert matched_listing[0]["sku"] == "DISC-MASK-18"
+    assert matched_listing[0]["is_custom_order_available"] is True
+
+
+def test_update_inventory_authorization(client: TestClient, db_session, approved_artisan_user, second_artisan_user, traveler_user):
+    user1, _, listing1 = approved_artisan_user
+    user2, _, _ = second_artisan_user
+
+    item = ShowcaseItem(
+        artisan_listing_id=listing1.id,
+        title="Sunil Protected Item",
+        item_type="product",
+        stock_quantity=50,
+        is_active=True,
+    )
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+
+    # 1. Unauthenticated update attempt -> 401
+    res_unauth = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": 0},
+    )
+    assert res_unauth.status_code == 401
+
+    # 2. Traveler update attempt -> 403
+    res_traveler = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": 0},
+        headers=auth_header(traveler_user),
+    )
+    assert res_traveler.status_code == 403
+
+    # 3. Other artisan update attempt -> 403
+    res_other = client.put(
+        f"/api/v1/showcase-items/{item.id}",
+        json={"stock_quantity": 0},
+        headers=auth_header(user2),
+    )
+    assert res_other.status_code == 403
+    assert "do not own this showcase item" in res_other.json()["detail"].lower()
+
+    # Verify stock remained untouched in DB
+    db_session.refresh(item)
+    assert item.stock_quantity == 50
+

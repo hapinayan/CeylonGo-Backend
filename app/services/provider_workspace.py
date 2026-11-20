@@ -359,6 +359,7 @@ class WorkspaceReader:
                     ShowcaseItem.title.label("title"),
                     row.pickup_date.label("starts"),
                     row.pickup_date.label("ends"),
+                    row.expires_at,
                 )
                 .join(ArtisanListing, ArtisanListing.id == row.artisan_listing_id)
                 .join(

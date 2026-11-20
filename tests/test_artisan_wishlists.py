@@ -13,7 +13,7 @@ Covers all 12 required scenarios:
 9. Shared listing reference integration (reusing dbo.listing_references and dbo.wishlists from Migration 027).
 10. Cross-module wishlist compatibility (artisan wishlists do not collide with eco or homestay wishlists).
 11. Empty Wishlist behavior (empty items list, total=0).
-12. Product Favorite support and documented limitation (compatibility endpoint & rejection of product favorite).
+12. Product favorites, visibility and traveler isolation.
 """
 
 from datetime import UTC, datetime
@@ -617,25 +617,56 @@ def test_empty_wishlist_behavior(
 
 
 # ==============================================================================
-# 12. Product Favorite Support and Documented Limitation (Scenario 12)
+# 12. Product favorites
 # ==============================================================================
 
-def test_product_favorite_architectural_limitation_and_rejection(
-    client: TestClient,
-    traveler_user: User,
+def test_product_favorites_are_idempotent_private_and_visibility_filtered(
+    client, db_session, traveler_user, approved_artisan_listing, provider_user
 ):
-    # 1. Query compatibility documentation
-    compat_res = client.get("/api/v1/artisan-wishlists/product-favorites-compatibility")
-    assert compat_res.status_code == 200
-    compat_data = compat_res.json()
-    assert compat_data["supported"] is False
-    assert "CK_listing_references_type" in compat_data["reason"]
-    assert "parent Artisan Business" in compat_data["recommended_alternative"]
+    from app.models.artisan import ArtisanProductFavorite
+    from app.models.showcase_item import ShowcaseItem
 
-    # 2. Attempt product-level favorite -> HTTP 400 Bad Request
-    prod_res = client.post(
-        "/api/v1/artisan-products/123/favorite",
-        headers=auth_header(traveler_user),
+    approved_artisan_listing.is_verified = True
+    product = ShowcaseItem(
+        artisan_listing_id=approved_artisan_listing.id,
+        title="Carved bowl",
+        item_type="product",
+        approval_status="approved",
     )
-    assert prod_res.status_code == 400
-    assert "Product-level favorites are not supported by the shared database schema" in prod_res.json()["detail"]
+    db_session.add(product)
+    db_session.commit()
+    base = "/api/v1/artisan-product-favorites"
+    path = f"{base}/{product.id}"
+    headers = auth_header(traveler_user)
+    assert client.get(base).status_code in (401, 403)
+    assert client.put(path, headers=auth_header(provider_user)).status_code == 403
+
+    first = client.put(path, headers=headers)
+    assert first.status_code == 200, first.text
+    assert client.put(path, headers=headers).json() == first.json()
+    assert client.post(
+        f"/api/v1/artisan-products/{product.id}/favorite", headers=headers
+    ).json() == first.json()
+    assert db_session.query(ArtisanProductFavorite).count() == 1
+    assert client.get(base, headers=headers).json()["total"] == 1
+    assert client.get(
+        "/api/v1/artisan-wishlists/product-favorites-compatibility"
+    ).json()["supported"] is True
+
+    other = User(
+        full_name="Other traveler", email="other-favorite@example.test",
+        password_hash=traveler_user.password_hash, role="traveler", is_active=True,
+    )
+    db_session.add(other)
+    db_session.commit()
+    other_headers = auth_header(other)
+    assert client.get(base, headers=other_headers).json()["items"] == []
+    assert client.delete(path, headers=other_headers).status_code == 204
+    assert client.get(base, headers=headers).json()["total"] == 1
+
+    product.approval_status = "pending"
+    db_session.commit()
+    assert client.get(base, headers=headers).json()["items"] == []
+    assert client.put(path, headers=headers).status_code == 404
+    assert client.delete(path, headers=headers).status_code == 204
+    assert db_session.query(ArtisanProductFavorite).count() == 0

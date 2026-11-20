@@ -942,6 +942,3 @@ def moderate_artisan_review(
         message=f"Review #{review.id} successfully {status_str}.",
         moderated_at=review.updated_at,
     )
-
-
-

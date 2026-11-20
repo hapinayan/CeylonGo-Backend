@@ -249,4 +249,3 @@ def get_artisan_booking_reference(
         )
         .first()
     )
-

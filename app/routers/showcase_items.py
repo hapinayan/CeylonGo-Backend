@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import lock_booking_resource
 from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
@@ -298,6 +299,11 @@ def update_showcase_item(
     update_data = payload.model_dump(exclude_unset=True)
     # Providers cannot self-modify approval_status
     update_data.pop("approval_status", None)
+    if "stock_quantity" in update_data:
+        lock_booking_resource(db, f"artisan_stock_{item.id}")
+        db.refresh(item)
+        if item.artisan_listing.provider_profile_id != provider_profile.id:
+            raise HTTPException(403, "You do not own this showcase item")
 
     for key, value in update_data.items():
         setattr(item, key, value)

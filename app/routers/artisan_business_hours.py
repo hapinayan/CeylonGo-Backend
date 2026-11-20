@@ -354,4 +354,3 @@ def delete_artisan_business_hours(
     listing.updated_at = datetime.now(timezone.utc)
     db.commit()
     return None
-

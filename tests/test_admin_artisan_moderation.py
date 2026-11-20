@@ -503,4 +503,3 @@ def test_reservation_creation_blocked_for_pending_product(client: TestClient, ap
     )
     assert res_res.status_code == 400
     assert "not approved for reservation" in res_res.json()["detail"].lower()
-

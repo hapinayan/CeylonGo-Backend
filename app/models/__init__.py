@@ -39,6 +39,7 @@ from app.models.artisan_listing import ArtisanListing
 from app.models.showcase_item import ShowcaseItem
 from app.models.artisan import (
     ArtisanBusinessImage,
+    ArtisanProductFavorite,
     ArtisanProductImage,
     ArtisanReservation,
     ArtisanBusinessHours,
@@ -163,6 +164,7 @@ __all__ = [
     "ArtisanListing",
     "ShowcaseItem",
     "ArtisanBusinessImage",
+    "ArtisanProductFavorite",
     "ArtisanProductImage",
     "ArtisanReservation",
     "ArtisanBusinessHours",

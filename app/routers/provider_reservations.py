@@ -28,6 +28,7 @@ from app.services.provider_reservations import (
     MODELS,
     change_activity_booking,
     change_reservation,
+    effective_artisan_expiry,
     reservation_payload,
     reservations,
     reserve_artisan,
@@ -148,9 +149,31 @@ def project_booking(reader, row):
     category = reader.category
     status = row.status
     actions = []
-    if category in ("homestay", "tour_guide", "artisan"):
+    if category == "artisan":
+        expiry = effective_artisan_expiry(row.starts, row.expires_at)
+        active_hold = expiry is not None and expiry > reader.now
+        unpaid = row.payment_status == "unpaid"
+        pickup_states = ("confirmed", "ready_for_pickup")
         if status == "pending":
-            cutoff = reader.today if category in ("homestay", "artisan") else reader.now
+            if active_hold and row.starts is not None and row.starts >= reader.today:
+                actions.append("accept")
+            if unpaid:
+                actions.append("reject")
+        if active_hold and unpaid and status in ("pending", *pickup_states):
+            actions.append("cancel")
+        if active_hold and status == "confirmed":
+            actions.append("ready")
+        if active_hold and unpaid and status in pickup_states and row.total_price > 0:
+            actions.append("cash")
+        if (
+            row.starts == reader.today
+            and status in pickup_states
+            and (row.payment_status == "paid" or (active_hold and unpaid and row.total_price == 0))
+        ):
+            actions.append("complete")
+    elif category in ("homestay", "tour_guide"):
+        if status == "pending":
+            cutoff = reader.today if category == "homestay" else reader.now
             if row.starts is not None and row.starts >= cutoff:
                 actions.append("accept")
             actions.append("reject")
@@ -170,17 +193,15 @@ def project_booking(reader, row):
             and (category != "tour_guide" or row.starts > reader.now)
         ):
             actions.append("cancel")
-        if category == "artisan" and status == "confirmed":
-            actions.append("ready")
         if (
-            category in ("artisan", "tour_guide")
+            category == "tour_guide"
             and status in ("confirmed", "ready_for_pickup")
             and row.payment_status == "unpaid"
             and row.total_price > 0
             and (category != "tour_guide" or row.payment_method == "pay_at_location")
         ):
             actions.append("cash")
-        cutoff = reader.today if category in ("homestay", "artisan") else reader.now
+        cutoff = reader.today if category == "homestay" else reader.now
         if (
             status in ("confirmed", "ready_for_pickup", "in_progress")
             and row.ends is not None
@@ -225,6 +246,7 @@ def project_booking(reader, row):
             ):
                 actions.append("complete")
     data = dict(row._mapping)
+    data.pop("expires_at", None)
     for key in ("starts", "ends", "created_at", "payment_expires_at"):
         if isinstance(data.get(key), datetime):
             data[key] = utc_timestamp(data[key])

@@ -441,4 +441,3 @@ def test_cannot_reserve_unapproved_product(client: TestClient, db_session, appro
     )
     assert res.status_code == 400
     assert "not approved for reservation" in res.json()["detail"].lower()
-

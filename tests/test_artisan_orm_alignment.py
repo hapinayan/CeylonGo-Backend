@@ -86,6 +86,9 @@ def test_artisan_reservations_schema_columns():
         "expires_at",
         "cancelled_by",
         "cancellation_reason",
+        "rejected_by",
+        "rejected_at",
+        "rejection_reason",
         "created_at",
         "updated_at",
     }
@@ -458,4 +461,3 @@ def test_business_hours_crud_and_unique_constraint(db_session):
     assert hours.close_time == time(17, 30)
     assert hours.is_closed is False
     assert len(listing.business_hours) == 1
-

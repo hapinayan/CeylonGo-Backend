@@ -1027,4 +1027,3 @@ def test_update_inventory_authorization(client: TestClient, db_session, approved
     # Verify stock remained untouched in DB
     db_session.refresh(item)
     assert item.stock_quantity == 50
-

@@ -47,4 +47,3 @@ class ArtisanImageUpdateRequest(BaseModel):
     caption: str | None = Field(default=None, max_length=255)
     display_order: int | None = Field(default=None, ge=0)
     is_primary: bool | None = None
-

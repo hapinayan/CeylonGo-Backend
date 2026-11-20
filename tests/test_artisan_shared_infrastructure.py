@@ -23,6 +23,7 @@ from sqlalchemy.dialects import mssql, sqlite
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.services.provider_reservations import LOCAL
 from app.core.security import create_access_token, hash_password
 from app.database.connection import get_db
 from app.main import app
@@ -440,7 +441,7 @@ def test_artisan_reservation_lifecycle_status_synchronization(
     listing, product = approved_listing_and_product
     provider_user, profile = artisan_provider_user
 
-    pickup_date = (date.today() + timedelta(days=1)).isoformat()
+    pickup_date = (datetime.now(LOCAL).date()).isoformat()
     create_res = client.post(
         "/api/v1/artisan-reservations",
         json={"showcase_item_id": product.id, "quantity": 1, "pickup_date": pickup_date},

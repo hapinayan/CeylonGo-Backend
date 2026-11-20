@@ -19,6 +19,11 @@ APPROVED_INTEGRATION_SERVERS: frozenset[str] = frozenset({
     r"127.0.0.1\sqlexpress01",
 })
 
+ARTISAN_INTEGRATION_ALIAS = r"localhost\SQLEXPRESS"
+ARTISAN_INTEGRATION_IDENTITY = r"VISHNUGA-KAJARASH\SQLEXPRESS"
+ARTISAN_INTEGRATION_DATABASE = "CeylonGoDB_IntegrationTest"
+LEGACY_INTEGRATION_IDENTITY = r"DESKTOP-JL1BGSI\SQLEXPRESS01"
+
 PROTECTED_DATABASES: frozenset[str] = frozenset({
     "ceylongodb",
     "ceylongodb_logintest",
@@ -147,30 +152,46 @@ def verify_safe_integration_target(
             "Set RUN_SQLSERVER_INTEGRATION_TESTS=1 to enable."
         )
 
-    verify_safe_integration_server(server_name)
     verify_safe_integration_database(database_name)
+    # The default instance is authorized only through this database-paired check.
+    if normalize_server_name(server_name) != ARTISAN_INTEGRATION_ALIAS.lower():
+        verify_safe_integration_server(server_name)
     return True
 
 
-def verify_connected_server_identity(connection_or_engine) -> dict[str, str]:
+def verify_connected_server_identity(
+    connection_or_engine, *, server_alias: str | None = None
+) -> dict[str, str]:
     """
     Performs read-only query against the live connection to verify actual connected
     SQL Server instance and database identity before permitting write execution.
     """
     from sqlalchemy import text
 
-    query = text(
+    query = (
         "SELECT DB_NAME() AS current_db, "
         "@@SERVERNAME AS server_name, "
         "CAST(SERVERPROPERTY('MachineName') AS NVARCHAR(100)) AS machine_name, "
         "CAST(SERVERPROPERTY('InstanceName') AS NVARCHAR(100)) AS instance_name;"
     )
 
+    use_artisan_instance = (
+        normalize_server_name(server_alias) == ARTISAN_INTEGRATION_ALIAS.lower()
+    )
+    if server_alias is not None and not use_artisan_instance:
+        verify_safe_integration_server(server_alias)
+    expected_identity = (
+        ARTISAN_INTEGRATION_IDENTITY if use_artisan_instance else LEGACY_INTEGRATION_IDENTITY
+    )
+    expected_machine, expected_instance = expected_identity.lower().split("\\", 1)
+
     if hasattr(connection_or_engine, "connect"):
         with connection_or_engine.connect() as conn:
-            row = conn.execute(query).fetchone()
+            row = conn.execute(text(query)).fetchone()
+    elif hasattr(connection_or_engine, "cursor"):
+        row = connection_or_engine.cursor().execute(query).fetchone()
     else:
-        row = connection_or_engine.execute(query).fetchone()
+        row = connection_or_engine.execute(text(query)).fetchone()
 
     if not row:
         raise DatabaseSafetyError(
@@ -185,10 +206,14 @@ def verify_connected_server_identity(connection_or_engine) -> dict[str, str]:
             "Integration writes are restricted strictly to 'ceylongodb_integrationtest'."
         )
 
-    if instance_name != "sqlexpress01":
+    if (
+        normalize_server_name(row[1]) != expected_identity.lower()
+        or str(row[2]).strip().lower() != expected_machine
+        or instance_name != expected_instance
+    ):
         raise DatabaseSafetyError(
-            f"LIVE IDENTITY SAFETY VIOLATION: Connected SQL Server instance is '{row[3]}'. "
-            "Integration writes are restricted strictly to instance 'SQLEXPRESS01'."
+            "LIVE IDENTITY SAFETY VIOLATION: Connected SQL Server identity "
+            f"does not match approved identity '{expected_identity}'."
         )
 
     return {

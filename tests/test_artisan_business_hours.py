@@ -564,4 +564,3 @@ def test_backward_compatibility_with_text_opening_hours(
     assert data["opening_hours"] == "Mon - Sat: 9:00 AM - 6:00 PM, Sun: Closed"
     assert "business_hours" in data
     assert isinstance(data["business_hours"], list)
-

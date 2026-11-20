@@ -601,4 +601,3 @@ def test_admin_process_expired_endpoint(client: TestClient, db_session):
 
     db_session.refresh(item)
     assert item.stock_quantity == 10
-

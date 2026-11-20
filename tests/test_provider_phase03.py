@@ -166,6 +166,24 @@ def test_guide_completion_requires_recorded_cash_and_elapsed_tour(
     )
 
 
+def test_provider_booking_action_rejects_artisan_reservation(inventory):
+    client, actor, engine, day, item_id, _ = inventory
+    actor["id"] = 5
+    created = client.post(
+        f"{API}/artisan-reservations",
+        json={"item_id": item_id, "quantity": 1, "pickup_date": day.isoformat()},
+    )
+    assert created.status_code == 201
+    actor["id"] = 7
+    action = f"{PROVIDER}/{created.json()['id']}/action"
+    assert client.post(action, json={"action": "reject"}).status_code == 422
+    result = client.post(action, json={"action": "reject", "reason": "Closed today"})
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "rejected"
+    with Session(engine) as db:
+        assert db.get(ShowcaseItem, item_id).stock_quantity == 2
+
+
 def test_artisan_cancellation_restores_stock_and_pickup_completes(inventory):
     client, actor, engine, _, item_id, _ = inventory
     actor["id"] = 5
@@ -205,6 +223,37 @@ def test_artisan_cancellation_restores_stock_and_pickup_completes(inventory):
             assert blocked.status_code == 409
             with Session(engine) as db:
                 assert db.get(ShowcaseItem, item_id).stock_quantity == 1
+
+
+def test_artisan_payload_and_action_routes_share_pickup_rules(inventory):
+    client, actor, engine, future_day, item_id, _ = inventory
+    actor["id"] = 5
+    pickup = datetime.now(LOCAL).date()
+    path = f"{API}/artisan-reservations"
+    for key in ("item_id", "showcase_item_id"):
+        booked = client.post(
+            path, json={key: item_id, "quantity": 1, "pickup_date": pickup.isoformat()}
+        )
+        assert booked.status_code == 201, booked.text
+        booking_id = booked.json()["id"]
+        detail = client.get(f"{path}/{booking_id}").json()
+        assert detail["payment_status"] == "unpaid" and detail["expires_at"]
+        actor["id"] = 7
+        shared = f"{PROVIDER}/{booking_id}/action"
+        assert client.patch(f"{path}/{booking_id}/ready").status_code == 400
+        assert client.post(shared, json={"action": "ready"}).status_code == 409
+        assert client.patch(f"{path}/{booking_id}/confirm").status_code == 200
+        assert client.post(shared, json={"action": "ready"}).status_code == 200
+        completed = client.post(f"{path}/{booking_id}/complete-pickup")
+        assert completed.json()["payment_status"] == "paid"
+        assert client.post(shared, json={"action": "complete"}).status_code == 409
+        actor["id"] = 5
+    with Session(engine) as db:
+        assert db.get(ShowcaseItem, item_id).stock_quantity == 0
+        assert len(db.scalars(select(PaymentTransaction)).all()) == 2
+    assert client.post(
+        path, json={"item_id": item_id, "quantity": 1, "pickup_date": future_day.isoformat()}
+    ).status_code == 409
 
 
 def test_homestay_cash_receipt_and_single_review(catalog):

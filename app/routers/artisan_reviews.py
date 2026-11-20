@@ -604,4 +604,3 @@ def delete_artisan_review(
     db.commit()
 
     return {"message": "Review deleted successfully", "id": review_id}
-

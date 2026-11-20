@@ -563,4 +563,3 @@ def test_provider_update_cannot_link_to_unapproved_target(client: TestClient, db
     )
     assert res.status_code == 400
     assert "inactive or unapproved showcase product" in res.json()["detail"].lower()
-

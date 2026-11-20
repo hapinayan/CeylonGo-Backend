@@ -71,6 +71,24 @@ class ArtisanProductImage(Base):
     )
 
 
+class ArtisanProductFavorite(Base):
+    __tablename__ = "artisan_product_favorites"
+    __table_args__ = (
+        UniqueConstraint("user_id", "product_id", name="UQ_artisan_favorites_user_product"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("showcase_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.sysutcdatetime(), nullable=False
+    )
+
+
 class ArtisanReservation(Base):
     __tablename__ = "artisan_reservations"
 
@@ -97,6 +115,9 @@ class ArtisanReservation(Base):
         Integer, ForeignKey("users.id"), nullable=True
     )
     cancellation_reason: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
+    rejected_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime)
+    rejection_reason: Mapped[str | None] = mapped_column(Unicode(1000))
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
     )

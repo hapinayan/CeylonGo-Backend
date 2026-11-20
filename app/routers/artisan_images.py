@@ -937,4 +937,3 @@ def serve_artisan_product_image(filename: str):
     ext = target_path.suffix.lower()
     media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
     return FileResponse(target_path, media_type=media_type)
-

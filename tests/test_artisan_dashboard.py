@@ -681,4 +681,3 @@ def test_unauthorized_and_forbidden_access(
     res_homestay = client.get("/api/v1/artisan/dashboard", headers=auth_header(homestay_user))
     assert res_homestay.status_code == 403
     assert "only artisan service providers" in res_homestay.json()["detail"]
-

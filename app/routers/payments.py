@@ -40,6 +40,7 @@ from app.models.shared import (
     PromotionCampaign,
     ProviderSettlement,
 )
+from app.models.tour_guide import TourGuideBooking
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.payment import (
@@ -54,9 +55,19 @@ from app.schemas.payment import (
     SettlementCreateRequest,
     SettlementResponse,
 )
+from app.schemas.tour_guide import TourGuidePaymentPrepareResponse
 from app.services.booking_expiration import expire_single_booking
 from app.services.guide_payments import handle_guide_callback
 from app.services.payhere_bookings import capture_amount, checkout_response, lock_capture
+from app.services.tour_guide_phase5 import (
+    handle_tour_guide_advertising_payment_callback,
+)
+from app.services.tour_guide_payment import (
+    get_tour_guide_online_earnings_components,
+    handle_tour_guide_payhere_callback,
+    prepare_tour_guide_online_payment,
+    sync_tour_guide_refund_completion,
+)
 
 router = APIRouter(
     prefix="/api/v1/payments",
@@ -543,6 +554,27 @@ def initiate_rental_booking_payment(
 
 
 # ==========================================
+# 1C. PAYHERE ONLINE PAYMENT INITIATION FOR TOUR GUIDES (TR-12)
+# ==========================================
+
+@router.post(
+    "/tour-guides/bookings/{booking_id}/initiate",
+    response_model=TourGuidePaymentPrepareResponse,
+    summary="Initiate PayHere online payment for an accepted tour guide booking (TR-12)",
+)
+def initiate_tour_guide_booking_payment(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return prepare_tour_guide_online_payment(
+        db,
+        booking_id=booking_id,
+        current_user=current_user,
+    )
+
+
+# ==========================================
 # 2. PAYHERE WEBHOOK / NOTIFICATION LISTENER
 # ==========================================
 
@@ -648,6 +680,12 @@ def handle_payhere_callback(form_data: dict, db: Session):
         )
 
     # 1b. Route advertising payment callbacks separately from booking callbacks
+    if order_id.startswith("AD-TG-"):
+        return handle_tour_guide_advertising_payment_callback(
+            db=db,
+            form_data=dict(form_data),
+        )
+
     if order_id.startswith("AD-"):
         return handle_advertising_payment_callback(
             db=db,
@@ -676,6 +714,16 @@ def handle_payhere_callback(form_data: dict, db: Session):
             db, booking_ref, payment_id, payhere_amount, payhere_currency, status_code,
         )
     if booking_ref.module_type == "tour_guide":
+        # Explicit dual-system routing:
+        # - Module 05 tour_guide_bookings use 'BK-TG-*' booking references -> isolated Module 05 handler.
+        # - PR #25 unified provider_reservations use 'RS-*' booking references -> Phase 03B guide handler.
+        if (booking_ref.booking_reference or "").startswith("BK-TG-"):
+            return handle_tour_guide_payhere_callback(
+                db=db,
+                form_data=dict(form_data),
+                booking_ref=booking_ref,
+                verify_signature=True,
+            )
         return handle_guide_callback(
             db, booking_ref, payment_id, payhere_amount, payhere_currency, status_code,
         )
@@ -1123,6 +1171,94 @@ def process_refund(
 
     tx = db.get(PaymentTransaction, refund.payment_transaction_id)
     ref = db.get(BookingReference, tx.booking_reference_id) if tx else None
+
+    if ref and ref.module_type == "tour_guide":
+        tg_booking = db.get(TourGuideBooking, ref.target_booking_id)
+        if (
+            tg_booking is None
+            or ref.user_id != tg_booking.traveler_id
+            or tx.user_id != tg_booking.traveler_id
+        ):
+            raise HTTPException(409, "Refund has no matching Tour Guide booking")
+        lock_booking_resource(db, f"tour_guide_booking_{tg_booking.tour_guide_id}")
+        for record in (refund, tx, ref, tg_booking):
+            db.refresh(record)
+        if payload.status not in ("approved", "rejected", "completed"):
+            raise HTTPException(400, "Invalid refund decision")
+        if refund.refund_status not in ("pending", "approved"):
+            raise HTTPException(409, "Refund already has a final decision")
+        if tx.payment_status not in CAPTURED or refund.currency != tx.currency:
+            raise HTTPException(409, "Refund does not match a captured payment")
+
+        if payload.notes:
+            note = payload.notes.strip()
+            if note:
+                base_reason = (refund.refund_reason or "")[:480]
+                refund.refund_reason = (
+                    f"{base_reason} | Admin Note: {note}" if base_reason else note
+                )[:500]
+
+        refund.refund_status = payload.status
+        refund.processed_by = admin.id
+        refund.processed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.flush()
+
+        executed, awaiting = db.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                PaymentRefund.refund_status.in_(EXECUTED_REFUNDS),
+                                PaymentRefund.amount,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.count(
+                    case((PaymentRefund.refund_status.in_(("pending", "approved")), 1))
+                ),
+            ).where(PaymentRefund.payment_transaction_id == tx.id)
+        ).one()
+        if executed > tx.amount:
+            db.rollback()
+            raise HTTPException(409, "Refund exceeds captured amount")
+
+        if payload.status == "completed":
+            sync_tour_guide_refund_completion(
+                db,
+                booking_ref=ref,
+                refund=refund,
+                admin_id=admin.id,
+            )
+        elif payload.status == "rejected" and not awaiting and executed < tx.amount:
+            tg_booking.payment_status = "paid"
+            ref.payment_status = "paid"
+
+        db.add(
+            AdminAuditLog(
+                admin_user_id=admin.id,
+                action=f"refund_{payload.status}",
+                entity_name="payment_refunds",
+                entity_id=refund.id,
+            )
+        )
+        create_notification(
+            db=db,
+            user_id=tg_booking.traveler_id,
+            title=f"Refund Request {payload.status.title()}",
+            message=(
+                f"Your refund of {refund.amount} {refund.currency} was marked {payload.status}."
+            ),
+            notification_type=f"refund_{payload.status}",
+            link_url=f"/tour-guide-bookings/{tg_booking.id}",
+        )
+        db.commit()
+        db.refresh(refund)
+        return refund
+
     booking = (
         db.get(Booking, ref.target_booking_id)
         if ref and ref.module_type == "homestay" else None
@@ -1317,6 +1453,23 @@ def calculate_provider_earnings_balances(
             prov_deduct = r.amount - comm_rev
             commission_reversal += comm_rev
             provider_refund_reduction += prov_deduct
+
+    # Additive Tour Guide online earnings contribution (excludes direct cash bookings)
+    tg = get_tour_guide_online_earnings_components(
+        db,
+        provider_profile_id=provider_profile_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    total_gross += tg["total_gross"]
+    completed_gross += tg["completed_gross"]
+    completed_commission += tg["completed_commission"]
+    completed_provider_payable += tg["completed_provider_payable"]
+    pending_earnings += tg["pending_earnings"]
+    verified_refunds += tg["verified_refunds"]
+    commission_reversal += tg["commission_reversal"]
+    provider_refund_reduction += tg["provider_refund_reduction"]
+    paid_count += tg["paid_count"]
 
     provider_net_earnings = max(
         Decimal("0.00"), completed_provider_payable - provider_refund_reduction
@@ -1768,6 +1921,21 @@ def admin_get_reconciliation_queue(
         .all()
     )
     for row in late_booking_txs:
+        flagged_tx_ids.add(row[0])
+
+    # 3. Paid Tour Guide transactions where booking is expired, cancelled, or rejected
+    late_tg_txs = (
+        db.query(PaymentTransaction.id)
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .join(TourGuideBooking, BookingReference.target_booking_id == TourGuideBooking.id)
+        .filter(
+            BookingReference.module_type == "tour_guide",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            TourGuideBooking.booking_status.in_(["expired", "cancelled", "rejected"]),
+        )
+        .all()
+    )
+    for row in late_tg_txs:
         flagged_tx_ids.add(row[0])
 
     if not flagged_tx_ids:

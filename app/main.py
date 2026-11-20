@@ -182,8 +182,32 @@ app_lifespan = None if ("pytest" in sys.modules or os.getenv("TESTING") == "1") 
 # LOCAL TOUR GUIDE MODULE 05 ROUTER IMPORT
 # ==========================================
 
+from app.routers.admin_tour_guides import (
+    router as admin_tour_guides_router,
+)
 from app.routers.tour_guide import (
+    public_router as tour_guide_uploads_router,
     router as tour_guide_router,
+)
+from app.routers.tour_guide_bookings import (
+    provider_router as tour_guide_provider_bookings_router,
+    traveler_router as tour_guide_traveler_bookings_router,
+)
+from app.routers.tour_guide_m034 import (
+    admin_router as tour_guide_m034_admin_router,
+    provider_router as tour_guide_m034_provider_router,
+    public_router as tour_guide_m034_public_router,
+)
+from app.routers.tour_guide_payments import (
+    router as tour_guide_payments_router,
+)
+from app.routers.tour_guide_phase5 import (
+    admin_router as tour_guide_phase5_admin_router,
+    provider_router as tour_guide_phase5_provider_router,
+    traveler_router as tour_guide_phase5_traveler_router,
+)
+from app.routers.tour_guide_public import (
+    router as tour_guide_public_router,
 )
 from app.routers.weather import router as weather_router
 from app.routers.interactive_map import admin_router as admin_map_router
@@ -333,7 +357,19 @@ app.include_router(rental_eligibility_router)
 # LOCAL TOUR GUIDE MODULE 05
 # ==========================================
 
+app.include_router(tour_guide_uploads_router)
+app.include_router(tour_guide_m034_public_router)
+app.include_router(tour_guide_public_router)
+app.include_router(tour_guide_traveler_bookings_router)
+app.include_router(tour_guide_payments_router)
+app.include_router(tour_guide_phase5_traveler_router)
 app.include_router(tour_guide_router)
+app.include_router(tour_guide_m034_provider_router)
+app.include_router(tour_guide_provider_bookings_router)
+app.include_router(tour_guide_phase5_provider_router)
+app.include_router(tour_guide_phase5_admin_router)
+app.include_router(tour_guide_m034_admin_router)
+app.include_router(admin_tour_guides_router)
 app.include_router(weather_router)
 app.include_router(interactive_map_router)
 app.include_router(admin_map_router)

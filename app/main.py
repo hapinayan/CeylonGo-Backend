@@ -31,6 +31,28 @@ from app.routers.artisan_listings import (
 from app.routers.showcase_items import (
     router as showcase_items_router,
 )
+from app.routers.artisan_reservations import (
+    router as artisan_reservations_router,
+)
+from app.routers.admin_artisan import (
+    router as admin_artisan_router,
+)
+from app.routers.artisan_images import (
+    artisan_uploads_router,
+    router as artisan_images_router,
+)
+from app.routers.artisan_business_hours import (
+    router as artisan_business_hours_router,
+)
+from app.routers.artisan_dashboard import (
+    router as artisan_dashboard_router,
+)
+from app.routers.artisan_reviews import (
+    router as artisan_reviews_router,
+)
+from app.routers.artisan_wishlists import (
+    router as artisan_wishlists_router,
+)
 from app.routers.promotions import (
     router as promotions_router,
 )
@@ -287,6 +309,14 @@ app.include_router(auth_router)
 
 app.include_router(artisan_listings_router)
 app.include_router(showcase_items_router)
+app.include_router(artisan_images_router)
+app.include_router(artisan_uploads_router)
+app.include_router(artisan_business_hours_router)
+app.include_router(artisan_dashboard_router)
+app.include_router(artisan_reviews_router)
+app.include_router(artisan_wishlists_router)
+app.include_router(artisan_reservations_router)
+app.include_router(admin_artisan_router)
 app.include_router(promotions_router)
 
 # ==========================================

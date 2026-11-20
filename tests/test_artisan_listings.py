@@ -710,13 +710,14 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     """
     Validates complete end-to-end workflow for M05.1 with isolated test fixtures:
     1. Traveler 403 boundary check.
-    2. Authenticated artisan provider creates sample listing.
-    3. Public search, district, and category discovery.
-    4. Detailed public listing view.
-    5. Ownership protection against other providers (PUT/DELETE 403).
-    6. Owner update (PUT 200).
-    7. Owner soft delete (DELETE 200).
-    8. Public 404 verification after deactivation while preserved in provider's own catalog.
+    2. Authenticated artisan provider creates sample listing (enters pending status).
+    3. Admin approves the artisan listing.
+    4. Public search, district, and category discovery.
+    5. Detailed public listing view.
+    6. Ownership protection against other providers (PUT/DELETE 403).
+    7. Owner update (PUT 200).
+    8. Owner soft delete (DELETE 200).
+    9. Public 404 verification after deactivation while preserved in provider's own catalog.
     """
     artisan_user, artisan_profile = approved_artisan_user
     other_artisan_user, _ = second_artisan_user
@@ -746,7 +747,7 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     assert traveler_res.status_code == 403
     assert "provider role required" in traveler_res.json()["detail"].lower()
 
-    # 2. Approved artisan provider creates sample listing (201 Created)
+    # 2. Approved artisan provider creates sample listing (201 Created) -> enters pending
     create_res = client.post(
         "/api/v1/artisan-listings",
         json=sample_listing_payload,
@@ -761,6 +762,7 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     assert created["is_active"] is True
     assert created["is_verified"] is False
     assert created["is_featured"] is False
+    assert created["approval_status"] == "pending"
 
     # A newly created shop stays out of public discovery until verification.
     assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
@@ -771,7 +773,17 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     )
     assert verified.status_code == 200
 
-    # 3. Public search & discovery (GET /api/v1/artisan-listings)
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
+
+    # 3. Admin approves the artisan listing
+    approve_res = client.post(
+        f"/api/v1/admin/artisan/listings/{listing_id}/approve",
+        headers=auth_header(admin_user),
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json()["approval_status"] == "approved"
+
+    # 4. Public search & discovery (GET /api/v1/artisan-listings)
     public_res = client.get("/api/v1/artisan-listings", params={"search": "Heritage"})
     assert public_res.status_code == 200
     search_data = public_res.json()

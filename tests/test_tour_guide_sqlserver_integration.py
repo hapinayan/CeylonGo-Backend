@@ -297,7 +297,7 @@ def test_sqlserver_migrations_001_to_036_and_live_check_constraints(
             text("SELECT version FROM dbo.schema_migrations ORDER BY version")
         ).fetchall()
     ]
-    assert versions == [f"{i:03d}" for i in range(1, 37)]
+    assert versions[:36] == [f"{i:03d}" for i in range(1, 37)]
 
     # Verify Migration 034 (eco_reservations) AND Migration 035 (tour_guides extensions) exist physically on SQL Server
     eco_tbl = sqlserver_db.execute(

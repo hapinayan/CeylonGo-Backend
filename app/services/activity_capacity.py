@@ -83,3 +83,34 @@ def release_activity_capacity(
     result = db.execute(statement)
 
     return result.rowcount == 1
+
+
+def update_slot_capacity(
+    db: Session,
+    slot_id: int,
+    new_capacity: int,
+) -> bool:
+    """
+    Atomically update capacity of a slot, ensuring new_capacity >= reserved_count.
+
+    The caller must commit or roll back the transaction.
+    """
+    if slot_id <= 0:
+        raise ValueError("slot_id must be positive")
+
+    if new_capacity <= 0:
+        raise ValueError("new_capacity must be positive")
+
+    statement = (
+        update(ActivitySlot)
+        .where(
+            ActivitySlot.id == slot_id,
+            ActivitySlot.reserved_count <= new_capacity,
+        )
+        .values(capacity=new_capacity)
+        .execution_options(synchronize_session=False)
+    )
+
+    result = db.execute(statement)
+
+    return result.rowcount == 1

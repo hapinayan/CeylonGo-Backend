@@ -287,6 +287,12 @@ class ActivitySummary(BaseModel):
     is_active: bool
 
 
+class ActivityActiveUpdate(BaseModel):
+    """Schema for activating or deactivating an activity."""
+
+    is_active: bool
+
+
 class ActivityImageResponse(BaseModel):
     """Image response schema."""
 
@@ -298,6 +304,14 @@ class ActivityImageResponse(BaseModel):
     alt_text: str | None = None
     display_order: int = 0
     is_cover: bool = False
+
+
+class ActivityImageUpdate(BaseModel):
+    """Schema for updating image metadata."""
+
+    alt_text: str | None = None
+    display_order: int | None = Field(default=None, ge=0)
+    is_cover: bool | None = None
 
 
 class ActivityOrganizerContact(BaseModel):

@@ -2,13 +2,14 @@
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.publication import public_activity, public_eco
 from app.database.connection import get_db
 from app.models.activity import Activity
+from app.models.activity_booking import ActivityBooking
 from app.models.eco_experience import EcoExperience
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
@@ -20,7 +21,9 @@ from app.schemas.activity_slot import (
     ActivitySlotAvailability,
     ActivitySlotCreate,
     ActivitySlotResponse,
+    ActivitySlotUpdate,
 )
+from app.services.activity_capacity import update_slot_capacity
 
 
 router = APIRouter(tags=["Activity Slots"])
@@ -196,3 +199,208 @@ def list_public_activity_slots(
         )
         for slot in slots
     ]
+
+
+@router.patch(
+    "/api/v1/provider/activities/{activity_id}/slots/{slot_id}",
+    response_model=ActivitySlotResponse,
+    summary="Update a provider's scheduled activity slot",
+)
+def update_activity_slot(
+    activity_id: int,
+    slot_id: int,
+    payload: ActivitySlotUpdate,
+    provider_profile: Annotated[
+        ProviderProfile,
+        Depends(require_activity_provider),
+    ],
+    db: Annotated[Session, Depends(get_db)],
+):
+    activity = get_owned_activity(
+        activity_id,
+        provider_profile,
+        db,
+        for_update=True,
+    )
+
+    slot = (
+        db.query(ActivitySlot)
+        .filter(
+            ActivitySlot.id == slot_id,
+            ActivitySlot.activity_id == activity.id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not slot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity slot not found",
+        )
+
+    # Validate time changes
+    if payload.starts_at is not None or payload.ends_at is not None:
+        new_starts = (
+            payload.starts_at.astimezone(timezone.utc).replace(tzinfo=None)
+            if payload.starts_at
+            else slot.starts_at
+        )
+        new_ends = (
+            payload.ends_at.astimezone(timezone.utc).replace(tzinfo=None)
+            if payload.ends_at
+            else slot.ends_at
+        )
+
+        is_time_changed = (new_starts != slot.starts_at) or (new_ends != slot.ends_at)
+        if is_time_changed:
+            if slot.reserved_count > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Cannot reschedule a slot with existing reservations",
+                )
+
+            active_booking = (
+                db.query(ActivityBooking)
+                .filter(
+                    ActivityBooking.activity_slot_id == slot.id,
+                    ActivityBooking.booking_status.in_(["pending", "confirmed"]),
+                )
+                .first()
+            )
+            if active_booking:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Cannot reschedule a slot with active bookings",
+                )
+
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            if new_starts <= now_utc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Slot start time must be in the future",
+                )
+            if new_ends <= new_starts:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Slot end time must be after start time",
+                )
+
+            # Check overlapping active slots for this activity
+            overlapping = (
+                db.query(ActivitySlot)
+                .filter(
+                    ActivitySlot.activity_id == activity.id,
+                    ActivitySlot.id != slot.id,
+                    ActivitySlot.is_active == True,
+                    ActivitySlot.starts_at < new_ends,
+                    ActivitySlot.ends_at > new_starts,
+                )
+                .first()
+            )
+            if overlapping:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This slot overlaps an existing active slot",
+                )
+
+            slot.starts_at = new_starts
+            slot.ends_at = new_ends
+
+    # Validate capacity change
+    if payload.capacity is not None:
+        if payload.capacity < 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Capacity must be at least 1",
+            )
+        success = update_slot_capacity(
+            db, slot_id=slot.id, new_capacity=payload.capacity
+        )
+        if not success:
+            db.refresh(slot)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot reduce capacity to {payload.capacity}; {slot.reserved_count} spots already reserved",
+            )
+        slot.capacity = payload.capacity
+
+    # Availability toggle
+    if payload.is_active is not None:
+        slot.is_active = payload.is_active
+
+    try:
+        db.commit()
+        db.refresh(slot)
+    except Exception:
+        db.rollback()
+        raise
+
+    return slot
+
+
+@router.delete(
+    "/api/v1/provider/activities/{activity_id}/slots/{slot_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an unbooked activity slot",
+)
+def delete_activity_slot(
+    activity_id: int,
+    slot_id: int,
+    provider_profile: Annotated[
+        ProviderProfile,
+        Depends(require_activity_provider),
+    ],
+    db: Annotated[Session, Depends(get_db)],
+):
+    activity = get_owned_activity(
+        activity_id,
+        provider_profile,
+        db,
+        for_update=True,
+    )
+
+    slot = (
+        db.query(ActivitySlot)
+        .filter(
+            ActivitySlot.id == slot_id,
+            ActivitySlot.activity_id == activity.id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not slot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity slot not found",
+        )
+
+    # Protect existing reservations
+    if slot.reserved_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete slot with existing reservations",
+        )
+
+    # Protect booking history and foreign key integrity
+    any_booking = (
+        db.query(ActivityBooking.id)
+        .filter(ActivityBooking.activity_slot_id == slot.id)
+        .first()
+    )
+    if any_booking:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete slot with existing bookings. Deactivate the slot instead.",
+        )
+
+    try:
+        db.delete(slot)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+

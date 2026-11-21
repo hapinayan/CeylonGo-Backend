@@ -114,6 +114,7 @@ from app.routers.activities_public import (
     router as activities_public_router,
 )
 from app.routers.provider_activities import (
+    activity_uploads_router,
     router as provider_activities_router,
 )
 from app.routers.admin_activities import (
@@ -361,6 +362,7 @@ app.include_router(eco_reservations_router)
 # ==========================================
 
 app.include_router(activities_public_router)
+app.include_router(activity_uploads_router)
 app.include_router(provider_activities_router)
 app.include_router(admin_activities_router)
 app.include_router(activity_slots_router)

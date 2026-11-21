@@ -48,6 +48,47 @@ class ActivitySlotCreate(BaseModel):
         return self
 
 
+class ActivitySlotUpdate(BaseModel):
+    """Update a scheduled slot for an activity."""
+
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    capacity: int | None = Field(
+        default=None,
+        ge=1,
+        le=10000,
+        description="Maximum participants allowed",
+    )
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_schedule(self):
+        if self.starts_at is not None and self.ends_at is not None:
+            if (
+                self.starts_at.tzinfo is None
+                or self.ends_at.tzinfo is None
+            ):
+                raise ValueError(
+                    "Slot timestamps must include a timezone offset"
+                )
+
+            start = self.starts_at.astimezone(timezone.utc)
+            end = self.ends_at.astimezone(timezone.utc)
+            now = datetime.now(timezone.utc)
+
+            if start <= now:
+                raise ValueError(
+                    "Slot start time must be in the future"
+                )
+
+            if end <= start:
+                raise ValueError(
+                    "Slot end time must be after start time"
+                )
+
+        return self
+
+
 class ActivitySlotResponse(BaseModel):
     """Scheduled slot details."""
 

@@ -1,9 +1,14 @@
 import smtplib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
+import jwt
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import SQLAlchemyError, StatementError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -19,6 +24,8 @@ from app.core.rate_limiter import reset_all_limiters
 from app.core.security import (
     create_access_token,
     decode_access_token,
+    get_jwt_algorithm,
+    get_jwt_secret_key,
     hash_password,
     hash_reset_token,
     verify_password,
@@ -27,6 +34,8 @@ from app.database.connection import get_db
 from app.main import app
 from app.models.password_reset import PasswordReset
 from app.models.user import Base, User
+from app.routers import auth
+from app.schemas.auth import ResetPasswordRequest
 
 # Create isolated in-memory SQLite database
 test_engine = create_engine(
@@ -845,6 +854,41 @@ def test_forgot_password_email_failure_handled_safely(
     assert db_session.query(PasswordReset).count() == 0
 
 
+@pytest.mark.parametrize(
+    "endpoint, payload, status_code, operation",
+    [
+        ("forgot-password", {"email": "redaction@example.com"}, 200, "request"),
+        ("reset-password", {
+            "token": "synthetic-reset-token", "new_password": "Replacement password",
+        }, 500, "execution"),
+    ],
+)
+def test_password_recovery_database_errors_are_logged_without_sensitive_details(
+    client, db_session, monkeypatch, caplog, endpoint, payload, status_code, operation
+):
+    driver_detail = "synthetic-driver-credential"
+    statement = "SELECT synthetic_sql_statement"
+    bound_value = "synthetic-sensitive-bound-parameter"
+
+    def fail_query(*args, **kwargs):
+        raise StatementError(
+            "Database query failed", statement, {"value": bound_value},
+            ValueError(driver_detail),
+        )
+
+    monkeypatch.setattr(db_session, "query", fail_query)
+    response = client.post(f"/api/v1/auth/{endpoint}", json=payload)
+
+    assert response.status_code == status_code
+    records = [record for record in caplog.records if record.name == auth.logger.name]
+    assert [record.getMessage() for record in records] == [
+        f"Database error occurred during password reset {operation}."
+    ]
+    assert records[0].levelname == "ERROR"
+    assert records[0].exc_info is None
+    assert all(value not in caplog.text for value in (statement, bound_value, driver_detail))
+
+
 def test_verify_reset_token_valid(client: TestClient, db_session):
     user = User(
         full_name="Verify Traveler",
@@ -936,12 +980,13 @@ def test_verify_reset_token_already_used(client: TestClient, db_session):
     assert "already been used" in response.json()["detail"]
 
 
-def test_reset_password_success_and_login(client: TestClient, db_session):
+@pytest.mark.parametrize("role", ["traveler", "admin"])
+def test_reset_password_success_and_login(client: TestClient, db_session, role):
     user = User(
         full_name="Reset Login Traveler",
         email="reset.login@example.com",
         password_hash=hash_password("InitialOldPass123!"),
-        role="traveler",
+        role=role,
         is_active=True,
     )
     db_session.add(user)
@@ -958,6 +1003,15 @@ def test_reset_password_success_and_login(client: TestClient, db_session):
     db_session.add(reset)
     db_session.commit()
 
+    login = client.post("/api/v1/auth/login", json={
+        "email": user.email, "password": "InitialOldPass123!",
+    })
+    assert login.status_code == 200
+    original_token = login.json()["access_token"]
+    assert decode_access_token(original_token)["credential_version"] == 0
+    original_headers = {"Authorization": f"Bearer {original_token}"}
+    assert client.get("/api/v1/auth/me", headers=original_headers).status_code == 200
+
     # Reset password
     payload = {
         "token": raw_token,
@@ -971,6 +1025,9 @@ def test_reset_password_success_and_login(client: TestClient, db_session):
     db_session.refresh(reset)
     assert reset.is_used is True
     assert reset.used_at is not None
+    db_session.refresh(user)
+    assert user.credential_version == 1
+    assert client.get("/api/v1/auth/me", headers=original_headers).status_code == 401
 
     # Login with OLD password must FAIL
     old_login = client.post(
@@ -989,6 +1046,11 @@ def test_reset_password_success_and_login(client: TestClient, db_session):
     )
     assert new_login.status_code == 200
     token_data = new_login.json()
+    new_token = token_data["access_token"]
+    assert decode_access_token(new_token)["credential_version"] == 1
+    assert client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {new_token}"}
+    ).status_code == 200
     assert "access_token" in token_data
     assert token_data["user"]["email"] == "reset.login@example.com"
 
@@ -1029,6 +1091,207 @@ def test_reset_password_replay_fails(client: TestClient, db_session):
     )
     assert res2.status_code == 400
     assert "already been used" in res2.json()["detail"]
+
+
+def test_concurrent_reset_token_claim(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'recovery.sqlite'}")
+    event.listen(engine, "connect", configure_sqlite_connection)
+    sessions = sessionmaker(bind=engine)
+    token = "concurrent-reset-test"
+    before_claim = Barrier(2, timeout=10)
+
+    try:
+        Base.metadata.create_all(engine)
+        with sessions.begin() as db:
+            user = User(email="race@example.com", full_name="Reset Test")
+            db.add(user)
+            db.flush()
+            db.add(PasswordReset(
+                user_id=user.id, token_hash=hash_reset_token(token),
+                expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5),
+            ))
+
+        def hash_before_claim(password):
+            hashed = hash_password(password)
+            before_claim.wait()
+            return hashed
+
+        monkeypatch.setattr(auth, "hash_password", hash_before_claim)
+
+        def redeem(password):
+            with sessions() as db:
+                try:
+                    auth.reset_password(
+                        ResetPasswordRequest(token=token, new_password=password), db
+                    )
+                except HTTPException as exc:
+                    return exc.status_code, password
+            return 200, password
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = sorted(executor.map(redeem, ["winner-or-loser", "other-password"]))
+
+        assert [code for code, _ in results] == [200, 400]
+        with sessions() as db:
+            assert verify_password(results[0][1], db.query(User).one().password_hash)
+            assert db.query(User).one().credential_version == 1
+            record = db.query(PasswordReset).one()
+            assert record.is_used and record.used_at is not None
+    finally:
+        engine.dispose()
+
+
+def test_legacy_jwt_transition(client, db_session, monkeypatch):
+    user = User(full_name="Legacy User", email="legacy@example.com")
+    db_session.add(user)
+    db_session.commit()
+    expiry = datetime.now(UTC) + timedelta(minutes=5)
+    token = jwt.encode(
+        {"sub": str(user.id), "exp": expiry},
+        get_jwt_secret_key(), algorithm=get_jwt_algorithm(),
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    deadline_var = "JWT_LEGACY_CREDENTIAL_VERSION_UNTIL"
+    monkeypatch.delenv(deadline_var, raising=False)
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
+    monkeypatch.setenv(deadline_var, str(int(expiry.timestamp())))
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 200
+    user.credential_version = 1
+    db_session.commit()
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
+    user.credential_version = 0
+    db_session.commit()
+    monkeypatch.setenv(deadline_var, "1")
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
+
+
+@pytest.mark.parametrize("version", [None, True, "0", -1, 0.0, 1])
+def test_invalid_or_mismatched_credential_version(client, db_session, version):
+    user = User(full_name="Version Test", email="version@example.com")
+    db_session.add(user)
+    db_session.commit()
+    token = jwt.encode(
+        {
+            "sub": str(user.id),
+            "exp": datetime.now(UTC) + timedelta(minutes=5),
+            "credential_version": version,
+        },
+        get_jwt_secret_key(), algorithm=get_jwt_algorithm(),
+    )
+    response = client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_login_racing_reset_cannot_issue_token_at_new_version(
+    client, db_session, monkeypatch
+):
+    old_password = "original password"
+    user = User(
+        full_name="Login Race", email="login-race@example.com",
+        password_hash=hash_password(old_password),
+    )
+    db_session.add(user)
+    db_session.flush()
+    token = "login-race-reset-test"
+    db_session.add(PasswordReset(
+        user_id=user.id, token_hash=hash_reset_token(token),
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5),
+    ))
+    db_session.commit()
+
+    def verify_while_reset_commits(password, password_hash):
+        auth.reset_password(
+            ResetPasswordRequest(token=token, new_password="replacement password"),
+            db_session,
+        )
+        assert user.credential_version == 1
+        return verify_password(password, password_hash)
+
+    monkeypatch.setattr(auth, "verify_password", verify_while_reset_commits)
+    response = client.post(
+        "/api/v1/auth/login", json={"email": user.email, "password": old_password}
+    )
+    assert response.status_code == 200
+    access_token = response.json()["access_token"]
+    assert decode_access_token(access_token)["credential_version"] == 0
+    assert client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"}
+    ).status_code == 401
+
+
+def test_failed_reset_commit_rolls_back_version_password_and_token(
+    client, db_session, monkeypatch
+):
+    old_password = "original password"
+    user = User(
+        full_name="Reset Rollback", email="reset-rollback@example.com",
+        password_hash=hash_password(old_password), credential_version=3,
+    )
+    db_session.add(user)
+    db_session.flush()
+    token = "failed-commit-reset-test"
+    record = PasswordReset(
+        user_id=user.id, token_hash=hash_reset_token(token),
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5),
+    )
+    db_session.add(record)
+    db_session.commit()
+
+    def reject_commit():
+        raise SQLAlchemyError("Simulated commit failure")
+
+    monkeypatch.setattr(db_session, "commit", reject_commit)
+    response = client.post("/api/v1/auth/reset-password", json={
+        "token": token, "new_password": "replacement password",
+    })
+    assert response.status_code == 500
+    db_session.refresh(user)
+    db_session.refresh(record)
+    assert user.credential_version == 3
+    assert verify_password(old_password, user.password_hash)
+    assert record.is_used is False and record.used_at is None
+
+
+def test_google_login_uses_current_version(client, db_session, monkeypatch):
+    email = "google-version@example.com"
+    user = User(
+        full_name="Google Version", email=email, google_sub="version-sub",
+        credential_version=4,
+    )
+    db_session.add(user)
+    db_session.commit()
+    monkeypatch.setattr(auth, "verify_google_id_token", lambda _: {
+        "google_sub": user.google_sub, "email": email, "full_name": user.full_name,
+    })
+    response = client.post("/api/v1/auth/google", json={"id_token": "verified-by-mock"})
+    assert response.status_code == 200
+    token = response.json()["access_token"]
+    assert decode_access_token(token)["credential_version"] == 4
+    assert client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"}
+    ).status_code == 200
+
+
+def test_tour_guide_optional_auth_rejects_stale_token(client, db_session):
+    user = User(
+        full_name="Guide Visitor", email="visitor@example.com", credential_version=1,
+    )
+    db_session.add(user)
+    db_session.commit()
+    path = "/api/v1/tour-guides/1/contact"
+    anonymous = client.get(path)
+    assert anonymous.status_code == 404
+    stale_token = create_access_token({"sub": str(user.id)}, credential_version=0)
+    assert client.get(
+        path, headers={"Authorization": f"Bearer {stale_token}"}
+    ).status_code == 401
+    fresh_token = create_access_token({"sub": str(user.id)}, credential_version=1)
+    assert client.get(
+        path, headers={"Authorization": f"Bearer {fresh_token}"}
+    ).status_code == 404
 
 
 def test_reset_password_expired_fails(client: TestClient, db_session):

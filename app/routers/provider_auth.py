@@ -210,14 +210,17 @@ def provider_login(
             detail="Provider account is inactive. Please contact support.",
         )
 
-    if not verify_password(payload.password, user.password_hash):
+    password_hash, credential_version = user.password_hash, user.credential_version
+    if not verify_password(payload.password, password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
 
     # Issue signed JWT access token
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=credential_version
+    )
 
     return ProviderLoginResponse(
         access_token=token,

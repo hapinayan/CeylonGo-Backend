@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import lock_booking_resource
+from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -41,14 +43,15 @@ def list_showcase_items(
 ):
     """
     Public discovery endpoint.
-    Retrieves active showcase items across active artisan listings with search, type, and listing filters.
+    Retrieves active and approved showcase items across active and approved artisan listings with search, type, and listing filters.
     """
     query = (
         db.query(ShowcaseItem)
         .join(ArtisanListing, ShowcaseItem.artisan_listing_id == ArtisanListing.id)
         .filter(
             ShowcaseItem.is_active == True,
-            ArtisanListing.is_active == True,
+            public_artisan(),
+            ShowcaseItem.approval_status == "approved",
         )
     )
 
@@ -123,7 +126,7 @@ def get_showcase_item(
     db: Annotated[Session, Depends(get_db)],
 ):
     """
-    Public endpoint: Returns full details of an active showcase item under an active listing.
+    Public endpoint: Returns full details of an active, approved showcase item under an active, approved listing.
     """
     item = (
         db.query(ShowcaseItem)
@@ -131,7 +134,8 @@ def get_showcase_item(
         .filter(
             ShowcaseItem.id == id,
             ShowcaseItem.is_active == True,
-            ArtisanListing.is_active == True,
+            public_artisan(),
+            ShowcaseItem.approval_status == "approved",
         )
         .first()
     )
@@ -157,11 +161,11 @@ def get_listing_showcase_items(
     page_size: int = Query(default=12, ge=1, le=100, description="Items per page"),
 ):
     """
-    Public endpoint: Returns paginated showcase items for a specific active artisan listing.
+    Public endpoint: Returns paginated active, approved showcase items for a specific active, approved artisan listing.
     """
     listing = (
         db.query(ArtisanListing)
-        .filter(ArtisanListing.id == listing_id, ArtisanListing.is_active == True)
+        .filter(ArtisanListing.id == listing_id, public_artisan())
         .first()
     )
     if not listing:
@@ -173,6 +177,7 @@ def get_listing_showcase_items(
     query = db.query(ShowcaseItem).filter(
         ShowcaseItem.artisan_listing_id == listing_id,
         ShowcaseItem.is_active == True,
+        ShowcaseItem.approval_status == "approved",
     )
 
     if item_type and item_type.strip():
@@ -249,6 +254,10 @@ def create_showcase_item(
         materials=payload.materials,
         duration_minutes=payload.duration_minutes,
         is_available=payload.is_available,
+        stock_quantity=payload.stock_quantity,
+        sku=payload.sku,
+        is_custom_order_available=payload.is_custom_order_available,
+        approval_status="pending",
         is_featured=False,
         is_active=True,
     )
@@ -288,6 +297,14 @@ def update_showcase_item(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
+    # Providers cannot self-modify approval_status
+    update_data.pop("approval_status", None)
+    if "stock_quantity" in update_data:
+        lock_booking_resource(db, f"artisan_stock_{item.id}")
+        db.refresh(item)
+        if item.artisan_listing.provider_profile_id != provider_profile.id:
+            raise HTTPException(403, "You do not own this showcase item")
+
     for key, value in update_data.items():
         setattr(item, key, value)
 

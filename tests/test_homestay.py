@@ -69,10 +69,12 @@ from app.models.homestay import (
     Homestay,
     HomestayImage,
     HomestayAmenity,
+    HomestayAvailabilityBlock,
 )
 
 
 from app.models.booking import Booking
+from app.models.shared import ListingReference
 
 from datetime import datetime, timezone
 
@@ -84,17 +86,8 @@ def homestay_test_client():
         poolclass=StaticPool,
     )
 
-    Base.metadata.create_all(
-        bind=engine,
-        tables=[
-            User.__table__,
-            Homestay.__table__,
-            HomestayImage.__table__,
-            HomestayAmenity.__table__,
-            Booking.__table__,
-
-        ],
-    )
+    import app.models as app_models  # Ensure all models are registered on Base without shadowing app
+    Base.metadata.create_all(bind=engine)
 
     TestingSession = sessionmaker(bind=engine)
 

@@ -239,6 +239,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
 
     # Create active listings
     listing1 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Kandyan Brass and Woodcraft",
         craft_category="Woodcarving & Masks",
@@ -251,6 +252,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
         is_featured=True,
     )
     listing2 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile2.id,
         title="Galle Fort Handmade Batiks",
         craft_category="Batik & Textiles",
@@ -264,6 +266,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
     )
     # Inactive listing (should not appear in public lists)
     listing3 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Closed Wood Shop",
         craft_category="Woodcarving & Masks",
@@ -318,6 +321,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
 def test_get_craft_categories(client: TestClient, db_session, approved_artisan_user):
     _, profile = approved_artisan_user
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Mask Workshop",
         craft_category="Woodcarving & Masks",
@@ -341,6 +345,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
     _, profile2 = second_artisan_user
 
     listing1 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Kandy Craft",
         craft_category="Woodcarving & Masks",
@@ -349,6 +354,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
         is_active=True,
     )
     listing2 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile2.id,
         title="Galle Craft",
         craft_category="Batik & Textiles",
@@ -369,6 +375,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
 def test_get_artisan_listing_details_public(client: TestClient, db_session, approved_artisan_user):
     _, profile = approved_artisan_user
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Kandy Woodcarving Workshop",
         craft_category="Woodcarving & Masks",
@@ -699,17 +706,18 @@ def test_admin_status_update_success(client: TestClient, db_session, admin_user,
 # Full End-to-End Sample Artisan Listing Lifecycle & Ownership Test
 # ==============================================================================
 
-def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_user, approved_artisan_user, second_artisan_user):
+def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_user, approved_artisan_user, second_artisan_user, admin_user):
     """
     Validates complete end-to-end workflow for M05.1 with isolated test fixtures:
     1. Traveler 403 boundary check.
-    2. Authenticated artisan provider creates sample listing.
-    3. Public search, district, and category discovery.
-    4. Detailed public listing view.
-    5. Ownership protection against other providers (PUT/DELETE 403).
-    6. Owner update (PUT 200).
-    7. Owner soft delete (DELETE 200).
-    8. Public 404 verification after deactivation while preserved in provider's own catalog.
+    2. Authenticated artisan provider creates sample listing (enters pending status).
+    3. Admin approves the artisan listing.
+    4. Public search, district, and category discovery.
+    5. Detailed public listing view.
+    6. Ownership protection against other providers (PUT/DELETE 403).
+    7. Owner update (PUT 200).
+    8. Owner soft delete (DELETE 200).
+    9. Public 404 verification after deactivation while preserved in provider's own catalog.
     """
     artisan_user, artisan_profile = approved_artisan_user
     other_artisan_user, _ = second_artisan_user
@@ -739,7 +747,7 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     assert traveler_res.status_code == 403
     assert "provider role required" in traveler_res.json()["detail"].lower()
 
-    # 2. Approved artisan provider creates sample listing (201 Created)
+    # 2. Approved artisan provider creates sample listing (201 Created) -> enters pending
     create_res = client.post(
         "/api/v1/artisan-listings",
         json=sample_listing_payload,
@@ -754,8 +762,28 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     assert created["is_active"] is True
     assert created["is_verified"] is False
     assert created["is_featured"] is False
+    assert created["approval_status"] == "pending"
 
-    # 3. Public search & discovery (GET /api/v1/artisan-listings)
+    # A newly created shop stays out of public discovery until verification.
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
+    verified = client.patch(
+        f"/api/v1/artisan-listings/{listing_id}/status",
+        json={"is_verified": True},
+        headers=auth_header(admin_user),
+    )
+    assert verified.status_code == 200
+
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
+
+    # 3. Admin approves the artisan listing
+    approve_res = client.post(
+        f"/api/v1/admin/artisan/listings/{listing_id}/approve",
+        headers=auth_header(admin_user),
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json()["approval_status"] == "approved"
+
+    # 4. Public search & discovery (GET /api/v1/artisan-listings)
     public_res = client.get("/api/v1/artisan-listings", params={"search": "Heritage"})
     assert public_res.status_code == 200
     search_data = public_res.json()

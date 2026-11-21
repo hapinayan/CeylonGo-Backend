@@ -40,7 +40,9 @@ class TourGuide(Base):
         CheckConstraint("daily_rate >= 0", name="CK_tour_guides_daily_rate"),
         CheckConstraint(
             "(base_latitude IS NULL AND base_longitude IS NULL) "
-            "OR (base_latitude BETWEEN -90.0 AND 90.0 AND base_longitude BETWEEN -180.0 AND 180.0)",
+            "OR (base_latitude IS NOT NULL AND base_longitude IS NOT NULL "
+            "AND base_latitude BETWEEN -90.0 AND 90.0 "
+            "AND base_longitude BETWEEN -180.0 AND 180.0)",
             name="CK_tour_guides_coords",
         ),
         CheckConstraint(
@@ -365,7 +367,9 @@ class TourGuidePackage(Base):
         CheckConstraint("max_people > 0", name="CK_tour_guide_packages_max_people"),
         CheckConstraint(
             "(meeting_latitude IS NULL AND meeting_longitude IS NULL) "
-            "OR (meeting_latitude BETWEEN -90.0 AND 90.0 AND meeting_longitude BETWEEN -180.0 AND 180.0)",
+            "OR (meeting_latitude IS NOT NULL AND meeting_longitude IS NOT NULL "
+            "AND meeting_latitude BETWEEN -90.0 AND 90.0 "
+            "AND meeting_longitude BETWEEN -180.0 AND 180.0)",
             name="CK_tour_guide_packages_coords",
         ),
     )

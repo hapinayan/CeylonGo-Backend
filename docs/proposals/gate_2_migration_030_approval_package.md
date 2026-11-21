@@ -4,11 +4,16 @@
 **Document Version**: 1.0  
 **Date**: 20 November 2026  
 **Target Database**: Microsoft SQL Server (`CeylonGoDB`)  
-**Target Script**: `migrations/030_make_activity_slots_activity_id_nullable.sql`  
+**Proposal Script**: [030_make_activity_slots_activity_id_nullable.sql](030_make_activity_slots_activity_id_nullable.sql)
 **Target Table**: `dbo.activity_slots`  
 **Responsible Approver**: Database Coordinator / Lead DBA  
 **Status**: **PENDING APPROVAL**  
 **Recommendation**: **READY FOR APPROVAL**  
+
+The SQL is retained outside the migration runner's inventory. Version `030` is
+assigned to the Homestay migration on `develop`. The staged Eco slot design
+requires a separate decision before any migration can be numbered or executed.
+The merged standalone Eco reservation flow uses the tables from migration `034`.
 
 ---
 
@@ -103,7 +108,7 @@ GO
 
 ## 4. Migration Architecture & Transaction Recommendation
 
-The migration script [migrations/030_make_activity_slots_activity_id_nullable.sql](file:///c:/Users/komaruthan/Desktop/project%203/CeylonGo-Backend/migrations/030_make_activity_slots_activity_id_nullable.sql) executes:
+The [proposal script](030_make_activity_slots_activity_id_nullable.sql) contains:
 1. **Pre-check**: Validates table existence and XOR row conformity.
 2. **Column Alteration**: `ALTER TABLE dbo.activity_slots ALTER COLUMN activity_id INT NULL;`.
 3. **XOR Constraint Addition**:
@@ -183,5 +188,5 @@ ALTER TABLE dbo.activity_slots ALTER COLUMN activity_id INT NOT NULL;
 - [ ] Execute read-only preflight script and verify all 4 checks pass.
 - [ ] Review backup checklist and confirm backup availability.
 - [ ] Review idempotent execution and guarded rollback logic.
-- [ ] Execute `migrations/030_make_activity_slots_activity_id_nullable.sql` on staging environment.
+- [ ] Approve a numbered migration before any staging execution.
 - [ ] Sign off on Gate 2.

@@ -1,5 +1,6 @@
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +30,28 @@ from app.routers.artisan_listings import (
 )
 from app.routers.showcase_items import (
     router as showcase_items_router,
+)
+from app.routers.artisan_reservations import (
+    router as artisan_reservations_router,
+)
+from app.routers.admin_artisan import (
+    router as admin_artisan_router,
+)
+from app.routers.artisan_images import (
+    artisan_uploads_router,
+    router as artisan_images_router,
+)
+from app.routers.artisan_business_hours import (
+    router as artisan_business_hours_router,
+)
+from app.routers.artisan_dashboard import (
+    router as artisan_dashboard_router,
+)
+from app.routers.artisan_reviews import (
+    router as artisan_reviews_router,
+)
+from app.routers.artisan_wishlists import (
+    router as artisan_wishlists_router,
 )
 from app.routers.promotions import (
     router as promotions_router,
@@ -79,6 +102,9 @@ from app.routers.admin_providers import (
 from app.routers.provider_auth import (
     router as provider_auth_router,
 )
+from app.routers.provider_workspace import router as provider_workspace_router
+from app.routers.provider_reservations import router as provider_reservations_router
+from app.routers.eco_reservations import router as eco_reservations_router
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES ROUTER IMPORTS
@@ -118,11 +144,99 @@ from app.routers.wishlists import (
 # RENTAL MODULE ROUTER IMPORTS
 # ==========================================
 
+from app.routers.rental_vehicles import pickup_router as rental_pickups_router
 from app.routers.rental_vehicles import (
     router as rental_vehicles_router,
 )
 from app.routers.rental_bookings import (
     router as rental_bookings_router,
+)
+from app.routers.rental_locations import (
+    router as rental_locations_router,
+)
+from app.routers.rental_reviews import (
+    router as rental_reviews_router,
+)
+from app.routers.rental_wishlists import (
+    router as rental_wishlists_router,
+)
+from app.routers.rental_providers import (
+    router as rental_providers_router,
+)
+from app.routers.admin_rentals import (
+    router as admin_rentals_router,
+)
+from app.routers.rental_eligibility import (
+    router as rental_eligibility_router,
+)
+
+from app.services.booking_expiration import (
+    start_expiration_worker,
+    stop_expiration_worker,
+)
+
+# ==========================================
+# LIFESPAN & APPLICATION LIFECYCLE
+# ==========================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Only run background expiration worker in runtime/production, strictly bypass during test suites
+    is_testing = (
+        "pytest" in sys.modules
+        or bool(os.getenv("PYTEST_CURRENT_TEST"))
+        or os.getenv("TESTING") == "1"
+    )
+    if not is_testing:
+        start_expiration_worker(interval_seconds=60)
+        try:
+            yield
+        finally:
+            await stop_expiration_worker()
+    else:
+        yield
+
+# Avoid deadlocking Starlette TestClient / anyio under pytest
+import sys
+app_lifespan = None if ("pytest" in sys.modules or os.getenv("TESTING") == "1") else lifespan
+
+# ==========================================
+# LOCAL TOUR GUIDE MODULE 05 ROUTER IMPORT
+# ==========================================
+
+from app.routers.admin_tour_guides import (
+    router as admin_tour_guides_router,
+)
+from app.routers.tour_guide import (
+    public_router as tour_guide_uploads_router,
+    router as tour_guide_router,
+)
+from app.routers.tour_guide_bookings import (
+    provider_router as tour_guide_provider_bookings_router,
+    traveler_router as tour_guide_traveler_bookings_router,
+)
+from app.routers.tour_guide_m034 import (
+    admin_router as tour_guide_m034_admin_router,
+    provider_router as tour_guide_m034_provider_router,
+    public_router as tour_guide_m034_public_router,
+)
+from app.routers.tour_guide_payments import (
+    router as tour_guide_payments_router,
+)
+from app.routers.tour_guide_phase5 import (
+    admin_router as tour_guide_phase5_admin_router,
+    provider_router as tour_guide_phase5_provider_router,
+    traveler_router as tour_guide_phase5_traveler_router,
+)
+from app.routers.tour_guide_public import (
+    router as tour_guide_public_router,
+)
+from app.routers.weather import router as weather_router
+from app.routers.interactive_map import admin_router as admin_map_router
+from app.routers.interactive_map import router as interactive_map_router
+from app.routers.community import (
+    router as community_router,
+    uploads_router as community_uploads_router,
 )
 
 # ==========================================
@@ -133,6 +247,7 @@ app = FastAPI(
     title="CeylonGo API",
     description="Backend API for the CeylonGo tourism platform",
     version="1.0.0",
+    lifespan=app_lifespan,
 )
 
 # ==========================================
@@ -198,6 +313,14 @@ app.include_router(auth_router)
 
 app.include_router(artisan_listings_router)
 app.include_router(showcase_items_router)
+app.include_router(artisan_images_router)
+app.include_router(artisan_uploads_router)
+app.include_router(artisan_business_hours_router)
+app.include_router(artisan_dashboard_router)
+app.include_router(artisan_reviews_router)
+app.include_router(artisan_wishlists_router)
+app.include_router(artisan_reservations_router)
+app.include_router(admin_artisan_router)
 app.include_router(promotions_router)
 
 # ==========================================
@@ -226,6 +349,9 @@ app.include_router(provider_otp_router)
 app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
+app.include_router(provider_workspace_router)
+app.include_router(provider_reservations_router)
+app.include_router(eco_reservations_router)
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES MODULE
@@ -252,7 +378,42 @@ app.include_router(admin_eco_promotions_router)
 # ==========================================
 
 app.include_router(rental_vehicles_router)
+app.include_router(rental_pickups_router)
 app.include_router(rental_bookings_router)
+app.include_router(rental_locations_router)
+app.include_router(rental_reviews_router)
+app.include_router(rental_wishlists_router)
+app.include_router(rental_providers_router)
+app.include_router(admin_rentals_router)
+app.include_router(rental_eligibility_router)
+
+# ==========================================
+# LOCAL TOUR GUIDE MODULE 05
+# ==========================================
+
+app.include_router(tour_guide_uploads_router)
+app.include_router(tour_guide_m034_public_router)
+app.include_router(tour_guide_public_router)
+app.include_router(tour_guide_traveler_bookings_router)
+app.include_router(tour_guide_payments_router)
+app.include_router(tour_guide_phase5_traveler_router)
+app.include_router(tour_guide_router)
+app.include_router(tour_guide_m034_provider_router)
+app.include_router(tour_guide_provider_bookings_router)
+app.include_router(tour_guide_phase5_provider_router)
+app.include_router(tour_guide_phase5_admin_router)
+app.include_router(tour_guide_m034_admin_router)
+app.include_router(admin_tour_guides_router)
+app.include_router(weather_router)
+app.include_router(interactive_map_router)
+app.include_router(admin_map_router)
+
+# ==========================================
+# TRAVEL COMMUNITY & SOCIAL FEED MODULE
+# ==========================================
+
+app.include_router(community_uploads_router)
+app.include_router(community_router)
 
 # ==========================================
 # HEALTH CHECK API

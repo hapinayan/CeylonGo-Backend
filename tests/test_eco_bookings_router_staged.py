@@ -840,7 +840,7 @@ class TestTravelerEcoBookingHistory:
         assert data[0]["booking_reference"] == expected_fallback
         assert data[0]["booking_reference"] == "ECO-20261119-0111"
 
-    def test_deterministic_selection_with_duplicate_booking_references(
+    def test_prefers_eco_reference_over_newer_activity_reference(
         self, db_session, seeded_env
     ):
         traveler = seeded_env["traveler"]
@@ -865,7 +865,7 @@ class TestTravelerEcoBookingHistory:
         db_session.add(booking)
         db_session.flush()
 
-        # Seed two references for the same target booking
+        # Both supported labels can refer to the booking without duplicating a key.
         older_ref = BookingReference(
             id=50,
             booking_reference="BK-OLDER-REF-050",
@@ -882,7 +882,7 @@ class TestTravelerEcoBookingHistory:
         newer_ref = BookingReference(
             id=60,
             booking_reference="BK-NEWER-REF-060",
-            module_type="eco_tourism",
+            module_type="activity",
             target_booking_id=booking.id,
             user_id=traveler.id,
             provider_profile_id=provider_profile.id,
@@ -903,8 +903,7 @@ class TestTravelerEcoBookingHistory:
 
         data = res.json()
         assert len(data) == 1
-        # Deterministic selection picks the newest by ID
-        assert data[0]["booking_reference"] == "BK-NEWER-REF-060"
+        assert data[0]["booking_reference"] == "BK-OLDER-REF-050"
 
     def test_prevents_cross_module_or_cross_user_reference_matching(
         self, db_session, seeded_env

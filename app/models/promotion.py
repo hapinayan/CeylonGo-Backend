@@ -126,12 +126,16 @@ class HomestayPromotion(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "discount_percent > 0 AND discount_percent <= 100",
-            name="CK_homestay_promotions_discount",
+            "discount_type IN ('percentage', 'fixed')",
+            name="CK_homestay_promotions_type",
         ),
         CheckConstraint(
             "end_date >= start_date",
             name="CK_homestay_promotions_dates",
+        ),
+        CheckConstraint(
+            "((discount_type = 'percentage' AND discount_percent IS NOT NULL AND discount_percent > 0 AND discount_percent <= 100 AND discount_amount IS NULL) OR (discount_type = 'fixed' AND discount_amount IS NOT NULL AND discount_amount > 0 AND discount_percent IS NULL))",
+            name="CK_homestay_promotions_discount_valid",
         ),
     )
 
@@ -158,9 +162,20 @@ class HomestayPromotion(Base):
         nullable=True,
     )
 
-    discount_percent: Mapped[Decimal] = mapped_column(
-        Numeric(5, 2),
+    discount_type: Mapped[str] = mapped_column(
+        Unicode(20),
+        default="percentage",
         nullable=False,
+    )
+
+    discount_percent: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2),
+        nullable=True,
+    )
+
+    discount_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
     )
 
     start_date: Mapped[date] = mapped_column(

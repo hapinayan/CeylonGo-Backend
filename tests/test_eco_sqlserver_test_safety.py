@@ -45,13 +45,14 @@ def test_safety_02_empty_test_url():
 
 
 def test_safety_03_valid_allowlisted_databases():
-    """3. Valid allowlisted database names pass URL validation."""
+    """3. Only the approved integration database passes default URL validation."""
     urls = [
         "mssql+pyodbc://user:pass@localhost/CeylonGoDB_IntegrationTest?driver=ODBC+Driver+18+for+SQL+Server",
         "mssql+pyodbc://user:pass@localhost/CeylonGoDB_Disposable_QA?driver=ODBC+Driver+18+for+SQL+Server",
     ]
     assert validate_disposable_sqlserver_url(urls[0]) == "CeylonGoDB_IntegrationTest"
-    assert validate_disposable_sqlserver_url(urls[1]) == "CeylonGoDB_Disposable_QA"
+    with pytest.raises(DatabaseSafetyError, match="UNAPPROVED INTEGRATION DATABASE"):
+        validate_disposable_sqlserver_url(urls[1])
 
 
 def test_safety_04_case_insensitive_allowlist_matching():
@@ -59,8 +60,6 @@ def test_safety_04_case_insensitive_allowlist_matching():
     casing_variants = [
         ("mssql+pyodbc://u:p@host/ceylongodb_integrationtest?driver=ODBC", "ceylongodb_integrationtest"),
         ("mssql+pyodbc://u:p@host/CEYLONGODB_INTEGRATIONTEST?driver=ODBC", "CEYLONGODB_INTEGRATIONTEST"),
-        ("mssql+pyodbc://u:p@host/ceylongodb_disposable_qa?driver=ODBC", "ceylongodb_disposable_qa"),
-        ("mssql+pyodbc://u:p@host/CEYLONGODB_DISPOSABLE_QA?driver=ODBC", "CEYLONGODB_DISPOSABLE_QA"),
     ]
     for url, expected_extracted in casing_variants:
         res = validate_disposable_sqlserver_url(url)
@@ -130,9 +129,9 @@ def test_safety_10_odbc_connection_string_with_database_parameter():
     assert extracted == "CeylonGoDB_IntegrationTest"
 
     # Also test alternative DB= parameter
-    odbc_url_short = "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BSERVER%3Dlocalhost%3BDB%3DCeylonGoDB_Disposable_QA%3B"
+    odbc_url_short = "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC%3BSERVER%3Dlocalhost%3BDB%3DCeylonGoDB_IntegrationTest%3B"
     extracted_short = validate_disposable_sqlserver_url(odbc_url_short)
-    assert extracted_short == "CeylonGoDB_Disposable_QA"
+    assert extracted_short == "CeylonGoDB_IntegrationTest"
 
 
 def test_safety_11_odbc_conflicting_database_parameters():

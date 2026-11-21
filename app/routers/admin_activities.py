@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_admin
+from app.core.location_validation import ACTIVITY_REVIEW_STATE, write_review_snapshot
 from app.database.connection import get_db
 from app.models.activity import Activity
 from app.models.user import User
@@ -92,15 +93,14 @@ def approve_activity(
             detail="Only pending activities can be approved",
         )
 
-    activity.approval_status = "approved"
-    activity.is_active = True
-    activity.reviewed_by = admin.id
-    activity.reviewed_at = datetime.now(timezone.utc).replace(
-        tzinfo=None
-    )
-    activity.rejection_reason = None
-
     try:
+        write_review_snapshot(db, activity, ACTIVITY_REVIEW_STATE, {
+            "approval_status": "approved",
+            "is_active": True,
+            "reviewed_by": admin.id,
+            "reviewed_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            "rejection_reason": None,
+        })
         db.commit()
         db.refresh(activity)
     except Exception:

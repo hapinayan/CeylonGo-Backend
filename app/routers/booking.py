@@ -1,11 +1,14 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import CAPTURED, RESERVED_REFUNDS, lock_booking_resource
+from app.core.dependencies import require_traveler
+from app.core.publication import public_homestay
 from app.core.homestay_permissions import (
     check_homestay_ownership,
     require_homestay_manager,
@@ -15,12 +18,22 @@ from app.core.listing_sync import (
     record_cash_payment_transaction,
     sync_homestay_booking_reference,
 )
+from app.core.attribution import verify_attribution_token
 from app.core.notification_service import create_notification
-from app.core.promotion_pricing import calculate_booking_price
+from app.core.promotion_pricing import (
+    calculate_booking_price,
+    record_campaign_booking_conversion,
+)
 from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import Homestay, HomestayAvailabilityBlock
 from app.models.provider_profile import ProviderProfile
+from app.models.shared import (
+    BookingReference,
+    BookingStatusHistory,
+    PaymentRefund,
+    PaymentTransaction,
+)
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.booking import (
@@ -31,6 +44,7 @@ from app.schemas.booking import (
     BookingResponse,
     CashPaymentRecordRequest,
 )
+from app.services.booking_expiration import expire_single_booking
 
 router = APIRouter(
     prefix="/api/v1/bookings",
@@ -72,6 +86,10 @@ def _verify_booking_provider_ownership(
         )
 
     return homestay
+
+
+def _acquire_homestay_lock(db: Session, homestay_id: int):
+    lock_booking_resource(db, f"homestay_booking_{homestay_id}")
 
 
 # TRAVELER: Get personal booking history
@@ -181,6 +199,18 @@ def get_booking(
     if booking.user_id != current_user.id and current_user.role != "admin":
         _verify_booking_provider_ownership(db, booking, current_user)
 
+    # Lazy deadline enforcement: if payment deadline has elapsed, transition to expired
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    if (
+        booking.status == "awaiting_payment"
+        and booking.payment_status != "paid"
+        and booking.payment_expires_at is not None
+        and booking.payment_expires_at <= now_utc
+    ):
+        if expire_single_booking(db, booking, now_utc):
+            db.commit()
+            db.refresh(booking)
+
     return booking
 
 
@@ -193,7 +223,7 @@ def get_booking(
 def create_booking(
     booking_data: BookingCreate,
     db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(require_traveler)],
 ):
     if booking_data.check_in < date.today():
         raise HTTPException(
@@ -201,11 +231,13 @@ def create_booking(
             detail="Check-in date cannot be in the past",
         )
 
+    _acquire_homestay_lock(db, booking_data.homestay_id)
     homestay = (
         db.query(Homestay)
+        .with_hint(Homestay, "WITH (HOLDLOCK)", "mssql")
         .filter(
             Homestay.id == booking_data.homestay_id,
-            Homestay.is_active == True,
+            public_homestay(hold=True),
         )
         .first()
     )
@@ -230,35 +262,26 @@ def create_booking(
         price_per_night=homestay.price_per_night,
     )
 
-    # Acquire lock for concurrency check
-    lock_result = db.execute(
-        text("""
-            DECLARE @result INT;
-            EXEC @result = sp_getapplock
-                @Resource = :resource,
-                @LockMode = 'Exclusive',
-                @LockOwner = 'Transaction',
-                @LockTimeout = 10000;
-            SELECT @result;
-        """),
-        {"resource": f"homestay_booking_{booking_data.homestay_id}"},
-    ).scalar()
 
-    if lock_result is None or lock_result < 0:
-        db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="Booking service is busy. Please try again.",
-        )
-
-    # Check for overlapping confirmed bookings
+    # Check for active overlapping inventory reservations:
+    # Confirmed bookings, in-progress bookings, and unexpired awaiting_payment bookings.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     overlapping_booking = (
         db.query(Booking)
         .filter(
             Booking.homestay_id == booking_data.homestay_id,
-            Booking.status == "confirmed",
             Booking.check_in < booking_data.check_out,
             Booking.check_out > booking_data.check_in,
+            or_(
+                Booking.status.in_(["confirmed", "in_progress"]),
+                and_(
+                    Booking.status == "awaiting_payment",
+                    or_(
+                        Booking.payment_expires_at.is_(None),
+                        Booking.payment_expires_at > now_utc,
+                    ),
+                ),
+            ),
         )
         .first()
     )
@@ -287,7 +310,7 @@ def create_booking(
             detail="Homestay is unavailable during the requested dates (blackout block)",
         )
 
-    # In Phase 2, new booking requests start in 'pending' status
+    # In Phase 2 & 7, new booking requests start in 'pending' status
     new_booking = Booking(
         homestay_id=booking_data.homestay_id,
         user_id=current_user.id,
@@ -297,7 +320,7 @@ def create_booking(
         total_price=total_price,
         status="pending",
         currency="LKR",
-        payment_method="pay_at_location",
+        payment_method=booking_data.payment_method,
         payment_status="unpaid",
         nightly_rate_snapshot=homestay.price_per_night,
         cancellation_policy_snapshot=homestay.cancellation_policy,
@@ -313,13 +336,21 @@ def create_booking(
         db.flush()
         ref = sync_homestay_booking_reference(db, new_booking, homestay)
         if ref:
+            verified_cid = None
+            if booking_data.attribution_token:
+                verified_cid = verify_attribution_token(booking_data.attribution_token, homestay.id)
+
+            initial_notes = "Booking requested by traveler"
+            if verified_cid:
+                initial_notes += f" | campaign_id:{verified_cid}"
+
             record_booking_status_change(
                 db,
                 booking_reference_id=ref.id,
                 from_status=None,
                 to_status="pending",
                 changed_by=current_user.id,
-                notes="Booking requested by traveler",
+                notes=initial_notes,
             )
 
         # Notify property provider
@@ -343,6 +374,23 @@ def create_booking(
         raise
 
     return new_booking
+
+
+def extract_attributed_campaign_id(db: Session, booking_reference_id: int) -> int | None:
+    import re
+    history = (
+        db.query(BookingStatusHistory)
+        .filter(
+            BookingStatusHistory.booking_reference_id == booking_reference_id,
+            BookingStatusHistory.notes.like("%campaign_id:%"),
+        )
+        .first()
+    )
+    if history and history.notes:
+        m = re.search(r"campaign_id:(\d+)", history.notes)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 # PROVIDER: Accept a pending booking request
@@ -372,35 +420,27 @@ def accept_booking(
         )
 
     # Concurrency lock during acceptance
-    lock_result = db.execute(
-        text("""
-            DECLARE @result INT;
-            EXEC @result = sp_getapplock
-                @Resource = :resource,
-                @LockMode = 'Exclusive',
-                @LockOwner = 'Transaction',
-                @LockTimeout = 10000;
-            SELECT @result;
-        """),
-        {"resource": f"homestay_booking_{booking.homestay_id}"},
-    ).scalar()
+    _acquire_homestay_lock(db, booking.homestay_id)
 
-    if lock_result is None or lock_result < 0:
-        db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="Booking service is busy. Please try again.",
-        )
-
-    # Recheck overlapping confirmed bookings
+    # Recheck active overlapping inventory reservations (confirmed, in-progress, unexpired awaiting_payment)
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     overlapping_booking = (
         db.query(Booking)
         .filter(
             Booking.homestay_id == booking.homestay_id,
-            Booking.status == "confirmed",
             Booking.id != booking.id,
             Booking.check_in < booking.check_out,
             Booking.check_out > booking.check_in,
+            or_(
+                Booking.status.in_(["confirmed", "in_progress"]),
+                and_(
+                    Booking.status == "awaiting_payment",
+                    or_(
+                        Booking.payment_expires_at.is_(None),
+                        Booking.payment_expires_at > now_utc,
+                    ),
+                ),
+            ),
         )
         .first()
     )
@@ -408,7 +448,7 @@ def accept_booking(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Dates conflict with an already confirmed booking",
+            detail="Dates conflict with an already active booking reservation",
         )
 
     # Recheck active blackout blocks
@@ -430,7 +470,29 @@ def accept_booking(
         )
 
     old_status = booking.status
-    booking.status = "confirmed"
+    is_online = (booking.payment_method == "online")
+
+    booking.approved_at = now_utc
+    if is_online:
+        new_status = "awaiting_payment"
+        booking.payment_expires_at = now_utc + timedelta(minutes=30)
+        notif_title = "Booking Approved — Payment Required"
+        notif_message = (
+            f"Your booking request for {homestay.name} ({booking.check_in} to {booking.check_out}) "
+            f"has been accepted! Please complete online payment within 30 minutes to confirm your reservation."
+        )
+        status_notes = "Booking approved by provider - awaiting online payment within 30m window"
+    else:
+        new_status = "confirmed"
+        booking.payment_expires_at = None
+        notif_title = "Booking Confirmed!"
+        notif_message = (
+            f"Your booking for {homestay.name} ({booking.check_in} to {booking.check_out}) "
+            f"has been accepted. Cash payment will be collected at check-in."
+        )
+        status_notes = "Booking accepted by provider - pay at location confirmed"
+
+    booking.status = new_status
 
     try:
         ref = sync_homestay_booking_reference(db, booking, homestay)
@@ -439,16 +501,25 @@ def accept_booking(
                 db,
                 booking_reference_id=ref.id,
                 from_status=old_status,
-                to_status="confirmed",
+                to_status=new_status,
                 changed_by=current_user.id,
-                notes="Booking accepted by provider",
+                notes=status_notes,
             )
+            if new_status == "confirmed":
+                cid = extract_attributed_campaign_id(db, ref.id)
+                record_campaign_booking_conversion(
+                    db=db,
+                    homestay_id=homestay.id,
+                    user_id=booking.user_id,
+                    booking_reference_id=ref.id,
+                    campaign_id=cid,
+                )
 
         create_notification(
             db=db,
             user_id=booking.user_id,
-            title="Booking Confirmed!",
-            message=f"Your booking for {homestay.name} ({booking.check_in} to {booking.check_out}) has been accepted.",
+            title=notif_title,
+            message=notif_message,
             notification_type="booking_accepted",
             link_url=f"/bookings/{booking.id}",
         )
@@ -544,6 +615,18 @@ def complete_booking(
 
     homestay = _verify_booking_provider_ownership(db, booking, current_user)
 
+    # Concurrency lock
+    _acquire_homestay_lock(db, booking.homestay_id)
+    db.refresh(booking)
+
+    # Prevent premature completion before the stay ends
+    today = date.today()
+    if booking.check_out > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot mark booking as completed before the check-out date ({booking.check_out})",
+        )
+
     if booking.status not in ("confirmed", "in_progress"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -583,11 +666,11 @@ def complete_booking(
     return booking
 
 
-# TRAVELER: Cancel a booking
+# TRAVELER / PROVIDER: Cancel a booking
 @router.post(
     "/{booking_id}/cancel",
     response_model=BookingResponse,
-    summary="Traveler cancels an existing booking request or confirmation",
+    summary="Traveler or Provider cancels an existing booking request or confirmation",
 )
 def cancel_booking(
     booking_id: int,
@@ -602,13 +685,49 @@ def cancel_booking(
             detail="Booking not found",
         )
 
-    if booking.user_id != current_user.id and current_user.role != "admin":
+    # Idempotent / Duplicate cancellation prevention
+    if booking.status == "cancelled":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only cancel your own bookings",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Booking is already cancelled",
         )
 
-    if booking.status not in ("pending", "confirmed"):
+    # Validate permitted status transitions
+    if booking.status not in ("pending", "awaiting_payment", "confirmed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel booking with status '{booking.status}'",
+        )
+
+    # Authorization: traveler who booked, homestay manager/owner, or admin
+    is_authorized = False
+    if current_user.role == "admin" or booking.user_id == current_user.id:
+        is_authorized = True
+    else:
+        try:
+            require_homestay_manager(current_user, db)
+            _verify_booking_provider_ownership(db, booking, current_user)
+            is_authorized = True
+        except HTTPException:
+            is_authorized = False
+
+    if not is_authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to cancel this booking",
+        )
+
+    # Concurrency lock during cancellation
+    _acquire_homestay_lock(db, booking.homestay_id)
+    db.refresh(booking)
+
+    if booking.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Booking is already cancelled",
+        )
+
+    if booking.status not in ("pending", "awaiting_payment", "confirmed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel booking with status '{booking.status}'",
@@ -616,6 +735,66 @@ def cancel_booking(
 
     homestay = db.query(Homestay).filter(Homestay.id == booking.homestay_id).first()
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # For paid bookings, handle refund request according to stored cancellation snapshot
+    if booking.payment_status == "paid":
+        check_in_dt = datetime.combine(booking.check_in, time.min)
+        hours_before_checkin = (check_in_dt - now_utc).total_seconds() / 3600.0
+        free_hours = booking.free_cancellation_hours_snapshot if booking.free_cancellation_hours_snapshot is not None else 24
+
+        tx = (
+            db.query(PaymentTransaction)
+            .join(
+                BookingReference,
+                PaymentTransaction.booking_reference_id == BookingReference.id,
+            )
+            .filter(
+                BookingReference.module_type == "homestay",
+                BookingReference.target_booking_id == booking.id,
+                BookingReference.user_id == booking.user_id,
+                PaymentTransaction.user_id == booking.user_id,
+                PaymentTransaction.currency == booking.currency,
+                PaymentTransaction.payment_status.in_(CAPTURED),
+                PaymentTransaction.payment_method == "online",
+            )
+            .order_by(PaymentTransaction.id.desc())
+            .first()
+        )
+
+        if tx:
+            existing_refund = (
+                db.query(PaymentRefund)
+                .filter(
+                    PaymentRefund.payment_transaction_id == tx.id,
+                    PaymentRefund.refund_status.in_(RESERVED_REFUNDS),
+                )
+                .first()
+            )
+            if not existing_refund:
+                if hours_before_checkin >= free_hours:
+                    reason = (
+                        f"Cancelled within free cancellation window "
+                        f"({hours_before_checkin:.1f}h before check-in >= {free_hours}h required). "
+                        f"Full refund requested."
+                    )
+                else:
+                    reason = (
+                        f"Cancelled outside free cancellation window "
+                        f"({hours_before_checkin:.1f}h before check-in < {free_hours}h required). "
+                        f"Policy snapshot: '{booking.cancellation_policy_snapshot}'. Pending admin review."
+                    )
+                if payload.cancellation_reason:
+                    reason += f" Reason: {payload.cancellation_reason}"
+
+                refund = PaymentRefund(
+                    payment_transaction_id=tx.id,
+                    amount=tx.amount,
+                    currency=tx.currency,
+                    refund_reason=reason,
+                    refund_status="pending",
+                )
+                db.add(refund)
+                booking.payment_status = "refund_pending"
 
     old_status = booking.status
     booking.status = "cancelled"
@@ -633,20 +812,32 @@ def cancel_booking(
                     from_status=old_status,
                     to_status="cancelled",
                     changed_by=current_user.id,
-                    notes=payload.cancellation_reason or "Cancelled by traveler",
+                    notes=payload.cancellation_reason or f"Cancelled by user #{current_user.id}",
                 )
 
-        provider_user_id = homestay.owner_id if homestay else None
-        if not provider_user_id and homestay and homestay.provider_profile:
-            provider_user_id = homestay.provider_profile.user_id
-        if provider_user_id:
+        # Notify other party
+        actor_is_traveler = (current_user.id == booking.user_id)
+        if actor_is_traveler:
+            provider_user_id = homestay.owner_id if homestay else None
+            if not provider_user_id and homestay and homestay.provider_profile:
+                provider_user_id = homestay.provider_profile.user_id
+            if provider_user_id:
+                create_notification(
+                    db=db,
+                    user_id=provider_user_id,
+                    title=f"Booking Cancelled: {homestay.name if homestay else ''}",
+                    message=f"Booking #{booking.id} ({booking.check_in} to {booking.check_out}) was cancelled by the traveler.",
+                    notification_type="booking_cancelled",
+                    link_url=f"/provider/bookings/{booking.id}",
+                )
+        else:
             create_notification(
                 db=db,
-                user_id=provider_user_id,
+                user_id=booking.user_id,
                 title=f"Booking Cancelled: {homestay.name if homestay else ''}",
-                message=f"Booking #{booking.id} ({booking.check_in} to {booking.check_out}) was cancelled by the traveler.",
+                message=f"Your booking #{booking.id} ({booking.check_in} to {booking.check_out}) was cancelled.",
                 notification_type="booking_cancelled",
-                link_url=f"/provider/bookings/{booking.id}",
+                link_url=f"/bookings/{booking.id}",
             )
 
         db.commit()
@@ -677,55 +868,42 @@ def record_cash_payment(
             detail="Booking not found",
         )
 
+    _acquire_homestay_lock(db, booking.homestay_id)
+    db.refresh(booking)
     homestay = _verify_booking_provider_ownership(db, booking, current_user)
 
     if booking.status not in ("confirmed", "in_progress", "completed"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot record payment for booking with status '{booking.status}'",
-        )
-
-    if booking.payment_status == "paid":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cash payment has already been recorded as paid for this booking",
-        )
-
-    outstanding_amount = booking.total_price - (booking.cash_received_amount or Decimal("0.00"))
-    if outstanding_amount <= Decimal("0.00"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This booking has no outstanding balance to pay",
-        )
-
-    payment_amount = payload.amount if payload.amount is not None else outstanding_amount
-    if payment_amount <= Decimal("0.00"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment amount must be greater than zero",
-        )
-
-    if payment_amount != outstanding_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cash payment amount ({payment_amount} LKR) does not match the actual outstanding booking amount ({outstanding_amount} LKR)",
-        )
-
-    booking.cash_received_amount = (booking.cash_received_amount or Decimal("0.00")) + payment_amount
-    booking.payment_status = "paid"
-    booking.payment_method = "pay_at_location"
+        raise HTTPException(400, "Booking is not eligible for cash confirmation")
+    if booking.payment_method != "pay_at_location":
+        raise HTTPException(400, "This booking is configured for online payment")
+    if booking.payment_status not in ("unpaid", "pending"):
+        raise HTTPException(409, "Payment has already been recorded or is under review")
 
     try:
         ref = sync_homestay_booking_reference(db, booking, homestay)
-        if ref:
-            record_cash_payment_transaction(
-                db,
-                booking_reference=ref,
-                user_id=booking.user_id,
-                amount=payment_amount,
-                notes=payload.notes or "Cash received at property",
-            )
+        if ref is None:
+            raise HTTPException(409, "Booking has no financial reference")
+        recorded = db.query(func.coalesce(func.sum(PaymentTransaction.amount), 0)).filter(
+            PaymentTransaction.booking_reference_id == ref.id,
+            PaymentTransaction.user_id == booking.user_id,
+            PaymentTransaction.currency == ref.currency,
+            PaymentTransaction.payment_method == "cash",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+        ).scalar()
+        outstanding_amount = booking.total_price - recorded
+        payment_amount = payload.amount if payload.amount is not None else outstanding_amount
+        if outstanding_amount <= 0 or payment_amount != outstanding_amount:
+            raise HTTPException(400, "Cash payment must match the positive outstanding balance")
 
+        booking.payment_status = ref.payment_status = "paid"
+        record_cash_payment_transaction(
+            db, booking_reference=ref, user_id=booking.user_id,
+            amount=payment_amount, notes=payload.notes,
+        )
+        record_booking_status_change(
+            db, ref.id, booking.status, booking.status, current_user.id,
+            notes="Cash payment confirmed at property",
+        )
         create_notification(
             db=db,
             user_id=booking.user_id,

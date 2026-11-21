@@ -405,6 +405,7 @@ class DatabaseConfig:
     trust_server_certificate: str = "yes"
     connection_timeout: int = 60
     expected_server: str | None = None
+    integration_opt_in: str | None = None
 
     @classmethod
     def from_env(cls, env_path: Path | str | None = None, database_override: str | None = None) -> DatabaseConfig:
@@ -968,14 +969,43 @@ def cmd_upgrade(
         print("Pass '--yes' to confirm applying pending migrations to the database.")
         return 1
 
+    isolated = config.integration_opt_in is not None or (
+        config.database.strip().casefold() == "ceylongodb_integrationtest"
+    )
+    if isolated:
+        from app.core.database_guard import (
+            ARTISAN_INTEGRATION_ALIAS,
+            DatabaseSafetyError,
+            normalize_server_name,
+            verify_connected_server_identity,
+            verify_safe_integration_target,
+        )
+
+        verify_safe_integration_target(
+            config.server, config.database, config.integration_opt_in
+        )
+        if (
+            normalize_server_name(config.server) != ARTISAN_INTEGRATION_ALIAS.lower()
+            or config.user or config.password or target_version not in {"037", "038"}
+        ):
+            raise DatabaseSafetyError(
+                "Artisan rehearsal requires the approved Windows-authenticated target "
+                "and a migration ceiling of 037 or 038."
+            )
+
     migrations = discover_migrations(migrations_dir)
     conn = get_connection(config)
     try:
         current_db = verify_target_database(conn, config.database)
+        if isolated:
+            verify_connected_server_identity(conn, server_alias=config.server)
 
         with migration_lock(conn):
-            ensure_schema_migrations_table(conn)
+            if not isolated:
+                ensure_schema_migrations_table(conn)
             applied = get_applied_migrations(conn)
+            if isolated and not {f"{version:03d}" for version in range(1, 37)} <= applied.keys():
+                raise MigrationError("Artisan rehearsal requires a verified ledger through 036.")
 
             # 1. Verify unknown migrations in DB history and verify checksums
             discovered_map = {m.version: m for m in migrations}

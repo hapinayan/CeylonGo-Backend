@@ -5,13 +5,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_artisan
 from app.core.dependencies import (
     require_admin,
     require_approved_provider,
 )
+from app.core.location_validation import (
+    ARTISAN_LOCATION_FIELDS,
+    ARTISAN_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
+)
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
 from app.models.provider_profile import ProviderProfile
+from app.models.shared import ListingReference, Review
 from app.models.user import User
 from app.schemas.artisan_listing import (
     VALID_CRAFT_CATEGORIES,
@@ -21,7 +29,9 @@ from app.schemas.artisan_listing import (
     ArtisanListingStatusUpdate,
     ArtisanListingSummary,
     ArtisanListingUpdate,
+    ArtisanNearbyListingPagination,
 )
+from app.services.artisan_shared_reference import sync_artisan_listing_reference
 
 router = APIRouter(prefix="/api/v1/artisan-listings", tags=["Artisan Listings"])
 
@@ -38,9 +48,9 @@ def list_artisan_listings(
 ):
     """
     Public discovery endpoint.
-    Retrieves active artisan listings with search, category, district, and featured filters.
+    Retrieves active and approved artisan listings under approved providers with search, category, district, and featured filters.
     """
-    query = db.query(ArtisanListing).filter(ArtisanListing.is_active == True)
+    query = db.query(ArtisanListing).filter(public_artisan())
 
     if search and search.strip():
         search_pattern = f"%{search.strip().lower()}%"
@@ -87,7 +97,7 @@ def get_craft_categories(db: Annotated[Session, Depends(get_db)]):
     """
     db_categories = (
         db.query(ArtisanListing.craft_category)
-        .filter(ArtisanListing.is_active == True)
+        .filter(public_artisan())
         .distinct()
         .all()
     )
@@ -99,11 +109,11 @@ def get_craft_categories(db: Annotated[Session, Depends(get_db)]):
 @router.get("/districts", response_model=list[str], summary="Get list of districts with active artisan listings")
 def get_active_districts(db: Annotated[Session, Depends(get_db)]):
     """
-    Returns unique districts that currently have active artisan listings.
+    Returns unique districts that currently have active, approved artisan listings.
     """
     results = (
         db.query(ArtisanListing.district)
-        .filter(ArtisanListing.is_active == True)
+        .filter(public_artisan())
         .distinct()
         .order_by(ArtisanListing.district)
         .all()
@@ -129,17 +139,167 @@ def get_my_artisan_listings(
     return [ArtisanListingResponse.model_validate(item) for item in listings]
 
 
+@router.get("/featured", response_model=ArtisanListingPagination, summary="Discover featured and sponsored artisan businesses")
+def list_featured_artisan_listings(
+    db: Annotated[Session, Depends(get_db)],
+    search: str | None = Query(default=None, max_length=100, description="Search in title, description, or city"),
+    district: str | None = Query(default=None, max_length=100, description="Filter by district"),
+    category: str | None = Query(default=None, max_length=50, description="Filter by craft category"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=12, ge=1, le=100, description="Items per page"),
+):
+    """
+    Public discovery endpoint for actively promoted and featured artisan businesses.
+    Only returns active, approved businesses marked as featured.
+    """
+    return list_artisan_listings(
+        db=db,
+        search=search,
+        district=district,
+        category=category,
+        is_featured=True,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/sponsored-promotions-status", summary="Artisan sponsored promotions and advertising capability status")
+def get_sponsored_promotions_status():
+    """
+    Returns current system capabilities and documents architectural blockers for paid promotions.
+    """
+    return {
+        "featured_listings_supported": True,
+        "discount_promotions_supported": True,
+        "sponsored_discovery_sorting_supported": True,
+        "paid_sponsorship_supported": False,
+        "click_analytics_supported": False,
+        "blocked_reason": (
+            "Paid sponsorship and click analytics require new database tables, "
+            "payment gateway package verification, and pricing policy approval "
+            "from the Database Coordinator and Product Owner."
+        ),
+    }
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculates the great-circle distance between two geographic coordinates in kilometers
+    using the Haversine trigonometric formula.
+    """
+    R = 6371.0  # Earth radius in kilometers
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return round(R * c, 2)
+
+
+@router.get(
+    "/nearby",
+    response_model=ArtisanNearbyListingPagination,
+    summary="Discover approved artisan listings near a given latitude/longitude",
+)
+def list_nearby_artisan_listings(
+    db: Annotated[Session, Depends(get_db)],
+    latitude: float = Query(..., ge=-90.0, le=90.0, description="Search origin latitude (-90 to 90)"),
+    longitude: float = Query(..., ge=-180.0, le=180.0, description="Search origin longitude (-180 to 180)"),
+    radius_km: float = Query(default=50.0, gt=0.0, le=500.0, description="Search radius in kilometers (1 to 500 km)"),
+    category: str | None = Query(default=None, max_length=50, description="Optional craft category"),
+    search: str | None = Query(default=None, max_length=100, description="Optional text search"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=12, ge=1, le=100, description="Items per page"),
+):
+    """
+    Public discovery endpoint with consent-driven location discovery (Phase P2 Step 16).
+    Requires valid coordinate bounds, evaluates distance via Haversine calculation,
+    filters listings within radius_km, and sorts ascending by distance.
+    Only returns approved businesses under approved providers.
+    """
+    query = (
+        db.query(ArtisanListing)
+        .filter(
+            public_artisan(),
+            ArtisanListing.latitude.isnot(None),
+            ArtisanListing.longitude.isnot(None),
+        )
+    )
+
+    if category and isinstance(category, str) and category.strip():
+        query = query.filter(func.lower(ArtisanListing.craft_category) == func.lower(category.strip()))
+
+    if search and isinstance(search, str) and search.strip():
+        term = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                ArtisanListing.title.ilike(term),
+                ArtisanListing.description.ilike(term),
+                ArtisanListing.city.ilike(term),
+                ArtisanListing.district.ilike(term),
+            )
+        )
+
+    all_candidates = query.all()
+
+    # Filter and sort by Haversine distance
+    nearby_items: list[tuple[ArtisanListing, float]] = []
+    for listing in all_candidates:
+        try:
+            l_lat = float(listing.latitude)
+            l_lon = float(listing.longitude)
+        except (TypeError, ValueError):
+            continue
+
+        dist = haversine_km(latitude, longitude, l_lat, l_lon)
+        if dist <= radius_km:
+            nearby_items.append((listing, dist))
+
+    # Sort ascending by distance
+    nearby_items.sort(key=lambda x: x[1])
+
+    p = page if isinstance(page, int) else 1
+    ps = page_size if isinstance(page_size, int) else 12
+
+    total = len(nearby_items)
+    total_pages = math.ceil(total / ps) if total > 0 else 0
+
+    start_idx = (p - 1) * ps
+    page_slice = nearby_items[start_idx : start_idx + ps]
+
+    summaries = []
+    for listing, dist in page_slice:
+        summary = ArtisanListingSummary.model_validate(listing)
+        summary.distance_km = dist
+        summaries.append(summary)
+
+    return ArtisanNearbyListingPagination(
+        items=summaries,
+        total=total,
+        page=p,
+        page_size=ps,
+        total_pages=total_pages,
+        origin_latitude=latitude,
+        origin_longitude=longitude,
+        radius_km=radius_km,
+    )
+
+
 @router.get("/{id}", response_model=ArtisanListingResponse, summary="Get public details of an artisan listing")
 def get_artisan_listing(
     id: int,
     db: Annotated[Session, Depends(get_db)],
 ):
     """
-    Public endpoint: Returns full details of an active artisan listing.
+    Public endpoint: Returns full details of an active, approved artisan listing.
     """
     listing = (
         db.query(ArtisanListing)
-        .filter(ArtisanListing.id == id, ArtisanListing.is_active == True)
+        .filter(ArtisanListing.id == id, public_artisan())
         .first()
     )
     if not listing:
@@ -147,7 +307,38 @@ def get_artisan_listing(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Artisan listing not found",
         )
-    return ArtisanListingResponse.model_validate(listing)
+
+    # Calculate review metrics from shared Review infrastructure
+    listing_ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "artisan",
+            ListingReference.target_id == listing.id,
+        )
+        .first()
+    )
+    avg_rating = None
+    review_count = 0
+    if listing_ref:
+        rev_stats = (
+            db.query(
+                func.count(Review.id).label("total"),
+                func.avg(Review.rating).label("avg_rating"),
+            )
+            .filter(
+                Review.listing_reference_id == listing_ref.id,
+                Review.is_published == True,
+            )
+            .first()
+        )
+        if rev_stats and rev_stats.total and rev_stats.total > 0:
+            review_count = rev_stats.total
+            avg_rating = round(float(rev_stats.avg_rating), 2)
+
+    resp = ArtisanListingResponse.model_validate(listing)
+    resp.average_rating = avg_rating
+    resp.total_reviews = review_count
+    return resp
 
 
 @router.post("", response_model=ArtisanListingResponse, status_code=status.HTTP_201_CREATED, summary="Create a new artisan listing")
@@ -165,6 +356,7 @@ def create_artisan_listing(
             detail="Access forbidden: only artisan service providers can create artisan listings",
         )
 
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     new_listing = ArtisanListing(
         provider_profile_id=provider_profile.id,
         title=payload.title,
@@ -183,9 +375,13 @@ def create_artisan_listing(
         is_active=True,
         is_verified=False,
         is_featured=False,
+        approval_status="pending",
+        verification_status="unverified",
     )
 
     db.add(new_listing)
+    db.flush()
+    sync_artisan_listing_reference(db, new_listing)
     db.commit()
     db.refresh(new_listing)
     return ArtisanListingResponse.model_validate(new_listing)
@@ -216,9 +412,34 @@ def update_artisan_listing(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    # Providers cannot self-modify moderation or promotion/featured fields
+    for field in (
+        "approval_status",
+        "is_verified",
+        "verification_status",
+        "reviewed_by",
+        "reviewed_at",
+        "rejection_reason",
+        "is_featured",
+    ):
+        update_data.pop(field, None)
 
+    if {"latitude", "longitude"} & update_data.keys():
+        validate_coordinate_pair(
+            update_data.get("latitude", listing.latitude),
+            update_data.get("longitude", listing.longitude),
+        )
+    if any(
+        field in update_data and update_data[field] != getattr(listing, field)
+        for field in ARTISAN_LOCATION_FIELDS
+    ):
+        update_data["is_verified"] = False
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
+
+    sync_artisan_listing_reference(db, listing)
     db.commit()
     db.refresh(listing)
     return ArtisanListingResponse.model_validate(listing)
@@ -247,6 +468,7 @@ def delete_artisan_listing(
         )
 
     listing.is_active = False
+    sync_artisan_listing_reference(db, listing)
     db.commit()
 
     return {
@@ -274,9 +496,33 @@ def update_listing_status(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    if "approval_status" in update_data:
+        update_data["reviewed_by"] = admin_user.id
+        update_data["reviewed_at"] = func.sysutcdatetime()
+        if update_data["approval_status"] == "approved":
+            update_data["rejection_reason"] = None
+            update_data.setdefault("is_active", True)
+        elif update_data["approval_status"] in ("rejected", "suspended"):
+            update_data["is_active"] = False
+            if update_data.get("is_featured") is not True:
+                update_data["is_featured"] = False
 
+    if update_data.get("is_featured") is True:
+        target_approval = update_data.get("approval_status", listing.approval_status)
+        target_active = update_data.get("is_active", listing.is_active)
+        if target_approval != "approved" or not target_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot feature an artisan business that is not approved and active",
+            )
+
+    if {"is_verified", "approval_status", "is_featured"} & update_data.keys():
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
+
+    sync_artisan_listing_reference(db, listing)
     db.commit()
     db.refresh(listing)
     return ArtisanListingResponse.model_validate(listing)

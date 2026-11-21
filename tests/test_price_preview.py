@@ -12,6 +12,7 @@ from app.main import app
 from app.models.homestay import Homestay
 from app.models.promotion import HomestayPromotion
 from app.models.user import Base, User
+from app.models.provider_profile import ProviderProfile
 
 
 def test_price_preview_applies_best_promotion():
@@ -35,6 +36,7 @@ def test_price_preview_applies_best_promotion():
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
             HomestayPromotion.__table__,
         ],
@@ -105,6 +107,7 @@ def test_price_preview_applies_best_promotion():
             assert Decimal(str(data["original_price"])) == Decimal("15000.00")
             assert Decimal(str(data["discount_amount"])) == Decimal("3750.00")
             assert Decimal(str(data["final_price"])) == Decimal("11250.00")
+            assert data["discount_fixed_amount"] is None
 
         finally:
             app.dependency_overrides.pop(get_db, None)
@@ -185,6 +188,7 @@ def test_price_preview_without_promotion_and_inactive_homestay(
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
             HomestayPromotion.__table__,
         ],
@@ -237,6 +241,7 @@ def test_price_preview_without_promotion_and_inactive_homestay(
                 assert Decimal(
                     str(data["discount_amount"])
                 ) == Decimal("0.00")
+                assert data["discount_fixed_amount"] is None
 
                 assert Decimal(
                     str(data["final_price"])

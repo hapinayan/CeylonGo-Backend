@@ -11,6 +11,7 @@ from app.core.dependencies import (
     require_approved_provider,
     require_password_setup_authorization,
 )
+from app.core.provider_onboarding import lock_onboarding, require_live_authorization
 from app.core.rate_limiter import (
     provider_login_limiter,
     provider_password_setup_limiter,
@@ -70,24 +71,11 @@ def setup_provider_password(
     """
     auth_record, user, profile = auth_context
 
-    # Concurrency check & row locking
-    try:
-        locked_auth = (
-            db.query(ProviderRegistrationAuthorization)
-            .filter(ProviderRegistrationAuthorization.id == auth_record.id)
-            .with_for_update()
-            .first()
-        )
-    except SQLAlchemyError:
-        locked_auth = auth_record
+    lock_onboarding(db, auth_record.email)
+    require_live_authorization(db, auth_record)
+    db.refresh(profile)
+    db.refresh(user)
 
-    if not locked_auth or locked_auth.is_consumed:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Password setup authorization token has already been used.",
-        )
-
-    # Re-verify live approval status and password state
     if profile.approval_status != "approved":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -103,15 +91,20 @@ def setup_provider_password(
     now = datetime.now(UTC)
 
     try:
-        # 1. Store secure password hash
-        user.password_hash = hash_password(payload.password)
-
-        # 2. Activate user account
-        user.is_active = True
-
-        # 3. Mark current authorization token as consumed
-        locked_auth.is_consumed = True
-        locked_auth.consumed_at = now
+        require_live_authorization(db, auth_record, consume=True)
+        updated = db.query(User).filter(
+            User.id == user.id, User.role == "provider", User.password_hash.is_(None),
+            User.is_active == False,
+            db.query(ProviderProfile.id).filter(
+                ProviderProfile.id == profile.id, ProviderProfile.user_id == user.id,
+                ProviderProfile.approval_status == "approved",
+            ).exists(),
+        ).update({
+            "password_hash": hash_password(payload.password), "is_active": True,
+        }, synchronize_session=False)
+        if updated != 1:
+            db.rollback()
+            raise HTTPException(409, detail="Provider approval or activation state changed.")
 
         # 4. Revoke any other unused password-setup authorization tokens for this provider
         db.query(ProviderRegistrationAuthorization).filter(
@@ -125,7 +118,7 @@ def setup_provider_password(
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
-        logger.exception("Database error occurred during provider password setup.")
+        logger.warning("Database error occurred during provider password setup.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to complete password setup. Please try again.",
@@ -217,14 +210,17 @@ def provider_login(
             detail="Provider account is inactive. Please contact support.",
         )
 
-    if not verify_password(payload.password, user.password_hash):
+    password_hash, credential_version = user.password_hash, user.credential_version
+    if not verify_password(payload.password, password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
 
     # Issue signed JWT access token
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=credential_version
+    )
 
     return ProviderLoginResponse(
         access_token=token,

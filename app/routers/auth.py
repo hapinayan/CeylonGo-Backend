@@ -5,7 +5,7 @@ from typing import Annotated
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import func
+from sqlalchemy import false, func, select, true
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from app.core.security import (
     create_access_token,
     decode_access_token,
     generate_password_reset_token,
+    get_access_token_credential_version,
     hash_password,
     hash_reset_token,
     verify_password,
@@ -39,6 +40,7 @@ from app.schemas.auth import (
     UserResponse,
     VerifyResetTokenResponse,
 )
+from app.schemas.provider_auth import validate_provider_password_strength
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
@@ -48,6 +50,7 @@ security_scheme = HTTPBearer(
     description="JWT Bearer token. Enter your token in format: <token>",
     auto_error=True,
 )
+optional_security_scheme = HTTPBearer(scheme_name="OptionalProviderPreviewBearer", auto_error=False)
 
 
 def get_current_user(
@@ -57,6 +60,7 @@ def get_current_user(
     token = credentials.credentials
     try:
         payload = decode_access_token(token)
+        credential_version = get_access_token_credential_version(payload)
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -95,6 +99,13 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if user.credential_version != credential_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -102,6 +113,15 @@ def get_current_user(
         )
 
     return user
+
+
+def get_optional_current_user(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(optional_security_scheme)
+    ],
+    db: Annotated[Session, Depends(get_db)],
+) -> User | None:
+    return get_current_user(credentials, db) if credentials is not None else None
 
 
 def rate_limit_check_email(request: Request) -> None:
@@ -240,7 +260,10 @@ def login(
             )
 
     # Verify user exists and password matches
-    if not user or not verify_password(request.password, user.password_hash):
+    password_hash, credential_version = (
+        (user.password_hash, user.credential_version) if user else (None, 0)
+    )
+    if not user or not verify_password(request.password, password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -254,7 +277,9 @@ def login(
         )
 
     # Generate signed JWT token with sub claim for user id
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=credential_version
+    )
 
     return TokenResponse(
         access_token=token,
@@ -370,7 +395,9 @@ def google_auth(
                 user = new_user
 
     # Generate signed JWT token
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=user.credential_version
+    )
 
     return TokenResponse(
         access_token=token,
@@ -456,7 +483,7 @@ def forgot_password(
                 )
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error occurred during password reset request.")
+        logger.error("Database error occurred during password reset request.")
 
     return ForgotPasswordResponse(
         message="If an account with that email exists, a password reset link has been sent."
@@ -498,7 +525,7 @@ def verify_reset_token(
     if record_expires.tzinfo is not None:
         record_expires = record_expires.replace(tzinfo=None)
 
-    if now_utc > record_expires:
+    if now_utc >= record_expires:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This password reset token has expired.",
@@ -539,55 +566,95 @@ def reset_password(
     """
     Atomically update user password using Argon2 and consume the single-use reset token.
     """
-    token_hash = hash_reset_token(request.token)
-    reset_record = (
-        db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
-    )
-
-    if not reset_record:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired password reset token.",
+    try:
+        token_hash = hash_reset_token(request.token)
+        reset_record = (
+            db.query(PasswordReset).filter(PasswordReset.token_hash == token_hash).first()
         )
 
-    if reset_record.is_used:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has already been used.",
-        )
-
-    now_utc = datetime.now(UTC).replace(tzinfo=None)
-    record_expires = reset_record.expires_at
-    if record_expires.tzinfo is not None:
-        record_expires = record_expires.replace(tzinfo=None)
-
-    if now_utc > record_expires:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has expired.",
-        )
-
-    user = db.query(User).filter(User.id == reset_record.user_id).first()
-    if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired password reset token.",
-        )
-
-    if user.role == "provider":
-        profile = db.query(ProviderProfile).filter_by(user_id=user.id).first()
-        if not profile or profile.approval_status != "approved" or user.password_hash is None:
+        if not reset_record:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Password reset is not available for this provider account.",
+                detail="Invalid or expired password reset token.",
             )
 
-    hashed_password = hash_password(request.new_password)
+        if reset_record.is_used:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This password reset token has already been used.",
+            )
 
-    try:
-        user.password_hash = hashed_password
-        reset_record.is_used = True
-        reset_record.used_at = now_utc
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+        record_expires = reset_record.expires_at
+        if record_expires.tzinfo is not None:
+            record_expires = record_expires.replace(tzinfo=None)
+
+        if now_utc >= record_expires:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This password reset token has expired.",
+            )
+
+        user = db.query(User).filter(User.id == reset_record.user_id).first()
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired password reset token.",
+            )
+
+        if user.role == "provider":
+            profile = db.query(ProviderProfile).filter_by(user_id=user.id).first()
+            if not profile or profile.approval_status != "approved" or user.password_hash is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Password reset is not available for this provider account.",
+                )
+
+            try:
+                validate_provider_password_strength(request.new_password)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=[{
+                        "type": "value_error",
+                        "loc": ["body", "new_password"],
+                        "msg": str(exc),
+                    }],
+                ) from exc
+
+        hashed_password = hash_password(request.new_password)
+
+        redeemed_at = datetime.now(UTC).replace(tzinfo=None)
+        claimed = db.query(PasswordReset).filter(
+            PasswordReset.id == reset_record.id,
+            PasswordReset.is_used == false(),
+            PasswordReset.expires_at > redeemed_at,
+        ).update(
+            {"is_used": True, "used_at": redeemed_at}, synchronize_session=False
+        )
+        if claimed != 1:
+            raise HTTPException(400, detail="Invalid or expired password reset token.")
+
+        eligible_user = db.query(User).filter(
+            User.id == user.id, User.is_active == true(), User.role == user.role
+        )
+        if user.role == "provider":
+            approved_profile = select(ProviderProfile.id).where(
+                ProviderProfile.user_id == User.id,
+                ProviderProfile.approval_status == "approved",
+            ).exists()
+            eligible_user = eligible_user.filter(
+                User.password_hash.is_not(None), approved_profile
+            )
+        updated = eligible_user.update(
+            {
+                "password_hash": hashed_password,
+                "credential_version": User.credential_version + 1,
+            },
+            synchronize_session=False,
+        )
+        if updated != 1:
+            raise HTTPException(400, detail="Invalid or expired password reset token.")
 
         db.query(PasswordReset).filter(
             PasswordReset.user_id == user.id,
@@ -595,9 +662,14 @@ def reset_password(
         ).update({"is_used": True}, synchronize_session=False)
 
         db.commit()
+        db.expire(user)
+        db.expire(reset_record)
+    except HTTPException:
+        db.rollback()
+        raise
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error occurred during password reset execution.")
+        logger.error("Database error occurred during password reset execution.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while resetting the password. Please try again later.",

@@ -10,8 +10,14 @@ from pydantic import ValidationError
 
 from app.core.database_guard import (
     verify_safe_integration_database,
+    verify_safe_integration_server,
+    verify_safe_integration_target,
+    verify_connected_server_identity,
     DatabaseSafetyError,
     APPROVED_INTEGRATION_DATABASES,
+    APPROVED_INTEGRATION_SERVERS,
+    PROTECTED_DATABASES,
+    DISALLOWED_INTEGRATION_SERVERS,
 )
 from app.main import app
 from app.schemas.homestay import HomestayCreateRequest, HomestayUpdateRequest, HomestayImageInput
@@ -62,6 +68,208 @@ def test_guard_custom_allowlist_preserves_live_db_rejection():
 
     # Valid custom allowlist works for other explicit databases
     assert verify_safe_integration_database("Isolated_Rehearsal", approved_databases={"Isolated_Rehearsal"}) is True
+
+
+def test_guard_rejects_empty_or_whitespace_server_names():
+    for empty_val in [None, "", "   ", "\t\n"]:
+        with pytest.raises(DatabaseSafetyError) as exc_info:
+            verify_safe_integration_server(empty_val)
+        assert "target server instance is unspecified or empty" in str(exc_info.value).lower()
+
+
+def test_guard_rejects_disallowed_and_unapproved_servers():
+    disallowed = [
+        r".\SQLEXPRESS",
+        r"DESKTOP-JL1BGSI\SQLEXPRESS",
+        r"localhost\SQLEXPRESS",
+        r"127.0.0.1\SQLEXPRESS",
+        r"localhost",
+        r"127.0.0.1",
+        r".",
+        r"PROD_SQL_SERVER",
+        r"staging.database.windows.net",
+    ]
+    for srv in disallowed:
+        with pytest.raises(DatabaseSafetyError) as exc_info:
+            verify_safe_integration_server(srv)
+        assert any(k in str(exc_info.value).lower() for k in ["disallowed integration server", "unapproved integration server"])
+
+
+def test_guard_permits_approved_integration_servers():
+    approved = [
+        r"DESKTOP-JL1BGSI\SQLEXPRESS01",
+        r"desktop-jl1bgsi\sqlexpress01",
+        r"  DESKTOP-JL1BGSI\SQLEXPRESS01  ",
+        r".\SQLEXPRESS01",
+        r".\sqlexpress01",
+        r"./sqlexpress01",
+        r"localhost\SQLEXPRESS01",
+        r"localhost/sqlexpress01",
+        r"127.0.0.1\SQLEXPRESS01",
+    ]
+    for srv in approved:
+        assert verify_safe_integration_server(srv) is True
+
+
+def test_guard_rejects_protected_databases_including_logintest_and_system():
+    for protected in ["CeylonGoDB", "CeylonGoDB_LoginTest", "ceylongodb_logintest", "master", "tempdb", "model", "msdb"]:
+        with pytest.raises(DatabaseSafetyError) as exc_info:
+            verify_safe_integration_database(protected)
+        assert any(k in str(exc_info.value).lower() for k in ["live database safety violation", "protected database safety violation", "unapproved integration database"])
+
+
+def test_guard_verify_safe_integration_target_with_opt_in():
+    # Valid target with valid opt-in
+    assert verify_safe_integration_target(
+        r"DESKTOP-JL1BGSI\SQLEXPRESS01",
+        "ceylongodb_integrationtest",
+        opt_in="1",
+    ) is True
+
+    with pytest.raises(DatabaseSafetyError, match="INTEGRATION OPT-IN REQUIRED"):
+        verify_safe_integration_target(r".\SQLEXPRESS01", "CeylonGoDB_IntegrationTest")
+
+    # Disabled opt-in
+    with pytest.raises(DatabaseSafetyError) as exc_info:
+        verify_safe_integration_target(
+            r"DESKTOP-JL1BGSI\SQLEXPRESS01",
+            "ceylongodb_integrationtest",
+            opt_in="0",
+        )
+    assert "integration opt-in required" in str(exc_info.value).lower()
+
+    # Disallowed server with valid db
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(
+            r".\SQLEXPRESS",
+            "ceylongodb_integrationtest",
+            opt_in="1",
+        )
+
+    # Valid server with protected db
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(
+            r"DESKTOP-JL1BGSI\SQLEXPRESS01",
+            "CeylonGoDB",
+            opt_in="1",
+        )
+
+
+def test_verify_connected_server_identity_with_mock():
+    from unittest.mock import MagicMock
+
+    # Valid identity
+    mock_engine = MagicMock()
+    mock_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__.return_value = mock_conn
+    mock_conn.execute.return_value.fetchone.return_value = (
+        "ceylongodb_integrationtest",
+        "DESKTOP-JL1BGSI\\SQLEXPRESS01",
+        "DESKTOP-JL1BGSI",
+        "SQLEXPRESS01",
+    )
+    ident = verify_connected_server_identity(mock_engine)
+    assert ident["current_db"] == "ceylongodb_integrationtest"
+    assert ident["instance_name"] == "SQLEXPRESS01"
+
+    mock_conn.execute.return_value.fetchone.return_value = None
+    with pytest.raises(DatabaseSafetyError, match="identity is unavailable"):
+        verify_connected_server_identity(mock_engine)
+
+    # Connected to CeylonGoDB -> raises
+    mock_conn.execute.return_value.fetchone.return_value = (
+        "CeylonGoDB",
+        "DESKTOP-JL1BGSI\\SQLEXPRESS01",
+        "DESKTOP-JL1BGSI",
+        "SQLEXPRESS01",
+    )
+    with pytest.raises(DatabaseSafetyError) as exc_info:
+        verify_connected_server_identity(mock_engine)
+    assert "live identity safety violation" in str(exc_info.value).lower()
+
+    # Connected to SQLEXPRESS (not SQLEXPRESS01) -> raises
+    mock_conn.execute.return_value.fetchone.return_value = (
+        "ceylongodb_integrationtest",
+        "DESKTOP-JL1BGSI\\SQLEXPRESS",
+        "DESKTOP-JL1BGSI",
+        "SQLEXPRESS",
+    )
+    with pytest.raises(DatabaseSafetyError) as exc_info:
+        verify_connected_server_identity(mock_engine)
+    assert "live identity safety violation" in str(exc_info.value).lower()
+
+
+@pytest.mark.parametrize(
+    "alias", [r"localhost\SQLEXPRESS", r".\SQLEXPRESS01"]
+)
+def test_guard_rejects_live_database_on_both_instances(alias):
+    with pytest.raises(DatabaseSafetyError, match="LIVE DATABASE SAFETY VIOLATION"):
+        verify_safe_integration_target(alias, "CeylonGoDB", opt_in="1")
+
+
+def test_guard_authorizes_only_the_correct_artisan_alias_and_database():
+    alias = r"localhost\SQLEXPRESS"
+    assert verify_safe_integration_target(alias, "CeylonGoDB_IntegrationTest", "1")
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(alias, "CeylonGoDB_Artisan_Test", "1")
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(r"127.0.0.1\SQLEXPRESS", "CeylonGoDB_IntegrationTest", "1")
+
+
+@pytest.mark.parametrize(
+    ("database", "server", "machine", "instance"),
+    [
+        ("CeylonGoDB", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS"),
+        ("CeylonGoDB", r"DESKTOP-JL1BGSI\SQLEXPRESS01", "DESKTOP-JL1BGSI", "SQLEXPRESS01"),
+        ("OtherTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"OTHER\SQLEXPRESS", "OTHER", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "OTHER", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS01"),
+    ],
+)
+def test_failed_artisan_identity_prevents_migration_mutation(
+    monkeypatch, tmp_path, database, server, machine, instance,
+):
+    from unittest.mock import MagicMock
+
+    from scripts import migrate
+
+    # Raw ODBC connection limit the fake to methods on that interface.
+    connection = MagicMock(spec=["cursor", "commit", "rollback", "close"])
+    cursor = connection.cursor.return_value
+    row = (database, server, machine, instance)
+    cursor.fetchone.return_value = row
+    cursor.execute.return_value.fetchone.return_value = row
+    monkeypatch.setattr(migrate, "get_connection", lambda config: connection)
+    lock = MagicMock()
+    monkeypatch.setattr(migrate, "migration_lock", lock)
+    cfg = migrate.DatabaseConfig(
+        server=r"localhost\SQLEXPRESS",
+        database="CeylonGoDB_IntegrationTest",
+        integration_opt_in="1",
+    )
+    with pytest.raises((DatabaseSafetyError, migrate.TargetDatabaseMismatchError)):
+        migrate.cmd_upgrade(cfg, tmp_path, target_version="038", confirmed=True)
+    lock.assert_not_called()
+    connection.commit.assert_not_called()
+    connection.close.assert_called_once()
+    assert all(call.args[0].lstrip().startswith("SELECT ") for call in cursor.execute.call_args_list)
+
+
+def test_guard_accepts_exact_connected_artisan_identity():
+    from unittest.mock import MagicMock
+
+    connection = MagicMock(spec=["cursor"])
+    connection.cursor.return_value.execute.return_value.fetchone.return_value = (
+        "CeylonGoDB_IntegrationTest",
+        r"VISHNUGA-KAJARASH\SQLEXPRESS",
+        "VISHNUGA-KAJARASH",
+        "SQLEXPRESS",
+    )
+    identity = verify_connected_server_identity(
+        connection, server_alias=r"localhost\SQLEXPRESS"
+    )
+    assert identity["server_name"] == r"VISHNUGA-KAJARASH\SQLEXPRESS"
 
 
 # ==============================================================================

@@ -90,3 +90,12 @@ class ArtisanListing(Base):
         if self.provider_profile:
             return self.provider_profile.business_name
         return None
+
+    @property
+    def images(self) -> list:
+        if hasattr(self, "business_images") and self.business_images:
+            return sorted(
+                self.business_images,
+                key=lambda img: (not img.is_primary, img.display_order, img.id),
+            )
+        return []

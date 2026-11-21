@@ -47,6 +47,10 @@ class ShowcaseItem(Base):
 
     sku: Mapped[str | None] = mapped_column(Unicode(50), nullable=True)
 
+    is_custom_order_available: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
     approval_status: Mapped[str] = mapped_column(
         Unicode(20), default="approved", nullable=False, index=True
     )
@@ -74,3 +78,12 @@ class ShowcaseItem(Base):
         if self.artisan_listing:
             return self.artisan_listing.title
         return None
+
+    @property
+    def images(self) -> list:
+        if hasattr(self, "product_images") and self.product_images:
+            return sorted(
+                self.product_images,
+                key=lambda img: (not img.is_primary, img.display_order, img.id),
+            )
+        return []

@@ -66,9 +66,13 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, true
+from sqlalchemy.sql import ColumnElement
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.booking_transactions import EXECUTED_REFUNDS
+from app.core.publication import public_eco
+from app.routers.auth import get_optional_current_user
 from app.core.dependencies import (
     require_admin,
     require_approved_eco_provider,
@@ -76,6 +80,12 @@ from app.core.dependencies import (
     require_traveler,
 )
 from app.core.email import send_eco_badge_decision_email
+from app.core.location_validation import (
+    ECO_LOCATION_FIELDS,
+    ECO_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
+)
 from app.core.notification_service import create_notification
 from app.core.security import create_sponsored_tracking_token
 from app.database.connection import get_db
@@ -313,11 +323,11 @@ def _calculate_eco_refunds(
 ) -> Decimal:
     """
     Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
+    1. Sums recorded amounts for refunds finalized in the shared ledger
        linked via: PaymentTransaction -> BookingReference(module_type='activity')
        -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
     2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
+       only when no finalized refund record exists for that booking.
     3. Eliminates double counting and preserves cross-module isolation.
     """
     # 1. Processed refunds from PaymentRefund table
@@ -333,10 +343,11 @@ def _calculate_eco_refunds(
         .join(
             ActivityBooking,
             (BookingReference.target_booking_id == ActivityBooking.id)
+            & (BookingReference.user_id == ActivityBooking.user_id)
             & (ActivityBooking.eco_experience_id.isnot(None)),
         )
         .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
+        .filter(PaymentRefund.refund_status.in_(EXECUTED_REFUNDS))
     )
     if provider_profile_id is not None:
         rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
@@ -345,17 +356,9 @@ def _calculate_eco_refunds(
 
     processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
 
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
+    # Use the same Eco ownership and booking scope to suppress legacy fallback.
+    refunded_booking_ids_select = rf_query.with_entities(
+        ActivityBooking.id
     )
 
     # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
@@ -366,7 +369,7 @@ def _calculate_eco_refunds(
         .filter(
             ActivityBooking.eco_experience_id.isnot(None),
             ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
+            ~ActivityBooking.id.in_(refunded_booking_ids_select.statement),
         )
     )
     if provider_profile_id is not None:
@@ -453,8 +456,7 @@ def list_eco_experiences(
             selectinload(EcoExperience.verifications),
         )
         .filter(
-            EcoExperience.listing_status == "approved",
-            EcoExperience.is_published == True,
+            public_eco(),
         )
     )
 
@@ -730,79 +732,6 @@ def list_eco_experiences(
         )
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
 @router.get(
     "/categories",
     response_model=list[str],
@@ -813,79 +742,6 @@ def get_eco_categories():
     Returns the six official CeylonGo Eco-Tourism categories.
     """
     return list(VALID_ECO_CATEGORIES)
-
-
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
 
 
 @router.get(
@@ -901,87 +757,13 @@ def get_eco_districts(db: Annotated[Session, Depends(get_db)]):
     districts = (
         db.query(EcoExperience.district)
         .filter(
-            EcoExperience.listing_status == "approved",
-            EcoExperience.is_published == True,
+            public_eco(),
         )
         .distinct()
         .order_by(EcoExperience.district.asc())
         .all()
     )
     return [d[0] for d in districts if d[0]]
-
-
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
 
 
 @router.get(
@@ -1001,7 +783,7 @@ def get_eco_experience_detail(
     """
     experience = (
         _load_full_eco_experience_query(db)
-        .filter(EcoExperience.id == experience_id)
+        .filter(EcoExperience.id == experience_id, public_eco())
         .first()
     )
     if not experience or not experience.is_publicly_visible:
@@ -1034,79 +816,6 @@ def get_eco_experience_detail(
 # ==============================================================================
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
 @router.get(
     "/me/listings",
     response_model=list[EcoExperienceManagementResponse],
@@ -1132,79 +841,6 @@ def list_my_eco_experiences(
         EcoExperienceManagementResponse.model_validate(item)
         for item in listings
     ]
-
-
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
 
 
 @router.get(
@@ -1364,79 +1000,6 @@ def get_my_eco_experiences_summary(
 # ============================================================
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
 @router.get(
     "/me/earnings/summary",
     response_model=EcoProviderEarningsSummaryResponse,
@@ -1553,79 +1116,6 @@ def get_my_eco_earnings_summary(
         refunded_amount=refunded_amt,
         currency="LKR",
     )
-
-
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
 
 
 @router.get(
@@ -2192,6 +1682,7 @@ def create_eco_experience(
         db, payload.linked_homestay_id, payload.eco_category
     )
 
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     experience = EcoExperience(
         provider_profile_id=provider_profile.id,
         linked_homestay_id=payload.linked_homestay_id,
@@ -2358,8 +1849,26 @@ def update_eco_experience(
             detail="conservation_factual_contribution must be distinct from conservation_marketing_statement",
         )
 
-    for key, value in update_data.items():
-        setattr(experience, key, value)
+    if {"latitude", "longitude"} & update_data.keys():
+        validate_coordinate_pair(
+            update_data.get("latitude", experience.latitude),
+            update_data.get("longitude", experience.longitude),
+        )
+    if any(
+        field in update_data and update_data[field] != getattr(experience, field)
+        for field in ECO_LOCATION_FIELDS
+    ):
+        if experience.listing_status == "pending_approval":
+            raise HTTPException(409, detail="Location is currently under review")
+        if experience.listing_status == "approved":
+            update_data.update(
+                listing_status="draft", is_published=False,
+                approval_reviewed_by=None, approval_reviewed_at=None,
+            )
+        write_review_snapshot(db, experience, ECO_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(experience, key, value)
 
     experience.updated_at = datetime.now(UTC)
     db.commit()
@@ -2469,12 +1978,11 @@ def toggle_eco_experience_publication(
             detail=f"Cannot publish an eco experience with status '{experience.listing_status}'. Only admin-approved listings can be published.",
         )
 
-    experience.is_published = payload.is_published
-    if not payload.is_published:
-        experience.listing_status = "deactivated"
-    else:
-        experience.listing_status = "approved"
-    experience.updated_at = datetime.now(UTC)
+    write_review_snapshot(db, experience, ECO_REVIEW_STATE, {
+        "is_published": payload.is_published,
+        "listing_status": "approved" if payload.is_published else "deactivated",
+        "updated_at": datetime.now(UTC),
+    })
 
     db.commit()
     db.refresh(experience)
@@ -3169,11 +2677,13 @@ def admin_approve_eco_experience(
         )
 
     now = datetime.now(UTC)
-    experience.listing_status = "approved"
-    experience.approval_reviewed_by = admin_user.id
-    experience.approval_reviewed_at = now
-    experience.approval_rejection_reason = None
-    experience.updated_at = now
+    write_review_snapshot(db, experience, ECO_REVIEW_STATE, {
+        "listing_status": "approved",
+        "approval_reviewed_by": admin_user.id,
+        "approval_reviewed_at": now,
+        "approval_rejection_reason": None,
+        "updated_at": now,
+    })
 
     db.commit()
     db.refresh(experience)
@@ -3290,79 +2800,6 @@ def add_eco_safety_rule(
     return EcoSafetyRuleResponse.model_validate(rule)
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
 @router.get(
     "/{experience_id}/safety-rules",
     response_model=list[EcoSafetyRuleResponse],
@@ -3378,7 +2815,7 @@ def get_eco_safety_rules(
     """
     experience = (
         db.query(EcoExperience)
-        .filter(EcoExperience.id == experience_id)
+        .filter(EcoExperience.id == experience_id, public_eco())
         .first()
     )
     if not experience:
@@ -3502,79 +2939,6 @@ def add_eco_practice(
     db.commit()
     db.refresh(practice)
     return EcoPracticeManagementResponse.model_validate(practice)
-
-
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
 
 
 @router.get(
@@ -4521,215 +3885,67 @@ def delete_eco_experience_image(
     return None
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
-@router.get(
-    "/{experience_id}/images",
-    response_model=list[EcoExperienceImageResponse],
-    summary="List photo gallery images for an eco experience",
-)
-def list_eco_experience_images(
-    experience_id: int,
+def eco_media_visibility(
+    user: Annotated[User | None, Depends(get_optional_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    """
-    Public/Provider endpoint: Lists gallery images for an eco experience ordered by sort_order.
-    """
-    experience = (
-        db.query(EcoExperience)
-        .filter(EcoExperience.id == experience_id)
-        .first()
-    )
-    if not experience:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Eco experience not found",
+    if user is None:
+        return public_eco()
+    if user.role == "admin":
+        return true()
+    if user.role == "provider":
+        own_profile = db.query(ProviderProfile.id).filter(
+            ProviderProfile.user_id == user.id,
+            ProviderProfile.provider_type == "eco_tourism",
+            ProviderProfile.approval_status == "approved",
         )
+        return or_(public_eco(), EcoExperience.provider_profile_id.in_(own_profile.statement))
+    return public_eco()
+
+
+EcoMediaVisibility = Annotated[ColumnElement[bool], Depends(eco_media_visibility)]
+
+
+@router.get("/{experience_id}/images", response_model=list[EcoExperienceImageResponse])
+def list_eco_experience_images(
+    experience_id: int, db: Annotated[Session, Depends(get_db)],
+    visible: EcoMediaVisibility,
+):
+    experience = db.query(EcoExperience.id).filter(
+        EcoExperience.id == experience_id, visible,
+    ).first()
+    if experience is None:
+        raise HTTPException(404, detail="Eco experience not found")
     images = (
         db.query(EcoExperienceImage)
-        .filter(EcoExperienceImage.eco_experience_id == experience.id)
+        .filter(EcoExperienceImage.eco_experience_id == experience_id)
         .order_by(EcoExperienceImage.sort_order.asc(), EcoExperienceImage.id.asc())
         .all()
     )
     return [EcoExperienceImageResponse.model_validate(img) for img in images]
 
 
-def _calculate_eco_refunds(
-    db: Session,
-    provider_profile_id: int | None = None,
-    booking_ids_filter: list[int] | None = None,
-) -> Decimal:
-    """
-    Authoritative refund accounting for Eco-Tourism (P01, P14, A06, A08):
-    1. Sums actual PaymentRefund.amount where refund_status == 'processed'
-       linked via: PaymentTransaction -> BookingReference(module_type='activity')
-       -> ActivityBooking(eco_experience_id IS NOT NULL) -> EcoExperience.
-    2. Falls back to ActivityBooking.total_price where payment_status == 'refunded'
-       ONLY when no PaymentRefund record exists for that booking.
-    3. Eliminates double counting and preserves cross-module isolation.
-    """
-    # 1. Processed refunds from PaymentRefund table
-    rf_query = (
-        db.query(func.coalesce(func.sum(PaymentRefund.amount), Decimal("0.00")))
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .join(
-            ActivityBooking,
-            (BookingReference.target_booking_id == ActivityBooking.id)
-            & (ActivityBooking.eco_experience_id.isnot(None)),
-        )
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(PaymentRefund.refund_status == "processed")
-    )
-    if provider_profile_id is not None:
-        rf_query = rf_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        rf_query = rf_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    processed_refunds = Decimal(str(rf_query.scalar() or "0.00"))
-
-    # 2. Bookings that have at least one processed PaymentRefund record
-    refunded_booking_ids_select = (
-        select(BookingReference.target_booking_id)
-        .select_from(PaymentRefund)
-        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
-        .join(
-            BookingReference,
-            (PaymentTransaction.booking_reference_id == BookingReference.id)
-            & (BookingReference.module_type == "activity"),
-        )
-        .where(PaymentRefund.refund_status == "processed")
-    )
-
-    # 3. Fallback for bookings with payment_status == 'refunded' and no PaymentRefund record
-    fallback_query = (
-        db.query(func.coalesce(func.sum(ActivityBooking.total_price), Decimal("0.00")))
-        .select_from(ActivityBooking)
-        .join(EcoExperience, ActivityBooking.eco_experience_id == EcoExperience.id)
-        .filter(
-            ActivityBooking.eco_experience_id.isnot(None),
-            ActivityBooking.payment_status == "refunded",
-            ~ActivityBooking.id.in_(refunded_booking_ids_select),
-        )
-    )
-    if provider_profile_id is not None:
-        fallback_query = fallback_query.filter(EcoExperience.provider_profile_id == provider_profile_id)
-    if booking_ids_filter is not None:
-        fallback_query = fallback_query.filter(ActivityBooking.id.in_(booking_ids_filter))
-
-    fallback_refunds = Decimal(str(fallback_query.scalar() or "0.00"))
-
-    return (processed_refunds + fallback_refunds).quantize(Decimal("0.01"))
-
-
-@router.get(
-    "/images/{filename}",
-    summary="Publicly view an eco experience gallery image",
-)
-def get_eco_experience_image(filename: str):
-    """
-    Public endpoint: Serves verified eco experience gallery images from uploads/eco_experiences.
-    Prevents path traversal and only serves image files.
-    """
-    clean_filename = os.path.basename(filename)
-    upload_dir = get_eco_experience_images_dir().resolve()
-    target_path = (upload_dir / clean_filename).resolve()
+@router.get("/images/{filename}")
+@uploads_router.get("/uploads/eco_experiences/{filename}")
+def get_eco_experience_image(
+    filename: str, db: Annotated[Session, Depends(get_db)], visible: EcoMediaVisibility,
+):
+    root = get_eco_experience_images_dir().resolve()
+    target = (root / filename).resolve()
     if (
-        not str(target_path).startswith(str(upload_dir))
-        or not target_path.is_file()
-        or target_path == upload_dir
+        filename != os.path.basename(filename) or target.parent != root
+        or target.suffix.lower() not in ALLOWED_ECO_IMAGE_EXTENSIONS
     ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Eco experience image not found",
-        )
-    ext = target_path.suffix.lower()
-    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
-    return FileResponse(target_path, media_type=media_type)
-
-
-@uploads_router.get(
-    "/uploads/eco_experiences/{filename}",
-    summary="Publicly view an eco experience gallery image via upload path",
-)
-def serve_eco_experience_upload(filename: str):
-    """
-    Upload path alias for public eco experience gallery images.
-    """
-    return get_eco_experience_image(filename)
+        raise HTTPException(404, detail="Eco experience image not found")
+    registered = db.query(EcoExperienceImage.id).join(EcoExperience).filter(
+        EcoExperienceImage.image_url.in_((
+            f"/uploads/eco_experiences/{filename}",
+            f"/api/v1/eco-experiences/images/{filename}",
+        )),
+        visible,
+    ).first()
+    if not registered or not target.is_file():
+        raise HTTPException(404, detail="Eco experience image not found")
+    ext = target.suffix.lower()
+    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext[1:]}"
+    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, no-store"})

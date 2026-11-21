@@ -1,5 +1,6 @@
 from decimal import Decimal
 import hashlib
+import hmac
 import os
 
 
@@ -53,7 +54,8 @@ class PayHereService:
             f"{self.merchant_id}{order_id}{payhere_amount}{payhere_currency}{status_code}{secret_hash}"
         )
         calculated_sig = hashlib.md5(raw_string.encode("utf-8")).hexdigest().upper()
-        return calculated_sig == received_signature.upper()
+        comparison = received_signature.upper()
+        return comparison.isascii() and hmac.compare_digest(calculated_sig, comparison)
 
 
 payhere_service = PayHereService()

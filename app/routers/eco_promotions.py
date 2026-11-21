@@ -24,10 +24,9 @@ Endpoints (Phases P1.1B & P1.1C):
    - POST  /api/v1/admin/eco-promotions/campaigns/{campaign_id}/approve (Editorial approval only; no activation)
    - POST  /api/v1/admin/eco-promotions/campaigns/{campaign_id}/reject  (Reject campaign with mandatory reason)
 
-Payment Deferral & Safety Rules:
-- Payment integration is strictly DEFERRED.
-- Approval represents editorial approval only. Payment remains 'unpaid'.
-- No campaign becomes 'active' or gains sponsored placement in this phase.
+Payment and safety rules:
+- Editorial approval leaves the campaign unpaid until a verified capture is applied.
+- Campaign pricing and duration use the immutable package snapshots.
 - Historical package pricing snapshots are captured at campaign creation and never altered.
 - Forged client-supplied statuses, snapshots, or admin review fields are forbidden (`extra='forbid'`).
 """
@@ -41,7 +40,7 @@ import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.dependencies import require_admin, require_approved_eco_provider
@@ -50,11 +49,16 @@ from app.database.connection import get_db
 from app.models.eco_experience import EcoExperience
 from app.models.eco_promotion import (
     EcoPromotionAnalytics,
+    EcoPromotionAttribution,
+    EcoPromotionEventReceipt,
     EcoPromotionPackage,
     EcoSponsoredPromotion,
+    EcoSponsorshipCapture,
 )
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
+from app.schemas.payment import PaymentInitiateResponse
+from app.services import eco_sponsorship
 from app.schemas.eco_promotion import (
     EcoCampaignApproveRequest,
     EcoCampaignRejectRequest,
@@ -468,6 +472,8 @@ def create_campaign_request(
             detail="Cannot request promotion for an inactive package",
         )
 
+    eco_sponsorship.lock_experience(db, exp.id)
+    eco_sponsorship.expire_campaigns(db, exp.id)
     # 4. Duplicate / conflict check for concurrent pending or active campaigns
     conflict = (
         db.query(EcoSponsoredPromotion)
@@ -509,6 +515,54 @@ def create_campaign_request(
     db.refresh(campaign)
 
     return _serialize_campaign_response(campaign)
+
+
+@eco_promotions_router.post(
+    "/me/campaigns/{campaign_id}/payments/initiate",
+    response_model=PaymentInitiateResponse,
+)
+def initiate_eco_sponsorship(
+    campaign_id: int,
+    provider: Annotated[ProviderProfile, Depends(require_approved_eco_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return eco_sponsorship.checkout(db, provider, campaign_id)
+
+
+@admin_eco_promotions_router.post("/campaigns/{campaign_id}/expire")
+def expire_eco_campaign(
+    campaign_id: int, db: Annotated[Session, Depends(get_db)],
+) -> dict[str, str]:
+    campaign = eco_sponsorship.locked_campaign(
+        db, select(EcoSponsoredPromotion).where(EcoSponsoredPromotion.id == campaign_id)
+    )
+    eco_sponsorship.expire_campaigns(db, campaign.eco_experience_id)
+    db.refresh(campaign)
+    result = {"campaign_status": campaign.campaign_status}
+    db.commit()
+    return result
+
+
+@admin_eco_promotions_router.get("/campaigns/{campaign_id}/payments")
+def report_eco_sponsorship_payments(
+    campaign_id: int, db: Annotated[Session, Depends(get_db)],
+    page: Annotated[int, Query(ge=1, le=1000)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[dict]:
+    if not eco_sponsorship.ledger_enabled():
+        raise HTTPException(503, "Eco sponsorship payment ledger is unavailable")
+    if db.get(EcoSponsoredPromotion, campaign_id) is None:
+        raise HTTPException(404, "Eco campaign not found")
+    capture = EcoSponsorshipCapture
+    rows = db.scalars(select(capture).where(capture.promotion_id == campaign_id)
+                     .order_by(capture.captured_at.desc(), capture.gateway_id)
+                     .offset((page - 1) * page_size).limit(page_size))
+    return [
+        {"gateway_id": row.gateway_id, "amount": str(row.amount), "currency": row.currency,
+         "status": "applied" if row.applied else "reconciliation_required",
+         "captured_at": row.captured_at}
+        for row in rows
+    ]
 
 
 
@@ -621,14 +675,13 @@ def cancel_my_campaign(
     Provider endpoint: Cancels an owned campaign that is currently pending approval or approved.
     Active, expired, or already-cancelled campaigns cannot be cancelled through this endpoint.
     """
-    campaign = (
-        db.query(EcoSponsoredPromotion)
+    campaign = eco_sponsorship.locked_campaign(
+        db, select(EcoSponsoredPromotion)
         .options(
             selectinload(EcoSponsoredPromotion.eco_experience),
             selectinload(EcoSponsoredPromotion.package),
         )
         .filter(EcoSponsoredPromotion.id == campaign_id)
-        .first()
     )
     if not campaign:
         raise HTTPException(
@@ -769,18 +822,20 @@ def _record_sponsored_event(
             detail=f"Tracking token campaign ID {token_campaign_id} does not match endpoint campaign ID {campaign_id_expected}",
         )
 
-    _check_and_record_replay(event_type, nonce)
+    durable = eco_sponsorship.ledger_enabled()
+    if not durable:
+        _check_and_record_replay(event_type, nonce)
 
-    campaign = (
-        db.query(EcoSponsoredPromotion)
-        .filter(EcoSponsoredPromotion.id == token_campaign_id)
-        .first()
+    campaign = eco_sponsorship.locked_campaign(
+        db, select(EcoSponsoredPromotion).where(EcoSponsoredPromotion.id == token_campaign_id)
     )
     if not campaign:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Promotion campaign {token_campaign_id} not found",
         )
+    if campaign.eco_experience_id != token_experience_id:
+        raise HTTPException(400, "Tracking token experience does not match campaign")
 
     if campaign.payment_status != "paid":
         raise HTTPException(
@@ -824,6 +879,11 @@ def _record_sponsored_event(
             detail="Campaign validity window has not started yet",
         )
 
+    if durable and db.scalar(select(EcoSponsoredPromotion.id).where(
+        EcoSponsoredPromotion.id == campaign.id, *eco_sponsorship.active_campaign(now)
+    )) is None:
+        raise HTTPException(400, "Campaign has no applied verified payment")
+
     experience = (
         db.query(EcoExperience)
         .filter(EcoExperience.id == campaign.eco_experience_id)
@@ -835,12 +895,18 @@ def _record_sponsored_event(
             detail="Associated eco experience not found",
         )
 
-    if experience.listing_status != "approved" or not experience.is_published:
+    if not eco_sponsorship.listing_is_eligible(db, campaign):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot record ad metrics for an unapproved or unpublished experience",
         )
 
+    if durable:
+        if db.get(EcoPromotionEventReceipt, (nonce, event_type)) is not None:
+            raise HTTPException(409, "Duplicate sponsored tracking event")
+        db.add(EcoPromotionEventReceipt(
+            nonce=nonce, event_type=event_type, promotion_id=campaign.id
+        ))
     today = now.date()
     row = (
         db.query(EcoPromotionAnalytics)
@@ -1169,6 +1235,18 @@ def get_single_campaign_analytics(
         for r in records
     ]
 
+    attributed_bookings = 0
+    if eco_sponsorship.ledger_enabled():
+        attribution = EcoPromotionAttribution
+        count = select(func.count()).select_from(attribution).where(
+            attribution.promotion_id == campaign.id
+        )
+        if start_date:
+            count = count.where(attribution.recorded_on >= start_date)
+        if end_date:
+            count = count.where(attribution.recorded_on <= end_date)
+        attributed_bookings = db.scalar(count)
+
     return EcoPromotionCampaignAnalyticsResponse(
         campaign_id=campaign.id,
         eco_experience_id=campaign.eco_experience_id,
@@ -1187,6 +1265,7 @@ def get_single_campaign_analytics(
         start_date=start_date,
         end_date=end_date,
         daily_metrics=daily_metrics,
+        attributed_bookings=attributed_bookings,
     )
 
 
@@ -1302,8 +1381,8 @@ def admin_approve_campaign(
     - Does NOT activate the campaign.
     - Approval represents editorial compliance only, awaiting centralized payment verification.
     """
-    campaign = (
-        db.query(EcoSponsoredPromotion)
+    campaign = eco_sponsorship.locked_campaign(
+        db, select(EcoSponsoredPromotion)
         .options(
             selectinload(EcoSponsoredPromotion.eco_experience),
             selectinload(EcoSponsoredPromotion.package),
@@ -1311,7 +1390,6 @@ def admin_approve_campaign(
             selectinload(EcoSponsoredPromotion.reviewer),
         )
         .filter(EcoSponsoredPromotion.id == campaign_id)
-        .first()
     )
     if not campaign:
         raise HTTPException(
@@ -1364,8 +1442,8 @@ def admin_reject_campaign(
     Admin moderation endpoint: Rejects a campaign with a mandatory reason.
     Can reject from 'pending_approval' or revoke an un-activated 'approved' campaign.
     """
-    campaign = (
-        db.query(EcoSponsoredPromotion)
+    campaign = eco_sponsorship.locked_campaign(
+        db, select(EcoSponsoredPromotion)
         .options(
             selectinload(EcoSponsoredPromotion.eco_experience),
             selectinload(EcoSponsoredPromotion.package),
@@ -1373,7 +1451,6 @@ def admin_reject_campaign(
             selectinload(EcoSponsoredPromotion.reviewer),
         )
         .filter(EcoSponsoredPromotion.id == campaign_id)
-        .first()
     )
     if not campaign:
         raise HTTPException(

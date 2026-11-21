@@ -353,6 +353,7 @@ class EcoPromotionDailyMetric(BaseModel):
 
 
 class EcoPromotionCampaignAnalyticsResponse(BaseModel):
+    attributed_bookings: int = 0
     """Detailed analytics response for a specific provider promotion campaign."""
     campaign_id: int
     eco_experience_id: int

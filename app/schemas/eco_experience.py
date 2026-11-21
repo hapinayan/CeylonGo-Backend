@@ -907,6 +907,17 @@ class EcoProviderListingSummary(BaseModel):
     verified_badges: int = Field(default=0, ge=0)
     pending_badges: int = Field(default=0, ge=0)
 
+    # P01: Booking & Revenue metrics
+    total_bookings: int = Field(default=0, ge=0)
+    pending_bookings: int = Field(default=0, ge=0)
+    confirmed_bookings: int = Field(default=0, ge=0)
+    completed_bookings: int = Field(default=0, ge=0)
+    cancelled_bookings: int = Field(default=0, ge=0)
+    rejected_bookings: int = Field(default=0, ge=0)
+    total_revenue: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    pending_cash_revenue: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    refunded_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+
 
 class EcoAdminStatusBreakdown(BaseModel):
     """
@@ -944,6 +955,39 @@ class EcoAdminDistrictBreakdown(BaseModel):
     count: int = Field(default=0, ge=0)
 
 
+class EcoAdminBookingMetrics(BaseModel):
+    """
+    Booking volume and status breakdown for admin overview (A08).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    total_bookings: int = Field(default=0, ge=0)
+    pending_bookings: int = Field(default=0, ge=0)
+    confirmed_bookings: int = Field(default=0, ge=0)
+    completed_bookings: int = Field(default=0, ge=0)
+    cancelled_bookings: int = Field(default=0, ge=0)
+    rejected_bookings: int = Field(default=0, ge=0)
+
+
+class EcoAdminFinancialMetrics(BaseModel):
+    """
+    Platform-wide financial metrics for admin overview (A08).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    gross_booking_value: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    paid_revenue: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    pending_cash_volume: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    refunded_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    estimated_platform_commission: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    recorded_platform_fees: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    total_disbursed_settlements: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    approved_pending_settlements: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    net_provider_payable: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+
+
 class EcoAdminOverviewResponse(BaseModel):
     """
     Comprehensive platform-wide metrics for admin eco-tourism dashboard.
@@ -959,3 +1003,367 @@ class EcoAdminOverviewResponse(BaseModel):
     by_status: EcoAdminStatusBreakdown
     by_category: list[EcoAdminCategoryBreakdown]
     by_district: list[EcoAdminDistrictBreakdown]
+    booking_metrics: EcoAdminBookingMetrics = Field(default_factory=EcoAdminBookingMetrics)
+    financial_metrics: EcoAdminFinancialMetrics = Field(default_factory=EcoAdminFinancialMetrics)
+
+
+# ============================================================
+# Phase 5A: Admin Monitoring & Provider Earnings Schemas
+# ============================================================
+
+
+class EcoAdminBookingItem(BaseModel):
+    """
+    Detailed booking monitoring item for admin oversight (A05).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    booking_reference: str | None = None
+    eco_experience_id: int
+    eco_experience_title: str
+    provider_profile_id: int
+    provider_name: str
+    user_id: int
+    traveler_name: str
+    traveler_email: str
+    participants: int
+    total_price: Decimal
+    currency: str = "LKR"
+    payment_method: str
+    payment_status: str
+    booking_status: str
+    cancellation_reason: str | None = None
+    cancelled_at: datetime | None = None
+    created_at: datetime
+
+
+class EcoAdminBookingPagination(BaseModel):
+    """
+    Paginated admin booking monitoring response (A05).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[EcoAdminBookingItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class EcoAdminPaymentItem(BaseModel):
+    """
+    Payment and commission audit record for admin monitoring (A06).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    booking_id: int
+    booking_reference: str | None = None
+    eco_experience_id: int
+    eco_experience_title: str
+    provider_profile_id: int
+    provider_name: str
+    user_id: int
+    traveler_name: str
+    amount: Decimal
+    currency: str = "LKR"
+    payment_method: str
+    payment_status: str
+    booking_status: str
+    estimated_platform_commission: Decimal = Decimal("0.00")
+    platform_commission: Decimal = Decimal("0.00")
+    provider_share: Decimal = Decimal("0.00")
+    gateway_name: str | None = None
+    gateway_transaction_id: str | None = None
+    paid_at: datetime | None = None
+    created_at: datetime
+
+
+class EcoAdminPaymentAuditSummary(BaseModel):
+    """
+    Aggregated payment audit metrics across all eco-tourism transactions (A06).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    total_bookings: int = 0
+    paid_bookings_count: int = 0
+    total_gross_volume: Decimal = Decimal("0.00")
+    total_paid_volume: Decimal = Decimal("0.00")
+    total_pending_cash_volume: Decimal = Decimal("0.00")
+    total_refunded_volume: Decimal = Decimal("0.00")
+    estimated_platform_commission: Decimal = Decimal("0.00")
+    total_platform_commission: Decimal = Decimal("0.00")
+    recorded_platform_fees: Decimal = Decimal("0.00")
+    total_disbursed_settlements: Decimal = Decimal("0.00")
+    total_approved_settlements: Decimal = Decimal("0.00")
+    total_provider_payable: Decimal = Decimal("0.00")
+
+
+class EcoAdminPaymentAuditResponse(BaseModel):
+    """
+    Paginated payment audit response with high-level summary (A06).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    summary: EcoAdminPaymentAuditSummary
+    items: list[EcoAdminPaymentItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class EcoProviderEarningsSummaryResponse(BaseModel):
+    """
+    Comprehensive financial summary of online earnings and settlements for an eco provider (P14).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    provider_profile_id: int
+    total_bookings: int = 0
+    paid_bookings_count: int = 0
+    gross_earnings: Decimal = Decimal("0.00")
+    estimated_platform_commission: Decimal = Decimal("0.00")
+    platform_commission: Decimal = Decimal("0.00")
+    net_earnings: Decimal = Decimal("0.00")
+    recorded_platform_fees: Decimal = Decimal("0.00")
+    total_disbursed_payouts: Decimal = Decimal("0.00")
+    approved_pending_payouts: Decimal = Decimal("0.00")
+    on_hold_payouts: Decimal = Decimal("0.00")
+    total_settled: Decimal = Decimal("0.00")
+    pending_settlement: Decimal = Decimal("0.00")
+    pending_cash_to_collect: Decimal = Decimal("0.00")
+    refunded_amount: Decimal = Decimal("0.00")
+    currency: str = "LKR"
+
+
+class EcoProviderSettlementItem(BaseModel):
+    """
+    Single provider settlement payout record (P14).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    provider_profile_id: int
+    period_start: date
+    period_end: date
+    gross_amount: Decimal
+    platform_fee: Decimal
+    net_payable: Decimal
+    currency: str = "LKR"
+    settlement_status: str
+    payout_reference: str | None = None
+    paid_at: datetime | None = None
+    created_at: datetime
+
+
+class EcoProviderSettlementPagination(BaseModel):
+    """
+    Paginated list of provider settlement payout records (P14).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[EcoProviderSettlementItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+# ============================================================
+# Phase 5B: Ratings & Reviews Schemas (T13, P17)
+# ============================================================
+
+
+class EcoReviewCreateRequest(BaseModel):
+    """
+    Traveler review submission request for an eligible completed eco booking (T13).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    booking_id: int = Field(..., description="Eligible completed eco-tourism booking ID")
+    rating: Decimal = Field(
+        ...,
+        ge=Decimal("1.00"),
+        le=Decimal("5.00"),
+        decimal_places=2,
+        description="Rating from 1.00 to 5.00",
+    )
+    title: str | None = Field(default=None, max_length=150, description="Optional review title")
+    comment: str | None = Field(default=None, max_length=2000, description="Optional review comment")
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, v: str | None) -> str | None:
+        if v is not None:
+            cleaned = v.strip()
+            return cleaned if cleaned else None
+        return None
+
+    @field_validator("comment")
+    @classmethod
+    def clean_comment(cls, v: str | None) -> str | None:
+        if v is not None:
+            cleaned = v.strip()
+            return cleaned if cleaned else None
+        return None
+
+
+class EcoReviewResponse(BaseModel):
+    """
+    Public representation of a verified eco experience review (T13).
+    SECURITY RULE: Exposes only reviewer's display name, never private contact information.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    eco_experience_id: int
+    booking_id: int | None = None
+    user_id: int
+    reviewer_name: str
+    rating: Decimal
+    title: str | None = None
+    comment: str | None = None
+    is_verified_booking: bool = True
+    is_published: bool = True
+    created_at: datetime
+
+
+class EcoReviewListResponse(BaseModel):
+    """
+    Paginated public reviews list with aggregated rating statistics (T13).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[EcoReviewResponse]
+    total: int
+    average_rating: float
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class EcoProviderReviewItem(BaseModel):
+    """
+    Detailed review feedback item for provider dashboard (P17).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    eco_experience_id: int
+    eco_experience_title: str
+    booking_id: int | None = None
+    booking_reference: str | None = None
+    user_id: int
+    reviewer_name: str
+    rating: Decimal
+    title: str | None = None
+    comment: str | None = None
+    is_verified_booking: bool
+    is_published: bool
+    created_at: datetime
+
+
+class EcoProviderReviewListResponse(BaseModel):
+    """
+    Paginated review feedback response for provider dashboard with aggregated metrics (P17).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[EcoProviderReviewItem]
+    total: int
+    average_rating: float
+    page: int
+    page_size: int
+    total_pages: int
+
+
+# ============================================================
+# Weather & Environmental Emergency Cancellation (E06)
+# ============================================================
+
+
+class EcoWeatherEmergencyRequest(BaseModel):
+    """
+    Payload for authorized provider to declare a weather emergency or hazard (E06).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hazard_type: str = Field(
+        default="weather_alert",
+        description="Hazard type: 'weather_alert', 'monsoon_season', 'wildlife_breeding', or 'park_closure'",
+    )
+    reason: str = Field(
+        ...,
+        min_length=5,
+        max_length=500,
+        description="Detailed explanation of the weather hazard or environmental safety risk",
+    )
+    slot_id: int | None = Field(
+        default=None,
+        description="Optional single slot ID to cancel specifically",
+    )
+    start_date: date | None = Field(
+        default=None,
+        description="Start date of the weather restriction window (required if slot_id is omitted)",
+    )
+    end_date: date | None = Field(
+        default=None,
+        description="End date of the weather restriction window (required if slot_id is omitted)",
+    )
+
+    @field_validator("hazard_type")
+    @classmethod
+    def validate_hazard_type(cls, v: str) -> str:
+        cleaned = v.strip().lower()
+        if cleaned not in VALID_SEASON_RESTRICTION_TYPES:
+            raise ValueError(
+                f"Invalid hazard_type '{v}'. Allowed: {', '.join(VALID_SEASON_RESTRICTION_TYPES)}"
+            )
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "EcoWeatherEmergencyRequest":
+        if self.slot_id is None and (self.start_date is None or self.end_date is None):
+            raise ValueError(
+                "Either slot_id or both start_date and end_date must be provided."
+            )
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date.")
+        return self
+
+
+class EcoWeatherEmergencyResponse(BaseModel):
+    """
+    Response returned after declaring a weather emergency and cancelling affected slots/bookings.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    eco_experience_id: int
+    hazard_type: str
+    reason: str
+    restriction_id: int | None = None
+    affected_slots_count: int
+    cancelled_bookings_count: int
+    released_capacity_total: int
+    refunds_initiated_count: int
+    total_refund_amount: Decimal
+    cancelled_booking_ids: list[int]
+    status: str = "success"
+    message: str
+

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
@@ -19,7 +19,9 @@ from app.schemas.activity_admin import (
     ActivityRejectionRequest,
     ActivitySuspensionRequest,
     ActivityUnsuspensionRequest,
+    AdminActivityPlatformReportResponse,
 )
+from app.services.activity_reports import generate_platform_activity_report
 
 
 router = APIRouter(
@@ -63,6 +65,46 @@ def list_pending_activities(
         .order_by(Activity.created_at.asc())
         .limit(limit)
         .all()
+    )
+
+
+@router.get(
+    "/reports",
+    response_model=AdminActivityPlatformReportResponse,
+    summary="Get platform-wide activity reports and executive metrics (C07)",
+)
+def get_platform_activity_reports(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    date_from: date | None = Query(
+        default=None,
+        description="Start date filter (YYYY-MM-DD)",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="End date filter (YYYY-MM-DD)",
+    ),
+    start_date: date | None = Query(
+        default=None,
+        description="Alias for date_from",
+    ),
+    end_date: date | None = Query(
+        default=None,
+        description="Alias for date_to",
+    ),
+):
+    """
+    Platform-wide administrative activity reporting endpoint (C07).
+    Aggregates activity inventory, booking lifecycle metrics, slot occupancy,
+    canonical category distribution, regional heatmaps, multi-currency financials,
+    and top activities / providers with strict admin authorization.
+    """
+    eff_from = date_from or start_date
+    eff_to = date_to or end_date
+    return generate_platform_activity_report(
+        db,
+        date_from=eff_from,
+        date_to=eff_to,
     )
 
 

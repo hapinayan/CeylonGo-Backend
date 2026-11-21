@@ -202,3 +202,140 @@ class AdminActivityBookingDetail(BaseModel):
     cancellation_reason: str | None = None
     cancelled_at: datetime | None = None
     status_history: list[AdminBookingStatusHistoryItem] = []
+
+
+# ==============================================================================
+# Platform-Wide Admin Reporting Schemas (C07)
+# ==============================================================================
+
+
+class AdminActivityInventoryOverview(BaseModel):
+    """Platform-wide activity inventory aggregated by approval and publication status."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    total_activities: int = Field(ge=0)
+    approved_activities: int = Field(ge=0)
+    pending_activities: int = Field(ge=0)
+    draft_activities: int = Field(ge=0)
+    suspended_activities: int = Field(ge=0)
+    rejected_activities: int = Field(ge=0)
+    active_published_activities: int = Field(ge=0)
+    inactive_activities: int = Field(ge=0)
+
+
+class AdminActivityBookingOverview(BaseModel):
+    """Platform-wide activity booking lifecycle counts and conversion metrics."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    total_bookings: int = Field(ge=0)
+    confirmed_bookings: int = Field(ge=0)
+    completed_bookings: int = Field(ge=0)
+    pending_bookings: int = Field(ge=0)
+    cancelled_bookings: int = Field(ge=0)
+    rejected_bookings: int = Field(ge=0)
+    total_participants: int = Field(ge=0)
+    confirmed_participants: int = Field(ge=0)
+    booking_conversion_rate: float = Field(ge=0.0, le=100.0)
+    cancellation_rate: float = Field(ge=0.0, le=100.0)
+
+
+class AdminActivityCapacityUtilization(BaseModel):
+    """Aggregate scheduled slot capacity and occupancy metrics across activities."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    total_slots: int = Field(ge=0)
+    active_slots: int = Field(ge=0)
+    total_capacity: int = Field(ge=0)
+    total_reserved: int = Field(ge=0)
+    total_remaining: int = Field(ge=0)
+    occupancy_rate: float = Field(ge=0.0, le=100.0)
+
+
+class AdminActivityCategoryReport(BaseModel):
+    """Activity and booking metrics broken down by canonical activity category."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    category: str
+    activity_count: int = Field(ge=0)
+    active_activity_count: int = Field(ge=0)
+    booking_count: int = Field(ge=0)
+    total_participants: int = Field(ge=0)
+    gross_revenue: Decimal = Field(ge=Decimal("0.00"), default=Decimal("0.00"))
+    currency: str = "LKR"
+
+
+class AdminActivityRegionalReport(BaseModel):
+    """Activity and booking distribution aggregated by administrative district."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    district: str
+    activity_count: int = Field(ge=0)
+    booking_count: int = Field(ge=0)
+    total_participants: int = Field(ge=0)
+
+
+class AdminActivityFinancialBreakdown(BaseModel):
+    """Monetary booking aggregates partitioned strictly by currency to prevent cross-contamination."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    currency: str
+    total_gross_revenue: Decimal = Field(ge=Decimal("0.00"))
+    paid_revenue: Decimal = Field(ge=Decimal("0.00"))
+    unpaid_revenue: Decimal = Field(ge=Decimal("0.00"))
+    refunded_amount: Decimal = Field(ge=Decimal("0.00"))
+
+
+class AdminTopActivitySummary(BaseModel):
+    """Top-performing activity summary for administrative ranking."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: int
+    activity_title: str
+    category: str
+    district: str
+    provider_profile_id: int
+    provider_business_name: str | None = None
+    booking_count: int = Field(ge=0)
+    total_participants: int = Field(ge=0)
+    gross_revenue: Decimal = Field(ge=Decimal("0.00"))
+    currency: str = "LKR"
+
+
+class AdminTopProviderSummary(BaseModel):
+    """Top-performing activity provider summary for platform monitoring."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    provider_profile_id: int
+    business_name: str
+    total_activities: int = Field(ge=0)
+    active_activities: int = Field(ge=0)
+    booking_count: int = Field(ge=0)
+    total_participants: int = Field(ge=0)
+    gross_revenue: Decimal = Field(ge=Decimal("0.00"))
+    currency: str = "LKR"
+
+
+class AdminActivityPlatformReportResponse(BaseModel):
+    """Comprehensive executive activity platform report response (C07)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    generated_at: datetime
+    date_from: date | None = None
+    date_to: date | None = None
+    activity_inventory: AdminActivityInventoryOverview
+    booking_overview: AdminActivityBookingOverview
+    capacity_utilization: AdminActivityCapacityUtilization
+    category_distribution: list[AdminActivityCategoryReport] = []
+    regional_distribution: list[AdminActivityRegionalReport] = []
+    financial_overview: list[AdminActivityFinancialBreakdown] = []
+    top_activities: list[AdminTopActivitySummary] = []
+    top_providers: list[AdminTopProviderSummary] = []

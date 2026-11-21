@@ -285,3 +285,150 @@ class ActivitySummary(BaseModel):
     currency: str
     approval_status: ActivityStatus
     is_active: bool
+
+
+class ActivityImageResponse(BaseModel):
+    """Image response schema."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    activity_id: int
+    image_url: str
+    alt_text: str | None = None
+    display_order: int = 0
+    is_cover: bool = False
+
+
+class ActivityOrganizerContact(BaseModel):
+    """Public approved organizer contact channels."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    business_name: str
+    phone: str
+    secondary_phone: str | None = None
+    description: str | None = None
+
+
+class ActivityCategoryDetail(BaseModel):
+    """Approved activity category taxonomy definition."""
+
+    slug: ActivityCategory
+    name: str
+    description: str
+    examples: list[str]
+
+
+class ActivityPublicSummary(BaseModel):
+    """Compact summary schema for public discovery cards and search."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    category: ActivityCategory
+    district: str
+    city: str
+    duration_minutes: int
+    pricing_type: PricingType
+    price: Decimal
+    currency: str
+    minimum_age: int
+    cover_image_url: str | None = None
+    short_description: str
+    provider_business_name: str | None = None
+
+
+class ActivityPagination(BaseModel):
+    """Paginated response for public activity discovery."""
+
+    items: list[ActivityPublicSummary]
+    total: int = Field(ge=0)
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=100)
+    total_pages: int = Field(ge=0)
+
+
+class ActivityPublicDetail(BaseModel):
+    """Full public detail schema for travelers viewing an approved activity."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    description: str
+    category: ActivityCategory
+    district: str
+    city: str
+    duration_minutes: int
+    itinerary: str | None = None
+    requirements: str | None = None
+    safety_rules: str | None = None
+    required_equipment: str | None = None
+    minimum_age: int
+    pricing_type: PricingType
+    price: Decimal
+    currency: str
+    meeting_point: str
+    latitude: Decimal | None = None
+    longitude: Decimal | None = None
+    organizer: ActivityOrganizerContact | None = None
+    images: list[ActivityImageResponse] = Field(default_factory=list)
+    created_at: datetime
+
+
+APPROVED_ACTIVITY_CATEGORIES: list[ActivityCategoryDetail] = [
+    ActivityCategoryDetail(
+        slug="cultural",
+        name="Cultural Activities",
+        description="Traditional dance, heritage experiences, festivals and cultural shows",
+        examples=[
+            "Traditional dance",
+            "Heritage experiences",
+            "Festivals",
+            "Cultural shows",
+        ],
+    ),
+    ActivityCategoryDetail(
+        slug="adventure",
+        name="Adventure Activities",
+        description="Rafting, surfing, hiking, rock climbing and ziplining",
+        examples=[
+            "Rafting",
+            "Surfing",
+            "Hiking",
+            "Rock climbing",
+            "Ziplining",
+        ],
+    ),
+    ActivityCategoryDetail(
+        slug="local",
+        name="Local Experiences",
+        description="Cooking classes, village tours, farming and craft workshops",
+        examples=[
+            "Cooking classes",
+            "Village tours",
+            "Farming",
+            "Craft workshops",
+        ],
+    ),
+    ActivityCategoryDetail(
+        slug="community",
+        name="Community Experiences",
+        description="Tea experiences, fishing communities and community-led visits",
+        examples=[
+            "Tea experiences",
+            "Fishing communities",
+            "Community-led visits",
+        ],
+    ),
+]
+
+
+def make_short_description(description: str, max_length: int = 200) -> str:
+    """Clean and truncate text to a maximum length with ellipsis."""
+    cleaned = " ".join(description.split())
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 3].rstrip() + "..."

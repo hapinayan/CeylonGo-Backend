@@ -3,16 +3,18 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Integer,
     Numeric,
     Unicode,
     func,
+    text,
 )
-from sqlalchemy import DateTime
 from sqlalchemy.dialects import mssql
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
 from app.models.user import Base
 
@@ -146,8 +148,8 @@ class ActivityBookingParticipant(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "age IS NULL OR age > 0",
-            name="CK_activity_participants_age",
+            "age IS NULL OR age >= 0",
+            name="CK_activity_booking_participants_age",
         ),
     )
 
@@ -169,31 +171,45 @@ class ActivityBookingParticipant(Base):
         nullable=False,
     )
 
-    id_or_passport: Mapped[str | None] = mapped_column(
-        Unicode(50),
-        nullable=True,
-    )
-
     age: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,
     )
 
-    special_requirements: Mapped[str | None] = mapped_column(
-        Unicode(500),
+    emergency_contact_name: Mapped[str | None] = mapped_column(
+        Unicode(150),
         nullable=True,
     )
 
+    emergency_contact_phone: Mapped[str | None] = mapped_column(
+        Unicode(30),
+        nullable=True,
+    )
+
+    special_requirements: Mapped[str | None] = mapped_column(
+        Unicode(1000),
+        nullable=True,
+    )
+
+    waiver_signed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("0"),
+        nullable=False,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
-        DateTime().with_variant(__import__('sqlalchemy').dialects.mssql.DATETIME2(), 'mssql'),
+        DateTime().with_variant(mssql.DATETIME2(), "mssql"),
         server_default=func.sysutcdatetime(),
         nullable=False,
     )
 
     booking = relationship(
         "ActivityBooking",
-        backref=__import__('sqlalchemy.orm', fromlist=['backref']).backref(
-            "participants_list", cascade="all, delete-orphan", lazy="select"
+        backref=backref(
+            "participants_list",
+            cascade="all, delete-orphan",
+            lazy="select",
         ),
     )
 

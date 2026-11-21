@@ -110,6 +110,9 @@ from app.routers.eco_reservations import router as eco_reservations_router
 # ACTIVITIES & EXPERIENCES ROUTER IMPORTS
 # ==========================================
 
+from app.routers.activities_public import (
+    router as activities_public_router,
+)
 from app.routers.provider_activities import (
     router as provider_activities_router,
 )
@@ -357,6 +360,7 @@ app.include_router(eco_reservations_router)
 # ACTIVITIES & EXPERIENCES MODULE
 # ==========================================
 
+app.include_router(activities_public_router)
 app.include_router(provider_activities_router)
 app.include_router(admin_activities_router)
 app.include_router(activity_slots_router)

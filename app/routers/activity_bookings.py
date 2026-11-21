@@ -13,7 +13,7 @@ from app.database.connection import get_db
 
 from app.models.activity import Activity
 from app.models.eco_experience import EcoExperience
-from app.models.activity_booking import ActivityBooking
+from app.models.activity_booking import ActivityBooking, ActivityBookingParticipant
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
@@ -69,9 +69,10 @@ def create_activity_booking(
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # Find an active future slot.
+    # Find an active future slot with concurrency lock.
     slot = (
         db.query(ActivitySlot)
+        .with_hint(ActivitySlot, "WITH (UPDLOCK, HOLDLOCK)", "mssql")
         .filter(
             ActivitySlot.id == payload.activity_slot_id,
             ActivitySlot.is_active == True,
@@ -123,6 +124,59 @@ def create_activity_booking(
             detail="Participants exceed slot capacity",
         )
 
+    # Safety invariant: Adventure activities strictly require participant waivers and emergency contacts
+    if activity.category == "adventure" and payload.participants_list is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Participant details, signed waivers, and emergency contacts are required for adventure activities",
+        )
+
+    # Safety invariant: Age-restricted activities strictly require participant details for age verification
+    if activity.minimum_age > 0 and payload.participants_list is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Participant details and age verification are required for activities with a minimum age restriction ({activity.minimum_age}+)",
+        )
+
+    # Validate participant details and safety rules
+    if payload.participants_list is not None:
+        if len(payload.participants_list) != payload.participants:
+            raise HTTPException(
+                status_code=422,
+                detail="Number of participants in participants_list must match participants count",
+            )
+        for idx, p in enumerate(payload.participants_list):
+            name = (p.full_name or "").strip()
+            if not name:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Participant at index {idx} must have a non-empty full_name",
+                )
+            if activity.minimum_age > 0:
+                if p.age is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Participant {name} must provide age for age-restricted activities (minimum age: {activity.minimum_age})",
+                    )
+                if p.age < activity.minimum_age:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Participant {name} is below the minimum age of {activity.minimum_age}",
+                    )
+            if activity.category == "adventure":
+                if not p.waiver_signed:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Waiver must be signed for participant {name} on adventure activities",
+                    )
+                if not (p.emergency_contact_name or "").strip() or not (
+                    p.emergency_contact_phone or ""
+                ).strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Emergency contact name and phone are required for participant {name} on adventure activities",
+                    )
+
     # Calculate price on the server.
     unit_price = Decimal(str(activity.price))
 
@@ -161,14 +215,29 @@ def create_activity_booking(
             currency=activity.currency,
             payment_method="pay_at_location",
             payment_status="unpaid",
-            booking_status="confirmed",
+            booking_status="pending",
         )
 
         db.add(booking)
         db.flush()
+
+        if payload.participants_list is not None:
+            for p in payload.participants_list:
+                participant_record = ActivityBookingParticipant(
+                    activity_booking_id=booking.id,
+                    full_name=p.full_name.strip(),
+                    age=p.age,
+                    emergency_contact_name=p.emergency_contact_name,
+                    emergency_contact_phone=p.emergency_contact_phone,
+                    special_requirements=p.special_requirements,
+                    waiver_signed=p.waiver_signed,
+                )
+                db.add(participant_record)
+            db.flush()
+
         provider = db.get(ProviderProfile, activity.provider_profile_id)
         record_native_event(
-            db, booking, "activity", provider.id, None, "confirmed",
+            db, booking, "activity", provider.id, None, "pending",
             current_user.id, provider.user_id,
         )
         db.commit()

@@ -258,6 +258,7 @@ class WorkspaceReader:
                     ActivityBooking.payment_status,
                     ActivityBooking.total_price,
                     ActivityBooking.currency,
+                    ActivityBooking.payment_method,
                     Activity.title.label("title"),
                     ActivitySlot.starts_at.label("starts"),
                     ActivitySlot.ends_at.label("ends"),

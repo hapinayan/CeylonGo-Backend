@@ -121,3 +121,26 @@ class ActivitySlotAvailability(BaseModel):
 
     available_places: int = Field(ge=0)
     is_available: bool
+
+
+class SessionCancellationRequest(BaseModel):
+    """Request payload for cancelling an entire activity session due to weather/safety."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        min_length=5,
+        max_length=1000,
+        description="Reason for session cancellation (weather, safety, emergency)",
+    )
+
+
+class SessionCancellationResponse(BaseModel):
+    """Response returned when an activity session is cancelled by provider."""
+
+    slot_id: int
+    activity_id: int
+    cancelled_bookings_count: int
+    released_capacity: int
+    is_active: bool
+    reason: str

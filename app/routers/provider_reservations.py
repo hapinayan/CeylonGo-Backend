@@ -69,7 +69,15 @@ class CancelReservation(BaseModel):
 
 
 class ReservationAction(CancelReservation):
-    action: Literal["accept", "reject", "cancel", "ready", "cash", "complete"]
+    action: Literal[
+        "accept",
+        "reject",
+        "cancel",
+        "ready",
+        "cash",
+        "record_cash",
+        "complete",
+    ]
 
 
 class ReservationResponse(BaseModel):
@@ -219,14 +227,26 @@ def project_booking(reader, row):
         elif status in ("confirmed", "active") and row.ends <= reader.now:
             actions.append("complete")
     elif category == "activity":
-        if status == "confirmed" and row.ends <= reader.now:
-            actions.append("complete")
+        if status == "pending":
+            if row.starts is not None and row.starts > reader.now:
+                actions.append("accept")
+            actions.append("reject")
         if (
             status in ("pending", "confirmed")
+            and row.starts is not None
             and row.starts > reader.now
             and row.payment_status == "unpaid"
         ):
             actions.append("cancel")
+        if status == "confirmed":
+            if (
+                row.payment_status == "unpaid"
+                and row.total_price > 0
+                and row._mapping.get("payment_method") == "pay_at_location"
+            ):
+                actions.append("cash")
+            if row.ends is not None and row.ends <= reader.now:
+                actions.append("complete")
     elif category == "eco_tourism":
         if status == "pending":
             actions.append("reject")

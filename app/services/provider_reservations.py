@@ -133,6 +133,8 @@ def change_activity_booking(db, provider, booking_id, action, reason):
     )
     result = db.execute(
         select(booking, ActivitySlot)
+        .with_hint(booking, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+        .with_hint(ActivitySlot, "WITH (UPDLOCK, ROWLOCK)", "mssql")
         .join(ActivitySlot, ActivitySlot.id == booking.activity_slot_id)
         .where(booking.id == booking_id, ActivitySlot.activity_id.in_(owned_activity))
     ).first()
@@ -141,24 +143,143 @@ def change_activity_booking(db, provider, booking_id, action, reason):
     row, slot = result
     now = utc_now()
     old = row.booking_status
-    if action == "complete" and old == "confirmed" and slot.ends_at <= now:
-        changes = {"booking_status": "completed"}
-    elif (
-        action == "cancel"
-        and old in ("pending", "confirmed")
-        and (
-            slot.starts_at > now
-            and row.payment_status == "unpaid"
-            and row.payment_method == "pay_at_location"
+
+    # Idempotent checks for repeated actions
+    if action == "accept" and old == "confirmed":
+        return
+    if action == "reject" and old == "rejected":
+        return
+    if action in ("cash", "record_cash") and row.payment_status == "paid":
+        return
+
+    # Cash payment recording workflow
+    if action in ("cash", "record_cash"):
+        if row.payment_method != "pay_at_location":
+            raise HTTPException(
+                409, "Only pay-at-location bookings can accept on-site cash payments"
+            )
+        if row.payment_status != "unpaid":
+            raise HTTPException(409, "Booking payment is not in an unpaid state")
+        if old not in ("confirmed", "completed"):
+            raise HTTPException(
+                409, "Only confirmed bookings can accept cash payments"
+            )
+
+        ref = db.scalar(
+            select(BookingReference)
+            .where(
+                BookingReference.module_type == "activity",
+                BookingReference.target_booking_id == row.id,
+                BookingReference.user_id == row.user_id,
+                BookingReference.provider_profile_id == provider.id,
+            )
+            .order_by(BookingReference.id)
+            .limit(1)
         )
-    ):
+        if ref is None:
+            ref = BookingReference(
+                module_type="activity",
+                target_booking_id=row.id,
+                provider_profile_id=provider.id,
+                user_id=row.user_id,
+                booking_reference=f"RS-{uuid4().hex}",
+                total_price=row.total_price,
+                currency=row.currency,
+                booking_status=row.booking_status,
+                payment_status="unpaid",
+            )
+            db.add(ref)
+            db.flush()
+
+        try:
+            if not cash_recorded(db, ref.id):
+                record_cash_payment_transaction(
+                    db=db,
+                    booking_reference=ref,
+                    user_id=row.user_id,
+                    amount=row.total_price,
+                    notes=reason or "Cash payment received on-site",
+                )
+
+            changed = db.execute(
+                update(booking)
+                .where(
+                    booking.id == row.id,
+                    booking.payment_status == "unpaid",
+                    booking.booking_status == old,
+                )
+                .values(payment_status="paid")
+                .execution_options(synchronize_session=False)
+            )
+            if changed.rowcount != 1:
+                raise HTTPException(
+                    409, "Payment status changed concurrently. Reload and retry."
+                )
+
+            ref.payment_status = "paid"
+            save_event(
+                db,
+                ref,
+                old,
+                old,
+                provider.user_id,
+                row.user_id,
+                "cash_payment_confirmed",
+            )
+            db.commit()
+            return
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception:
+            db.rollback()
+            raise
+
+    # Status transition workflows
+    if action == "accept":
+        if old != "pending":
+            raise HTTPException(409, "Only pending activity bookings can be accepted")
+        if slot.starts_at <= now:
+            raise HTTPException(409, "Cannot accept bookings for past activity sessions")
+        changes = {"booking_status": "confirmed"}
+
+    elif action == "reject":
+        if old not in ("pending", "confirmed"):
+            raise HTTPException(
+                409, "Only pending or confirmed activity bookings can be rejected"
+            )
         changes = {
-            "booking_status": "cancelled",
-            "cancellation_reason": reason,
+            "booking_status": "rejected",
+            "cancellation_reason": reason or "Rejected by activity provider",
             "cancelled_at": now,
         }
+
+    elif action == "complete":
+        if old != "confirmed" or slot.ends_at > now:
+            raise HTTPException(
+                409, "Action is unavailable for this activity booking"
+            )
+        changes = {"booking_status": "completed"}
+
+    elif action == "cancel":
+        if (
+            old in ("pending", "confirmed")
+            and slot.starts_at > now
+            and row.payment_status == "unpaid"
+            and row.payment_method == "pay_at_location"
+        ):
+            changes = {
+                "booking_status": "cancelled",
+                "cancellation_reason": reason or "Cancelled by provider",
+                "cancelled_at": now,
+            }
+        else:
+            raise HTTPException(
+                409, "Action is unavailable for this activity booking"
+            )
     else:
         raise HTTPException(409, "Action is unavailable for this activity booking")
+
     changed = db.execute(
         update(booking)
         .where(
@@ -177,12 +298,14 @@ def change_activity_booking(db, provider, booking_id, action, reason):
     )
     if changed.rowcount != 1:
         raise HTTPException(409, "Booking changed. Reload and retry.")
+
     new = changes["booking_status"]
-    if new == "cancelled" and not release_activity_capacity(
+    if new in ("cancelled", "rejected") and not release_activity_capacity(
         db, slot.id, row.participants
     ):
         db.rollback()
         raise HTTPException(409, "Unable to release reserved capacity")
+
     record_native_event(
         db, row, "activity", provider.id, old, new, provider.user_id, row.user_id
     )

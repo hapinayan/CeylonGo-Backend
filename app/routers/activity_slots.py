@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.publication import public_activity, public_eco
@@ -13,6 +13,7 @@ from app.models.activity_booking import ActivityBooking
 from app.models.eco_experience import EcoExperience
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
+from app.models.shared import BookingReference
 from app.routers.provider_activities import (
     get_owned_activity,
     require_activity_provider,
@@ -22,8 +23,11 @@ from app.schemas.activity_slot import (
     ActivitySlotCreate,
     ActivitySlotResponse,
     ActivitySlotUpdate,
+    SessionCancellationRequest,
+    SessionCancellationResponse,
 )
 from app.services.activity_capacity import update_slot_capacity
+from app.services.provider_reservations import save_event
 
 
 router = APIRouter(tags=["Activity Slots"])
@@ -225,6 +229,7 @@ def update_activity_slot(
 
     slot = (
         db.query(ActivitySlot)
+        .with_hint(ActivitySlot, "WITH (UPDLOCK, HOLDLOCK)", "mssql")
         .filter(
             ActivitySlot.id == slot_id,
             ActivitySlot.activity_id == activity.id,
@@ -362,6 +367,7 @@ def delete_activity_slot(
 
     slot = (
         db.query(ActivitySlot)
+        .with_hint(ActivitySlot, "WITH (UPDLOCK, HOLDLOCK)", "mssql")
         .filter(
             ActivitySlot.id == slot_id,
             ActivitySlot.activity_id == activity.id,
@@ -403,4 +409,128 @@ def delete_activity_slot(
         raise
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/api/v1/provider/activities/{activity_id}/slots/{slot_id}/cancel-session",
+    response_model=SessionCancellationResponse,
+    summary="Cancel an activity session due to adverse weather or safety conditions",
+)
+def cancel_activity_session(
+    activity_id: int,
+    slot_id: int,
+    payload: SessionCancellationRequest,
+    provider_profile: Annotated[
+        ProviderProfile,
+        Depends(require_activity_provider),
+    ],
+    db: Annotated[Session, Depends(get_db)],
+):
+    activity = get_owned_activity(
+        activity_id,
+        provider_profile,
+        db,
+        for_update=True,
+    )
+
+    slot = (
+        db.query(ActivitySlot)
+        .with_hint(ActivitySlot, "WITH (UPDLOCK, HOLDLOCK)", "mssql")
+        .filter(
+            ActivitySlot.id == slot_id,
+            ActivitySlot.activity_id == activity.id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+    if not slot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity slot not found",
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Check if slot already ended
+    if slot.ends_at <= now:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot cancel an activity session that has already concluded",
+        )
+
+    # If slot is already inactive and has no active bookings, return idempotent response
+    active_bookings = (
+        db.query(ActivityBooking)
+        .filter(
+            ActivityBooking.activity_slot_id == slot.id,
+            ActivityBooking.booking_status.in_(["pending", "confirmed"]),
+        )
+        .all()
+    )
+
+    if not slot.is_active and len(active_bookings) == 0:
+        return SessionCancellationResponse(
+            slot_id=slot.id,
+            activity_id=activity.id,
+            cancelled_bookings_count=0,
+            released_capacity=0,
+            is_active=False,
+            reason=payload.reason,
+        )
+
+    released_capacity = slot.reserved_count
+
+    try:
+        # Mark slot inactive and reset reserved capacity
+        slot.is_active = False
+        slot.reserved_count = 0
+
+        # Cancel all active bookings and notify travelers
+        cancellation_msg = f"Session cancelled by organizer: {payload.reason}"
+        for b in active_bookings:
+            old_status = b.booking_status
+            b.booking_status = "cancelled"
+            b.cancellation_reason = cancellation_msg
+            b.cancelled_at = now
+            b.updated_at = now
+
+            # Sync shared booking reference if present
+            ref = db.scalar(
+                select(BookingReference)
+                .where(
+                    BookingReference.module_type == "activity",
+                    BookingReference.target_booking_id == b.id,
+                    BookingReference.user_id == b.user_id,
+                    BookingReference.provider_profile_id == provider_profile.id,
+                )
+                .order_by(BookingReference.id)
+                .limit(1)
+            )
+            if ref is not None:
+                ref.booking_status = "cancelled"
+                save_event(
+                    db=db,
+                    ref=ref,
+                    old=old_status,
+                    new="cancelled",
+                    actor=provider_profile.user_id,
+                    recipient=b.user_id,
+                    action="session_cancelled",
+                )
+
+        db.commit()
+
+        return SessionCancellationResponse(
+            slot_id=slot.id,
+            activity_id=activity.id,
+            cancelled_bookings_count=len(active_bookings),
+            released_capacity=released_capacity,
+            is_active=False,
+            reason=payload.reason,
+        )
+
+    except Exception:
+        db.rollback()
+        raise
 

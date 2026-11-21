@@ -120,6 +120,9 @@ from app.routers.provider_activities import (
 from app.routers.admin_activities import (
     router as admin_activities_router,
 )
+from app.routers.admin_activity_bookings import (
+    router as admin_activity_bookings_router,
+)
 from app.routers.activity_slots import (
     router as activity_slots_router,
 )
@@ -373,6 +376,7 @@ app.include_router(activity_reviews_router)
 app.include_router(activity_wishlists_router)
 app.include_router(provider_activities_router)
 app.include_router(admin_activities_router)
+app.include_router(admin_activity_bookings_router)
 app.include_router(activity_slots_router)
 app.include_router(activity_bookings_router)
 

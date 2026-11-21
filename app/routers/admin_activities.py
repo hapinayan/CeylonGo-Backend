@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_admin
+from app.core.listing_sync import sync_activity_listing_reference
 from app.core.location_validation import ACTIVITY_REVIEW_STATE, write_review_snapshot
 from app.database.connection import get_db
 from app.models.activity import Activity
@@ -101,6 +102,7 @@ def approve_activity(
             "reviewed_at": datetime.now(timezone.utc).replace(tzinfo=None),
             "rejection_reason": None,
         })
+        sync_activity_listing_reference(db, activity)
         db.commit()
         db.refresh(activity)
     except Exception:
@@ -136,6 +138,7 @@ def reject_activity(
         tzinfo=None
     )
     activity.rejection_reason = payload.reason
+    sync_activity_listing_reference(db, activity)
 
     try:
         db.commit()

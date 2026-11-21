@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 from app.core.dependencies import require_approved_provider
+from app.core.listing_sync import sync_activity_listing_reference
 from app.core.location_validation import (
     ACTIVITY_REVIEW_STATE,
     validate_coordinate_pair,
@@ -233,6 +234,7 @@ def update_activity(
     try:
         if updates:
             write_review_snapshot(db, activity, ACTIVITY_REVIEW_STATE, updates)
+        sync_activity_listing_reference(db, activity)
         db.commit()
         db.refresh(activity)
     except Exception:
@@ -309,6 +311,8 @@ def set_activity_active_status(
         activity.is_active = True
     else:
         activity.is_active = False
+
+    sync_activity_listing_reference(db, activity)
 
     try:
         db.commit()

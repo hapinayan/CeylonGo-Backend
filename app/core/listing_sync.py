@@ -3,7 +3,9 @@ from decimal import Decimal
 import uuid
 from sqlalchemy.orm import Session
 
-from app.core.booking_transactions import capture_status
+from app.core.booking_transactions import capture_status, lock_booking_resource
+from app.models.activity import Activity
+from app.models.activity_booking import ActivityBooking
 from app.models.booking import Booking
 from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
@@ -170,3 +172,104 @@ def record_cash_payment_transaction(
     )
     db.add(tx)
     return tx
+
+
+def sync_activity_listing_reference(db: Session, activity: Activity) -> ListingReference | None:
+    """Synchronize an approved activity listing with the central listing_references table."""
+    if activity.id is None:
+        return None
+
+    provider_profile_id = activity.provider_profile_id
+    if provider_profile_id is None:
+        return None
+
+    lock_booking_resource(db, f"sync_activity_listing_{activity.id}")
+
+    is_ref_active = bool(activity.is_active and activity.approval_status == "approved")
+    district = activity.district or "General"
+    city = activity.city
+
+    ref = (
+        db.query(ListingReference)
+        .filter(
+            ListingReference.module_type == "activity",
+            ListingReference.target_id == activity.id,
+        )
+        .first()
+    )
+
+    if ref is None:
+        if is_ref_active and provider_profile_id is not None:
+            ref = ListingReference(
+                module_type="activity",
+                target_id=activity.id,
+                provider_profile_id=provider_profile_id,
+                title=activity.title,
+                district=district,
+                city=city,
+                latitude=activity.latitude,
+                longitude=activity.longitude,
+                is_active=is_ref_active,
+            )
+            db.add(ref)
+            db.flush()
+    else:
+        ref.title = activity.title
+        ref.district = district
+        ref.city = city
+        ref.latitude = activity.latitude
+        ref.longitude = activity.longitude
+        ref.is_active = is_ref_active
+        if provider_profile_id is not None:
+            ref.provider_profile_id = provider_profile_id
+
+    return ref
+
+
+def sync_activity_booking_reference(
+    db: Session,
+    booking: ActivityBooking,
+    activity: Activity,
+) -> BookingReference | None:
+    """Synchronize an activity booking with the central booking_references table."""
+    if booking.id is None:
+        return None
+
+    provider_profile_id = activity.provider_profile_id
+    if provider_profile_id is None:
+        return None
+
+    lock_booking_resource(db, f"sync_activity_booking_{booking.id}")
+
+    ref = (
+        db.query(BookingReference)
+        .filter(
+            BookingReference.module_type == "activity",
+            BookingReference.target_booking_id == booking.id,
+        )
+        .first()
+    )
+
+    if ref is None:
+        ref_code = f"BK-ACT-{booking.id}-{uuid.uuid4().hex[:8].upper()}"
+        ref = BookingReference(
+            booking_reference=ref_code,
+            module_type="activity",
+            target_booking_id=booking.id,
+            user_id=booking.user_id,
+            provider_profile_id=provider_profile_id,
+            total_price=booking.total_price,
+            currency=booking.currency or "LKR",
+            booking_status=booking.booking_status,
+            payment_status=booking.payment_status or "unpaid",
+        )
+        db.add(ref)
+        db.flush()
+    else:
+        ref.total_price = booking.total_price
+        ref.booking_status = booking.booking_status
+        ref.payment_status = booking.payment_status or "unpaid"
+        if booking.currency:
+            ref.currency = booking.currency
+
+    return ref

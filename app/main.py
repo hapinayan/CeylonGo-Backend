@@ -126,6 +126,12 @@ from app.routers.activity_slots import (
 from app.routers.activity_bookings import (
     router as activity_bookings_router,
 )
+from app.routers.activity_reviews import (
+    router as activity_reviews_router,
+)
+from app.routers.activity_wishlists import (
+    router as activity_wishlists_router,
+)
 
 # ==========================================
 # ECO-TOURISM ROUTER IMPORTS
@@ -363,6 +369,8 @@ app.include_router(eco_reservations_router)
 
 app.include_router(activities_public_router)
 app.include_router(activity_uploads_router)
+app.include_router(activity_reviews_router)
+app.include_router(activity_wishlists_router)
 app.include_router(provider_activities_router)
 app.include_router(admin_activities_router)
 app.include_router(activity_slots_router)

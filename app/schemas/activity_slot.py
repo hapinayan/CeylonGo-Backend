@@ -1,5 +1,6 @@
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -144,3 +145,53 @@ class SessionCancellationResponse(BaseModel):
     released_capacity: int
     is_active: bool
     reason: str
+
+
+# ==============================================================================
+# Availability Calendar Schemas (A07)
+# ==============================================================================
+
+
+class ActivitySlotCalendarItem(BaseModel):
+    """Granular slot availability details for calendar representation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    activity_id: int
+    starts_at: datetime
+    ends_at: datetime
+    capacity: int
+    reserved_count: int
+    remaining_capacity: int = Field(ge=0)
+    availability_status: Literal["available", "limited", "sold_out"]
+    is_available: bool
+
+
+class ActivityDailyAvailabilitySummary(BaseModel):
+    """Day-level calendar summary aggregating slots."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    date: date
+    total_slots: int
+    available_slots: int
+    total_capacity: int
+    total_reserved: int
+    total_remaining: int
+    has_availability: bool
+
+
+class ActivityAvailabilityResponse(BaseModel):
+    """Public activity availability calendar response (A07)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: int
+    activity_title: str
+    date_from: date
+    date_to: date
+    total_slots: int
+    available_slots: int
+    days: list[ActivityDailyAvailabilitySummary] = []
+    slots: list[ActivitySlotCalendarItem] = []

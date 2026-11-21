@@ -1,8 +1,8 @@
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,10 @@ from app.routers.provider_activities import (
     require_activity_provider,
 )
 from app.schemas.activity_slot import (
+    ActivityAvailabilityResponse,
+    ActivityDailyAvailabilitySummary,
     ActivitySlotAvailability,
+    ActivitySlotCalendarItem,
     ActivitySlotCreate,
     ActivitySlotResponse,
     ActivitySlotUpdate,
@@ -149,10 +152,15 @@ def list_provider_activity_slots(
 @router.get(
     "/api/v1/activities/{activity_id}/slots",
     response_model=list[ActivitySlotAvailability],
+    summary="List available slots for an approved activity",
 )
 def list_public_activity_slots(
     activity_id: int,
     db: Annotated[Session, Depends(get_db)],
+    date_from: date | None = Query(default=None, description="Filter slots starting on or after date (YYYY-MM-DD)"),
+    date_to: date | None = Query(default=None, description="Filter slots starting on or before date (YYYY-MM-DD)"),
+    start_date: date | None = Query(default=None, description="Alias for date_from"),
+    end_date: date | None = Query(default=None, description="Alias for date_to"),
 ):
     activity = (
         db.query(Activity)
@@ -169,9 +177,17 @@ def list_public_activity_slots(
             detail="Activity not found",
         )
 
+    eff_from = date_from or start_date
+    eff_to = date_to or end_date
+    if eff_from and eff_to and eff_from > eff_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_date / date_from cannot be after end_date / date_to",
+        )
+
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    slots = (
+    query = (
         db.query(ActivitySlot)
         .filter(
             ActivitySlot.activity_id == activity_id,
@@ -181,9 +197,14 @@ def list_public_activity_slots(
                 EcoExperience.id == ActivitySlot.eco_experience_id, public_eco(),
             ).exists()),
         )
-        .order_by(ActivitySlot.starts_at.asc())
-        .all()
     )
+
+    if eff_from:
+        query = query.filter(ActivitySlot.starts_at >= datetime.combine(eff_from, datetime.min.time()))
+    if eff_to:
+        query = query.filter(ActivitySlot.starts_at <= datetime.combine(eff_to, datetime.max.time()))
+
+    slots = query.order_by(ActivitySlot.starts_at.asc(), ActivitySlot.id.asc()).all()
 
     return [
         ActivitySlotAvailability(
@@ -203,6 +224,148 @@ def list_public_activity_slots(
         )
         for slot in slots
     ]
+
+
+@router.get(
+    "/api/v1/activities/{activity_id}/availability",
+    response_model=ActivityAvailabilityResponse,
+    summary="Get public activity availability calendar (A07)",
+)
+def get_activity_availability_calendar(
+    activity_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    date_from: date | None = Query(default=None, description="Start date for availability calendar (YYYY-MM-DD)"),
+    date_to: date | None = Query(default=None, description="End date for availability calendar (YYYY-MM-DD)"),
+    start_date: date | None = Query(default=None, description="Alias for date_from"),
+    end_date: date | None = Query(default=None, description="Alias for date_to"),
+):
+    """
+    Public availability calendar endpoint for travelers (A07).
+    Returns real-time capacity, availability status (available, limited, sold_out),
+    and day-level calendar summary aggregates for approved activities.
+    """
+    activity = (
+        db.query(Activity)
+        .filter(
+            Activity.id == activity_id,
+            public_activity(),
+        )
+        .first()
+    )
+
+    if activity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity not found",
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today = now.date()
+
+    eff_from = date_from or start_date or today
+    eff_to = date_to or end_date or (eff_from + timedelta(days=30))
+
+    if eff_from > eff_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_date / date_from cannot be after end_date / date_to",
+        )
+
+    if (eff_to - eff_from).days > 180:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Date range exceeds maximum allowed window of 180 days",
+        )
+
+    window_start = max(now, datetime.combine(eff_from, datetime.min.time()))
+    window_end = datetime.combine(eff_to, datetime.max.time())
+
+    slots = (
+        db.query(ActivitySlot)
+        .filter(
+            ActivitySlot.activity_id == activity_id,
+            ActivitySlot.is_active == True,
+            ActivitySlot.starts_at >= window_start,
+            ActivitySlot.starts_at <= window_end,
+            or_(
+                ActivitySlot.eco_experience_id.is_(None),
+                db.query(EcoExperience.id).filter(
+                    EcoExperience.id == ActivitySlot.eco_experience_id, public_eco(),
+                ).exists(),
+            ),
+        )
+        .order_by(ActivitySlot.starts_at.asc(), ActivitySlot.id.asc())
+        .all()
+    )
+
+    calendar_slots = []
+    days_map: dict[date, dict[str, int]] = {}
+
+    for s in slots:
+        rem = max(0, s.capacity - s.reserved_count)
+        is_avail = (rem > 0 and s.is_active)
+        if rem == 0 or not s.is_active:
+            avail_status = "sold_out"
+        elif rem <= 2 or (s.capacity > 0 and (s.reserved_count / s.capacity) >= 0.8):
+            avail_status = "limited"
+        else:
+            avail_status = "available"
+
+        calendar_slots.append(
+            ActivitySlotCalendarItem(
+                id=s.id,
+                activity_id=s.activity_id,
+                starts_at=s.starts_at,
+                ends_at=s.ends_at,
+                capacity=s.capacity,
+                reserved_count=s.reserved_count,
+                remaining_capacity=rem,
+                availability_status=avail_status,
+                is_available=is_avail,
+            )
+        )
+
+        d = s.starts_at.date()
+        if d not in days_map:
+            days_map[d] = {
+                "total_slots": 0,
+                "available_slots": 0,
+                "total_capacity": 0,
+                "total_reserved": 0,
+                "total_remaining": 0,
+            }
+        days_map[d]["total_slots"] += 1
+        if is_avail:
+            days_map[d]["available_slots"] += 1
+        days_map[d]["total_capacity"] += s.capacity
+        days_map[d]["total_reserved"] += s.reserved_count
+        days_map[d]["total_remaining"] += rem
+
+    days_summary = [
+        ActivityDailyAvailabilitySummary(
+            date=d,
+            total_slots=stats["total_slots"],
+            available_slots=stats["available_slots"],
+            total_capacity=stats["total_capacity"],
+            total_reserved=stats["total_reserved"],
+            total_remaining=stats["total_remaining"],
+            has_availability=(stats["available_slots"] > 0),
+        )
+        for d, stats in sorted(days_map.items())
+    ]
+
+    available_slots_count = sum(1 for s in calendar_slots if s.is_available)
+
+    return ActivityAvailabilityResponse(
+        activity_id=activity.id,
+        activity_title=activity.title,
+        date_from=eff_from,
+        date_to=eff_to,
+        total_slots=len(calendar_slots),
+        available_slots=available_slots_count,
+        days=days_summary,
+        slots=calendar_slots,
+    )
 
 
 @router.patch(

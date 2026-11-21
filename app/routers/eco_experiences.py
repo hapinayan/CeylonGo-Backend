@@ -72,6 +72,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.booking_transactions import EXECUTED_REFUNDS
 from app.core.publication import public_eco
+from app.models.eco_reservation import EcoAvailabilitySlot, EcoReservation
+from app.services import eco_financial_reporting, eco_reservations
+from app.services.eco_sponsorship import active_campaign
 from app.routers.auth import get_optional_current_user
 from app.core.dependencies import (
     require_admin,
@@ -502,10 +505,8 @@ def list_eco_experiences(
         db.query(EcoSponsoredPromotion.id)
         .filter(
             EcoSponsoredPromotion.eco_experience_id == EcoExperience.id,
-            EcoSponsoredPromotion.campaign_status == "active",
-            EcoSponsoredPromotion.payment_status == "paid",
-            EcoSponsoredPromotion.starts_at <= now,
-            EcoSponsoredPromotion.ends_at > now,
+            EcoSponsoredPromotion.provider_profile_id == EcoExperience.provider_profile_id,
+            *active_campaign(now),
         )
         .correlate(EcoExperience)
         .exists()
@@ -538,12 +539,11 @@ def list_eco_experiences(
                 EcoSponsoredPromotion.eco_experience_id,
                 EcoSponsoredPromotion.id,
             )
+            .join(EcoExperience, EcoExperience.id == EcoSponsoredPromotion.eco_experience_id)
             .filter(
                 EcoSponsoredPromotion.eco_experience_id.in_(match_ids),
-                EcoSponsoredPromotion.campaign_status == "active",
-                EcoSponsoredPromotion.payment_status == "paid",
-                EcoSponsoredPromotion.starts_at <= now,
-                EcoSponsoredPromotion.ends_at > now,
+                EcoSponsoredPromotion.provider_profile_id == EcoExperience.provider_profile_id,
+                *active_campaign(now),
             )
             .all()
         )
@@ -687,14 +687,13 @@ def list_eco_experiences(
                         EcoSponsoredPromotion.eco_experience_id,
                         EcoSponsoredPromotion.id,
                     )
+                    .join(EcoExperience, EcoExperience.id == EcoSponsoredPromotion.eco_experience_id)
                     .filter(
                         EcoSponsoredPromotion.eco_experience_id.in_(
                             boost_exp_ids
                         ),
-                        EcoSponsoredPromotion.campaign_status == "active",
-                        EcoSponsoredPromotion.payment_status == "paid",
-                        EcoSponsoredPromotion.starts_at <= now,
-                        EcoSponsoredPromotion.ends_at > now,
+                        EcoSponsoredPromotion.provider_profile_id == EcoExperience.provider_profile_id,
+                        *active_campaign(now),
                     )
                     .all()
                 )
@@ -797,10 +796,8 @@ def get_eco_experience_detail(
         db.query(EcoSponsoredPromotion.id)
         .filter(
             EcoSponsoredPromotion.eco_experience_id == experience.id,
-            EcoSponsoredPromotion.campaign_status == "active",
-            EcoSponsoredPromotion.payment_status == "paid",
-            EcoSponsoredPromotion.starts_at <= now,
-            EcoSponsoredPromotion.ends_at > now,
+            EcoSponsoredPromotion.provider_profile_id == experience.provider_profile_id,
+            *active_campaign(now),
         )
         .first()
         is not None
@@ -1098,6 +1095,9 @@ def get_my_eco_earnings_summary(
     # Pending settlement balance: net earnings minus already disbursed and approved pending payouts
     pending_settlement = max(Decimal("0.00"), net_earnings - total_disbursed_payouts - approved_pending_payouts)
 
+    native_financials = eco_financial_reporting.totals(
+        db, eco_financial_reporting.scope(provider_id=provider_profile.id)
+    )
     return EcoProviderEarningsSummaryResponse(
         provider_profile_id=provider_profile.id,
         total_bookings=total_b,
@@ -1114,6 +1114,10 @@ def get_my_eco_earnings_summary(
         pending_settlement=pending_settlement,
         pending_cash_to_collect=pending_cash,
         refunded_amount=refunded_amt,
+        native_financials=native_financials,
+        provider_settlements_by_currency=eco_financial_reporting.settlement_totals(
+            db, provider_profile.id
+        ),
         currency="LKR",
     )
 
@@ -1323,7 +1327,10 @@ def get_my_eco_reviews(
     listing_to_exp = {lr[0]: lr[1] for lr in listing_refs}
 
     query = (
-        db.query(Review, User.full_name, BookingReference.booking_reference, BookingReference.target_booking_id)
+        db.query(
+            Review, User.full_name, BookingReference.booking_reference,
+            BookingReference.target_booking_id, BookingReference.module_type,
+        )
         .join(User, Review.user_id == User.id)
         .outerjoin(BookingReference, Review.booking_reference_id == BookingReference.id)
         .filter(Review.listing_reference_id.in_(listing_ref_ids))
@@ -1362,7 +1369,7 @@ def get_my_eco_reviews(
     )
 
     items = []
-    for review, reviewer_name, booking_ref_code, target_b_id in rows:
+    for review, reviewer_name, booking_ref_code, target_b_id, booking_source in rows:
         exp_id = listing_to_exp.get(review.listing_reference_id, target_exp_ids[0])
         exp_title = exp_title_map.get(exp_id, "Eco Experience")
         items.append(
@@ -1371,6 +1378,7 @@ def get_my_eco_reviews(
                 eco_experience_id=exp_id,
                 eco_experience_title=exp_title,
                 booking_id=target_b_id,
+                booking_source=booking_source,
                 booking_reference=booking_ref_code,
                 user_id=review.user_id,
                 reviewer_name=reviewer_name or "Verified Traveler",
@@ -1421,12 +1429,12 @@ def submit_eco_experience_review(
     9. Atomic transaction with db.rollback() on failure.
     10. Safe response exposing only reviewer display name, no private contact info.
     """
+    eco_reservations.lock_schedule(db, experience_id)
     experience = (
         db.query(EcoExperience)
         .filter(
             EcoExperience.id == experience_id,
-            EcoExperience.listing_status == "approved",
-            EcoExperience.is_published == True,
+            public_eco(),
         )
         .first()
     )
@@ -1436,35 +1444,53 @@ def submit_eco_experience_review(
             detail="Eco experience not found or not eligible for reviews",
         )
 
-    booking = (
-        db.query(ActivityBooking)
-        .filter(
-            ActivityBooking.id == payload.booking_id,
-            ActivityBooking.eco_experience_id == experience_id,
-            ActivityBooking.user_id == current_user.id,
+    booking_ref = None
+    if payload.booking_source == "eco_experience":
+        native = db.execute(
+            eco_reservations.reservation_query(traveler_id=current_user.id).where(
+                EcoReservation.id == payload.booking_id,
+                EcoAvailabilitySlot.eco_experience_id == experience_id,
+            )
+        ).first()
+        booking = native[0] if native else None
+        if native:
+            booking_ref = native[2]
+            booking_status = booking.status
+            if booking_ref.booking_status != booking_status or booking.completed_at is None:
+                booking_status = None
+    else:
+        booking = (
+            db.query(ActivityBooking)
+            .filter(
+                ActivityBooking.id == payload.booking_id,
+                ActivityBooking.eco_experience_id == experience_id,
+                ActivityBooking.user_id == current_user.id,
+            )
+            .first()
         )
-        .first()
-    )
+        booking_status = booking.booking_status if booking else None
     if not booking:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Eligible booking not found for this eco experience",
         )
 
-    if booking.booking_status != "completed":
+    if booking_status != "completed":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Reviews can only be submitted for completed bookings",
         )
 
     listing_ref = _get_or_create_eco_listing_reference(db, experience)
-    booking_ref = _get_or_create_eco_booking_reference(db, booking, experience)
+    if booking_ref is None:
+        booking_ref = _get_or_create_eco_booking_reference(db, booking, experience)
+    if booking_ref.user_id != current_user.id or booking_ref.provider_profile_id != experience.provider_profile_id:
+        raise HTTPException(409, "Booking reference does not match the Eco booking")
 
     # Check duplicate review
     existing_review = (
         db.query(Review)
         .filter(
-            Review.listing_reference_id == listing_ref.id,
             Review.booking_reference_id == booking_ref.id,
         )
         .first()
@@ -1514,9 +1540,9 @@ def submit_eco_experience_review(
 
         db.commit()
         db.refresh(review)
-    except Exception as exc:
+    except Exception:
         db.rollback()
-        logger.error(f"Failed to submit eco experience review: {exc}", exc_info=True)
+        logger.error("Failed to submit Eco experience review")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to submit review due to an internal error",
@@ -1526,6 +1552,7 @@ def submit_eco_experience_review(
         id=review.id,
         eco_experience_id=experience.id,
         booking_id=booking.id,
+        booking_source=payload.booking_source,
         user_id=current_user.id,
         reviewer_name=current_user.full_name or "Verified Traveler",
         rating=review.rating,
@@ -1591,7 +1618,7 @@ def list_eco_experience_reviews(
         )
 
     query = (
-        db.query(Review, User.full_name, BookingReference.target_booking_id)
+        db.query(Review, User.full_name, BookingReference.target_booking_id, BookingReference.module_type)
         .join(User, Review.user_id == User.id)
         .outerjoin(BookingReference, Review.booking_reference_id == BookingReference.id)
         .filter(
@@ -1635,6 +1662,7 @@ def list_eco_experience_reviews(
             id=review.id,
             eco_experience_id=experience.id,
             booking_id=target_b_id,
+            booking_source=booking_source,
             user_id=review.user_id,
             reviewer_name=full_name or "Verified Traveler",
             rating=review.rating,
@@ -1644,7 +1672,7 @@ def list_eco_experience_reviews(
             is_published=review.is_published,
             created_at=review.created_at,
         )
-        for review, full_name, target_b_id in rows
+        for review, full_name, target_b_id, booking_source in rows
     ]
 
     return EcoReviewListResponse(
@@ -2619,6 +2647,15 @@ def audit_admin_eco_payments(
         page=page,
         page_size=page_size,
         total_pages=total_pages,
+        native_financials=eco_financial_reporting.totals(
+            db,
+            eco_financial_reporting.scope(
+                provider_id=provider_id, payment_status=payment_status,
+                payment_method=payment_method,
+                start=datetime.combine(start_date, time.min) if start_date else None,
+                end=datetime.combine(end_date, time.max) if end_date else None,
+            ),
+        ),
     )
 
 

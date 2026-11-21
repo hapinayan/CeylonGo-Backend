@@ -17,16 +17,57 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     Numeric,
     Unicode,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.eco_experience import EcoExperience
 from app.models.provider_profile import ProviderProfile
 from app.models.user import Base, User
+
+
+class EcoSponsorshipCapture(Base):
+    __tablename__ = "eco_sponsorship_captures"
+    __table_args__ = (
+        Index(
+            "UX_eco_sponsor_applied", "promotion_id", unique=True,
+            mssql_where=text("applied = 1"), sqlite_where=text("applied = 1"),
+        ),
+    )
+
+    gateway_id: Mapped[str] = mapped_column(Unicode(100), primary_key=True)
+    promotion_id: Mapped[int] = mapped_column(ForeignKey("eco_sponsored_promotions.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(Unicode(3))
+    applied: Mapped[bool]
+    captured_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class EcoPromotionEventReceipt(Base):
+    __tablename__ = "eco_promotion_event_receipts"
+    __table_args__ = (
+        CheckConstraint("event_type IN ('impression', 'click')", name="CK_eco_event_type"),
+    )
+
+    nonce: Mapped[str] = mapped_column(Unicode(32), primary_key=True)
+    event_type: Mapped[str] = mapped_column(Unicode(10), primary_key=True)
+    promotion_id: Mapped[int] = mapped_column(ForeignKey("eco_sponsored_promotions.id"))
+
+
+class EcoPromotionAttribution(Base):
+    __tablename__ = "eco_promotion_attributions"
+
+    booking_reference_id: Mapped[int] = mapped_column(
+        ForeignKey("booking_references.id"), primary_key=True
+    )
+    nonce: Mapped[str] = mapped_column(Unicode(32), unique=True)
+    promotion_id: Mapped[int] = mapped_column(ForeignKey("eco_sponsored_promotions.id"), index=True)
+    recorded_on: Mapped[date] = mapped_column(Date)
 
 # ==============================================================================
 # Domain Constants
@@ -259,7 +300,7 @@ class EcoSponsoredPromotion(Base):
         ):
             starts = self.starts_at.replace(tzinfo=UTC) if self.starts_at.tzinfo is None else self.starts_at
             ends = self.ends_at.replace(tzinfo=UTC) if self.ends_at.tzinfo is None else self.ends_at
-            return starts <= now <= ends
+            return starts <= now < ends
         return False
 
 

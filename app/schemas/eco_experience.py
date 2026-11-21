@@ -1116,6 +1116,63 @@ class EcoAdminPaymentAuditResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    native_financials: list["EcoNativeFinanceTotals"] = Field(default_factory=list)
+
+
+class EcoNativeFinanceAmounts(BaseModel):
+    captured_online: Decimal = Decimal("0.00")
+    unapplied_captures: Decimal = Decimal("0.00")
+    pending_refunds: Decimal = Decimal("0.00")
+    verified_refunds: Decimal = Decimal("0.00")
+    verified_applied_refunds: Decimal = Decimal("0.00")
+    cash_receipts: Decimal = Decimal("0.00")
+    recorded_online_commission: Decimal = Decimal("0.00")
+
+
+class EcoNativeFinanceTotals(EcoNativeFinanceAmounts):
+    currency: str
+    bookings: int
+    paid_bookings: int
+
+
+class EcoNativeRefundReportItem(BaseModel):
+    id: int
+    amount: Decimal
+    state: str
+
+
+class EcoNativeAdminBookingItem(BaseModel):
+    id: int
+    booking_reference: str
+    experience_id: int
+    provider_id: int
+    traveler_id: int
+    status: str
+    payment_status: str
+    currency: str
+    payment_method: str
+    created_at: datetime
+    cancelled_at: datetime | None
+    total_price: Decimal
+    finance: EcoNativeFinanceAmounts
+    refunds: list[EcoNativeRefundReportItem]
+
+
+class EcoNativeAdminReport(BaseModel):
+    items: list[EcoNativeAdminBookingItem]
+    total: int
+    page: int
+    page_size: int
+    totals_by_currency: list[EcoNativeFinanceTotals]
+    provider_settlements_by_currency: list["EcoSettlementTotals"]
+
+
+class EcoSettlementTotals(BaseModel):
+    currency: str
+    disbursed: Decimal
+    pending: Decimal
+    on_hold: Decimal
+    recorded_platform_fees: Decimal
 
 
 class EcoProviderEarningsSummaryResponse(BaseModel):
@@ -1140,6 +1197,8 @@ class EcoProviderEarningsSummaryResponse(BaseModel):
     pending_settlement: Decimal = Decimal("0.00")
     pending_cash_to_collect: Decimal = Decimal("0.00")
     refunded_amount: Decimal = Decimal("0.00")
+    native_financials: list[EcoNativeFinanceTotals] = Field(default_factory=list)
+    provider_settlements_by_currency: list[EcoSettlementTotals] = Field(default_factory=list)
     currency: str = "LKR"
 
 
@@ -1191,6 +1250,7 @@ class EcoReviewCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     booking_id: int = Field(..., description="Eligible completed eco-tourism booking ID")
+    booking_source: Literal["activity", "eco_experience"] = "activity"
     rating: Decimal = Field(
         ...,
         ge=Decimal("1.00"),
@@ -1229,6 +1289,7 @@ class EcoReviewResponse(BaseModel):
     id: int
     eco_experience_id: int
     booking_id: int | None = None
+    booking_source: str | None = None
     user_id: int
     reviewer_name: str
     rating: Decimal
@@ -1265,6 +1326,7 @@ class EcoProviderReviewItem(BaseModel):
     eco_experience_id: int
     eco_experience_title: str
     booking_id: int | None = None
+    booking_source: str | None = None
     booking_reference: str | None = None
     user_id: int
     reviewer_name: str

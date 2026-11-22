@@ -17,6 +17,7 @@ from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.routers.provider_activities import require_activity_provider
 from app.schemas.activity_promotion import (
+    ActivityCampaignAnalyticsSummary,
     ActivityCampaignCreate,
     ActivityCampaignPagination,
     ActivityCampaignResponse,
@@ -25,12 +26,15 @@ from app.schemas.activity_promotion import (
     ActivityDiscountPagination,
     ActivityDiscountResponse,
     ActivityDiscountUpdate,
+    ActivityProviderPromotionsAnalytics,
 )
 from app.services.activity_promotions import (
     cancel_provider_campaign,
     create_provider_campaign,
     create_provider_discount,
     deactivate_provider_discount,
+    get_activity_campaign_analytics,
+    get_provider_activities_promotions_analytics,
     get_provider_campaign,
     get_provider_discount,
     list_provider_campaigns,
@@ -239,3 +243,57 @@ def cancel_sponsored_campaign(
     Cancel an owned activity sponsored campaign (B16).
     """
     return cancel_provider_campaign(db, profile, campaign_id)
+
+
+# ==============================================================================
+# B18: Provider Promotion Analytics Endpoints (dbo.promotion_events)
+# ==============================================================================
+
+
+@router.get(
+    "/promotions/analytics",
+    response_model=ActivityProviderPromotionsAnalytics,
+    summary="Provider activity promotions aggregate analytics (B18)",
+)
+def get_provider_promotions_analytics(
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Retrieve provider-wide aggregate performance analytics across all activity campaigns (B18).
+    Includes impressions, clicks, inquiries, bookings, CTR, conversion rate, and spend totals.
+    """
+    return get_provider_activities_promotions_analytics(db, profile)
+
+
+@router.get(
+    "/promotions/campaigns/{campaign_id}/analytics",
+    response_model=ActivityCampaignAnalyticsSummary,
+    summary="Get single activity campaign performance analytics (B18)",
+)
+def get_campaign_analytics(
+    campaign_id: int,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Retrieve performance analytics for a single activity sponsored campaign (B18).
+    Enforces tenant isolation and target_module = 'activity'.
+    """
+    return get_activity_campaign_analytics(db, profile, campaign_id)
+
+
+@router.get(
+    "/promotions/campaigns/{campaign_id}/stats",
+    response_model=ActivityCampaignAnalyticsSummary,
+    summary="Get single activity campaign stats (B18 - alias)",
+)
+def get_campaign_stats(
+    campaign_id: int,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Alias endpoint for single campaign performance metrics (B18 /stats).
+    """
+    return get_activity_campaign_analytics(db, profile, campaign_id)

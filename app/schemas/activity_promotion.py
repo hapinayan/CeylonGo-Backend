@@ -9,7 +9,7 @@ Complies strictly with the physical schema of Microsoft SQL Server 2025 Express:
 from datetime import date, datetime
 from decimal import Decimal
 import math
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -247,3 +247,75 @@ class ActivityCampaignPagination(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+
+# ==============================================================================
+# A17: Promotion Event Tracking Schemas (dbo.promotion_events)
+# ==============================================================================
+
+
+class ActivityPromotionEventCreate(BaseModel):
+    """Payload for recording a public activity promotion event (A17)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: Annotated[
+        Literal["impression", "click", "inquiry"],
+        Field(description="Event type to record: impression, click, inquiry"),
+    ]
+
+
+class ActivityPromotionEventResponse(BaseModel):
+    """Response after recording a promotion event (A17)."""
+
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+    id: int
+    campaign_id: int
+    event_type: str
+    user_id: int | None = None
+    ip_address: str | None = None
+    created_at: datetime
+
+
+# ==============================================================================
+# B18: Provider Promotion Analytics Schemas (dbo.promotion_events)
+# ==============================================================================
+
+
+class ActivityCampaignAnalyticsSummary(BaseModel):
+    """Performance metrics for an individual activity sponsored campaign (B18)."""
+
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+    campaign_id: int
+    campaign_name: str
+    status: str
+    budget: Decimal
+    spent_amount: Decimal
+    currency: str
+    impressions: int
+    clicks: int
+    inquiries: int
+    bookings: int
+    ctr: float
+    conversion_rate: float
+
+
+class ActivityProviderPromotionsAnalytics(BaseModel):
+    """Provider-level aggregate performance analytics across all activity campaigns (B18)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    total_campaigns: int
+    active_campaigns: int
+    total_budget: Decimal
+    total_spent: Decimal
+    currency: str = "LKR"
+    total_impressions: int
+    total_clicks: int
+    total_inquiries: int
+    total_bookings: int
+    overall_ctr: float
+    overall_conversion_rate: float
+    campaigns: list[ActivityCampaignAnalyticsSummary]

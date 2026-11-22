@@ -353,6 +353,17 @@ class ActivityPublicSummary(BaseModel):
     short_description: str
     provider_business_name: str | None = None
 
+    # A17: Sponsored Activities Badging
+    is_sponsored: bool = False
+    sponsored_campaign_id: int | None = None
+
+    # A18: Special Offers & Promotional Discounts
+    has_discount: bool = False
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal | None = None
+    discounted_price: Decimal | None = None
+    special_offer_title: str | None = None
+
 
 class ActivityPagination(BaseModel):
     """Paginated response for public activity discovery."""
@@ -390,6 +401,17 @@ class ActivityPublicDetail(BaseModel):
     organizer: ActivityOrganizerContact | None = None
     images: list[ActivityImageResponse] = Field(default_factory=list)
     created_at: datetime
+
+    # A17: Sponsored Activities Badging
+    is_sponsored: bool = False
+    sponsored_campaign_id: int | None = None
+
+    # A18: Special Offers & Promotional Discounts
+    has_discount: bool = False
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal | None = None
+    discounted_price: Decimal | None = None
+    special_offer_title: str | None = None
 
 
 APPROVED_ACTIVITY_CATEGORIES: list[ActivityCategoryDetail] = [

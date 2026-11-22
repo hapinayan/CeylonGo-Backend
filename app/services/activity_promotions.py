@@ -8,8 +8,9 @@ Guarantees 100% ANSI-SQL and physical schema compatibility with SQL Server 2025 
 - Cross-module isolation enforcing target_module = 'activity'
 """
 
+import json
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import math
 from typing import Any
 
@@ -18,8 +19,10 @@ from sqlalchemy import case, func, insert, update
 from sqlalchemy.orm import Session
 
 from app.models.provider_profile import ProviderProfile
-from app.models.shared import PromotionCampaign, PromotionPackage
+from app.models.shared import AdminAuditLog, PromotionCampaign, PromotionEvent, PromotionPackage
+from app.schemas.activity_admin import AdminCampaignReviewRequest
 from app.schemas.activity_promotion import (
+    ActivityCampaignAnalyticsSummary,
     ActivityCampaignCreate,
     ActivityCampaignPagination,
     ActivityCampaignResponse,
@@ -28,6 +31,8 @@ from app.schemas.activity_promotion import (
     ActivityDiscountPagination,
     ActivityDiscountResponse,
     ActivityDiscountUpdate,
+    ActivityPromotionEventResponse,
+    ActivityProviderPromotionsAnalytics,
 )
 
 # Physical columns guaranteed to exist on SQL Server dbo.promotion_campaigns
@@ -645,3 +650,560 @@ def get_admin_campaign(
         )
 
     return _campaign_row_to_response(row)
+
+
+def review_admin_campaign(
+    db: Session,
+    campaign_id: int,
+    payload: AdminCampaignReviewRequest,
+    admin_user_id: int,
+    ip_address: str | None = None,
+) -> ActivityCampaignResponse:
+    """
+    Execute administrative moderation decision on an activity sponsored campaign (C06).
+    Enforces:
+    - target_module = 'activity'
+    - Status eligibility transition validation
+    - Safe physical column updates (mapping 'reject' -> 'cancelled')
+    - Immutable audit logging to dbo.admin_audit_logs
+    """
+    row = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(
+            PromotionCampaign.id == campaign_id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Promotion campaign not found",
+        )
+
+    try:
+        payload.validate_status_eligibility(row.status)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    # Determine target physical status
+    if payload.action == "approve":
+        target_status = "active"
+    elif payload.action == "reject":
+        target_status = "cancelled"
+    elif payload.action == "pause":
+        target_status = "paused"
+    elif payload.action == "resume":
+        target_status = "active"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported review action '{payload.action}'",
+        )
+
+    # Update campaign status
+    stmt = (
+        update(PromotionCampaign.__table__)
+        .where(
+            PromotionCampaign.id == campaign_id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .values(status=target_status)
+    )
+    db.execute(stmt)
+
+    # Record audit log
+    audit_log = AdminAuditLog(
+        admin_user_id=admin_user_id,
+        action=f"campaign_{payload.action}",
+        entity_name="promotion_campaign",
+        entity_id=campaign_id,
+        details=json.dumps(
+            {
+                "action": payload.action,
+                "from_status": row.status,
+                "to_status": target_status,
+                "reason": payload.reason,
+                "notes": payload.notes,
+            }
+        ),
+        ip_address=ip_address,
+    )
+    db.add(audit_log)
+    db.commit()
+
+    return get_admin_campaign(db, campaign_id=campaign_id)
+
+
+# ==============================================================================
+# A17: Public Discovery Active Campaigns & Event Tracking
+# ==============================================================================
+
+
+def get_active_activity_campaigns_map(
+    db: Session,
+    now_utc: datetime | None = None,
+) -> dict[int, int]:
+    """
+    Returns a dictionary mapping provider_profile_id -> campaign_id
+    for all currently active activity campaigns on dbo.promotion_campaigns (A17).
+    Guarantees physical schema compatibility (avoids unapplied listing_reference_id).
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    clean_now = now_utc.replace(tzinfo=None)
+
+    rows = (
+        db.query(PromotionCampaign.provider_profile_id, PromotionCampaign.id)
+        .filter(
+            PromotionCampaign.target_module == "activity",
+            PromotionCampaign.status == "active",
+            PromotionCampaign.starts_at <= clean_now,
+            PromotionCampaign.ends_at >= clean_now,
+            PromotionCampaign.spent_amount < PromotionCampaign.budget,
+        )
+        .order_by(PromotionCampaign.id.desc())
+        .all()
+    )
+    # If a provider has multiple active campaigns, map to the latest active campaign ID
+    return {row[0]: row[1] for row in rows}
+
+
+def record_activity_promotion_event(
+    db: Session,
+    campaign_id: int,
+    event_type: str,
+    user_id: int | None = None,
+    ip_address: str | None = None,
+) -> ActivityPromotionEventResponse:
+    """
+    Records an impression, click, or inquiry event on dbo.promotion_events (A17).
+    Enforces target_module = 'activity', active status, and physical column safety.
+    Rejects fabricated public booking conversions.
+    """
+    clean_event = event_type.strip().lower()
+    if clean_event == "booking":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Fabricated booking conversions cannot be recorded directly via public event endpoints. Bookings must be attributed through verified reservation workflows.",
+        )
+
+    if clean_event not in ("impression", "click", "inquiry"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Invalid event_type '{event_type}'. Allowed types: impression, click, inquiry",
+        )
+
+    campaign_row = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(
+            PromotionCampaign.id == campaign_id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .first()
+    )
+    if campaign_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity promotion campaign not found",
+        )
+
+    if campaign_row.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot record events for campaign with status '{campaign_row.status}'. Campaign must be active.",
+        )
+
+    stmt = (
+        insert(PromotionEvent.__table__)
+        .values(
+            campaign_id=campaign_id,
+            event_type=clean_event,
+            user_id=user_id,
+            ip_address=ip_address,
+        )
+    )
+    res = db.execute(stmt)
+    db.commit()
+
+    inserted_id = res.inserted_primary_key[0] if res.inserted_primary_key else 0
+
+    return ActivityPromotionEventResponse(
+        id=inserted_id,
+        campaign_id=campaign_id,
+        event_type=clean_event,
+        user_id=user_id,
+        ip_address=ip_address,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+# ==============================================================================
+# A18: Promotional Discounts & Special Offers Calculation
+# ==============================================================================
+
+
+def get_active_activity_discounts_map(
+    db: Session,
+    today: date | None = None,
+) -> dict[int, list[PromotionPackage]]:
+    """
+    Returns a dictionary mapping provider_profile_id -> list of active PromotionPackage
+    records from dbo.promotion_packages (A18).
+    """
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+
+    packages = (
+        db.query(PromotionPackage)
+        .filter(
+            PromotionPackage.is_active == True,
+            PromotionPackage.valid_from <= today,
+            PromotionPackage.valid_to >= today,
+        )
+        .order_by(PromotionPackage.id.desc())
+        .all()
+    )
+
+    promo_map: dict[int, list[PromotionPackage]] = {}
+    for p in packages:
+        promo_map.setdefault(p.provider_profile_id, []).append(p)
+    return promo_map
+
+
+def calculate_activity_discount(
+    base_price: Decimal,
+    packages: list[PromotionPackage] | PromotionPackage | None,
+) -> tuple[bool, Decimal | None, Decimal | None, Decimal | None, str | None]:
+    """
+    Computes promotional discounted price and special offer metadata for an activity (A18).
+    Evaluates active packages and selects the offer providing the maximum savings.
+
+    Returns:
+        (has_discount, discount_percent, discount_amount, discounted_price, special_offer_title)
+    """
+    if not packages or base_price <= Decimal("0.00"):
+        return False, None, None, None, None
+
+    pkg_list = [packages] if isinstance(packages, PromotionPackage) else packages
+    best_pkg: PromotionPackage | None = None
+    best_savings = Decimal("0.00")
+
+    for pkg in pkg_list:
+        savings = Decimal("0.00")
+        if pkg.discount_percent is not None and pkg.discount_percent > Decimal("0.00"):
+            pct_savings = (
+                base_price * (pkg.discount_percent / Decimal("100.00"))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            savings = max(savings, pct_savings)
+
+        if pkg.discount_amount is not None and pkg.discount_amount > Decimal("0.00"):
+            fixed_savings = min(pkg.discount_amount, base_price).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            savings = max(savings, fixed_savings)
+
+        if savings > best_savings:
+            best_savings = savings
+            best_pkg = pkg
+
+    if best_pkg and best_savings > Decimal("0.00"):
+        discounted_price = max(
+            Decimal("0.00"), base_price - best_savings
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return (
+            True,
+            best_pkg.discount_percent,
+            best_pkg.discount_amount,
+            discounted_price,
+            best_pkg.title,
+        )
+
+    return False, None, None, None, None
+
+
+# ==============================================================================
+# B18: Provider & Admin Promotion Analytics (dbo.promotion_events)
+# ==============================================================================
+
+
+def get_activity_campaign_analytics(
+    db: Session,
+    profile: ProviderProfile,
+    campaign_id: int,
+) -> ActivityCampaignAnalyticsSummary:
+    """
+    Retrieve performance analytics for a single activity sponsored campaign (B18).
+    Enforces tenant isolation and target_module = 'activity'.
+    """
+    campaign = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(
+            PromotionCampaign.id == campaign_id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .first()
+    )
+    if campaign is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Promotion campaign not found",
+        )
+
+    if campaign.provider_profile_id != profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view analytics for your own campaigns",
+        )
+
+    impressions = (
+        db.query(func.count(PromotionEvent.id))
+        .filter(
+            PromotionEvent.campaign_id == campaign_id,
+            PromotionEvent.event_type == "impression",
+        )
+        .scalar()
+        or 0
+    )
+    clicks = (
+        db.query(func.count(PromotionEvent.id))
+        .filter(
+            PromotionEvent.campaign_id == campaign_id,
+            PromotionEvent.event_type == "click",
+        )
+        .scalar()
+        or 0
+    )
+    inquiries = (
+        db.query(func.count(PromotionEvent.id))
+        .filter(
+            PromotionEvent.campaign_id == campaign_id,
+            PromotionEvent.event_type == "inquiry",
+        )
+        .scalar()
+        or 0
+    )
+    bookings = (
+        db.query(func.count(PromotionEvent.id))
+        .filter(
+            PromotionEvent.campaign_id == campaign_id,
+            PromotionEvent.event_type == "booking",
+        )
+        .scalar()
+        or 0
+    )
+
+    ctr = round((clicks / impressions * 100), 2) if impressions > 0 else 0.0
+    conversion_rate = round((bookings / clicks * 100), 2) if clicks > 0 else 0.0
+
+    return ActivityCampaignAnalyticsSummary(
+        campaign_id=campaign.id,
+        campaign_name=campaign.campaign_name,
+        status=campaign.status,
+        budget=campaign.budget,
+        spent_amount=campaign.spent_amount,
+        currency=campaign.currency,
+        impressions=impressions,
+        clicks=clicks,
+        inquiries=inquiries,
+        bookings=bookings,
+        ctr=ctr,
+        conversion_rate=conversion_rate,
+    )
+
+
+def get_provider_activities_promotions_analytics(
+    db: Session,
+    profile: ProviderProfile,
+) -> ActivityProviderPromotionsAnalytics:
+    """
+    Provider-level aggregated performance analytics across all activity campaigns (B18).
+    """
+    campaigns = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(
+            PromotionCampaign.provider_profile_id == profile.id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .order_by(PromotionCampaign.id.desc())
+        .all()
+    )
+
+    summaries: list[ActivityCampaignAnalyticsSummary] = []
+    total_budget = Decimal("0.00")
+    total_spent = Decimal("0.00")
+    total_impressions = 0
+    total_clicks = 0
+    total_inquiries = 0
+    total_bookings = 0
+    active_count = 0
+
+    for c in campaigns:
+        total_budget += c.budget
+        total_spent += c.spent_amount
+        if c.status == "active":
+            active_count += 1
+
+        imp = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "impression",
+            )
+            .scalar()
+            or 0
+        )
+        clk = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "click",
+            )
+            .scalar()
+            or 0
+        )
+        inq = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "inquiry",
+            )
+            .scalar()
+            or 0
+        )
+        bks = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "booking",
+            )
+            .scalar()
+            or 0
+        )
+
+        ctr = round((clk / imp * 100), 2) if imp > 0 else 0.0
+        cvr = round((bks / clk * 100), 2) if clk > 0 else 0.0
+
+        total_impressions += imp
+        total_clicks += clk
+        total_inquiries += inq
+        total_bookings += bks
+
+        summaries.append(
+            ActivityCampaignAnalyticsSummary(
+                campaign_id=c.id,
+                campaign_name=c.campaign_name,
+                status=c.status,
+                budget=c.budget,
+                spent_amount=c.spent_amount,
+                currency=c.currency,
+                impressions=imp,
+                clicks=clk,
+                inquiries=inq,
+                bookings=bks,
+                ctr=ctr,
+                conversion_rate=cvr,
+            )
+        )
+
+    overall_ctr = (
+        round((total_clicks / total_impressions * 100), 2)
+        if total_impressions > 0
+        else 0.0
+    )
+    overall_cvr = (
+        round((total_bookings / total_clicks * 100), 2)
+        if total_clicks > 0
+        else 0.0
+    )
+
+    return ActivityProviderPromotionsAnalytics(
+        total_campaigns=len(campaigns),
+        active_campaigns=active_count,
+        total_budget=total_budget,
+        total_spent=total_spent,
+        currency="LKR",
+        total_impressions=total_impressions,
+        total_clicks=total_clicks,
+        total_inquiries=total_inquiries,
+        total_bookings=total_bookings,
+        overall_ctr=overall_ctr,
+        overall_conversion_rate=overall_cvr,
+        campaigns=summaries,
+    )
+
+
+def get_admin_activities_promotions_analytics(
+    db: Session,
+) -> list[ActivityCampaignAnalyticsSummary]:
+    """
+    Admin summary of all activity campaigns performance analytics (C06).
+    """
+    campaigns = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(PromotionCampaign.target_module == "activity")
+        .order_by(PromotionCampaign.created_at.desc(), PromotionCampaign.id.desc())
+        .all()
+    )
+
+    summaries: list[ActivityCampaignAnalyticsSummary] = []
+    for c in campaigns:
+        imp = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "impression",
+            )
+            .scalar()
+            or 0
+        )
+        clk = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "click",
+            )
+            .scalar()
+            or 0
+        )
+        inq = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "inquiry",
+            )
+            .scalar()
+            or 0
+        )
+        bks = (
+            db.query(func.count(PromotionEvent.id))
+            .filter(
+                PromotionEvent.campaign_id == c.id,
+                PromotionEvent.event_type == "booking",
+            )
+            .scalar()
+            or 0
+        )
+        ctr = round((clk / imp * 100), 2) if imp > 0 else 0.0
+        cvr = round((bks / clk * 100), 2) if clk > 0 else 0.0
+
+        summaries.append(
+            ActivityCampaignAnalyticsSummary(
+                campaign_id=c.id,
+                campaign_name=c.campaign_name,
+                status=c.status,
+                budget=c.budget,
+                spent_amount=c.spent_amount,
+                currency=c.currency,
+                impressions=imp,
+                clicks=clk,
+                inquiries=inq,
+                bookings=bks,
+                ctr=ctr,
+                conversion_rate=cvr,
+            )
+        )
+    return summaries

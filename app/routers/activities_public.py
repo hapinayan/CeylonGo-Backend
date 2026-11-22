@@ -13,18 +13,21 @@ Requirements covered:
 - D03: Meeting Point (public retrieval)
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal
 import math
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.publication import public_activity
 from app.database.connection import get_db
 from app.models.activity import Activity
 from app.models.activity_image import ActivityImage
+from app.models.user import User
+from app.routers.auth import get_optional_current_user
 from app.schemas.activity import (
     APPROVED_ACTIVITY_CATEGORIES,
     ActivityCategory,
@@ -35,6 +38,16 @@ from app.schemas.activity import (
     ActivityPublicDetail,
     ActivityPublicSummary,
     make_short_description,
+)
+from app.schemas.activity_promotion import (
+    ActivityPromotionEventCreate,
+    ActivityPromotionEventResponse,
+)
+from app.services.activity_promotions import (
+    calculate_activity_discount,
+    get_active_activity_campaigns_map,
+    get_active_activity_discounts_map,
+    record_activity_promotion_event,
 )
 
 
@@ -116,6 +129,18 @@ def list_activities(
         default="newest",
         description="Deterministic sorting criteria",
     ),
+    is_sponsored: bool | None = Query(
+        default=None,
+        description="Filter activities by sponsored status (A17)",
+    ),
+    has_discount: bool | None = Query(
+        default=None,
+        description="Filter activities with active promotional discount offers (A18)",
+    ),
+    boost_sponsored: bool = Query(
+        default=True,
+        description="Boost sponsored activities to top of search results (A17)",
+    ),
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(
         default=12,
@@ -127,6 +152,7 @@ def list_activities(
     """
     Public discovery endpoint for activities.
     Strictly returns approved, active activities from approved providers.
+    Supports sponsored badging & boosting (A17) and special offers discount pricing (A18).
     """
     # Parameter range validations
     if min_price is not None and max_price is not None and min_price > max_price:
@@ -140,6 +166,12 @@ def list_activities(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="min_duration cannot exceed max_duration",
         )
+
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+
+    active_campaigns_map = get_active_activity_campaigns_map(db, now_utc=now_utc)
+    active_discounts_map = get_active_activity_discounts_map(db, today=today)
 
     # Base publication filter
     conditions = [public_activity()]
@@ -180,6 +212,26 @@ def list_activities(
     if max_duration is not None:
         conditions.append(Activity.duration_minutes <= max_duration)
 
+    # Sponsored filter (A17)
+    if is_sponsored is True:
+        if active_campaigns_map:
+            conditions.append(Activity.provider_profile_id.in_(list(active_campaigns_map.keys())))
+        else:
+            conditions.append(Activity.id == -1)
+    elif is_sponsored is False:
+        if active_campaigns_map:
+            conditions.append(Activity.provider_profile_id.not_in(list(active_campaigns_map.keys())))
+
+    # Discount filter (A18)
+    if has_discount is True:
+        if active_discounts_map:
+            conditions.append(Activity.provider_profile_id.in_(list(active_discounts_map.keys())))
+        else:
+            conditions.append(Activity.id == -1)
+    elif has_discount is False:
+        if active_discounts_map:
+            conditions.append(Activity.provider_profile_id.not_in(list(active_discounts_map.keys())))
+
     # Total count query
     total = db.query(func.count(Activity.id)).filter(*conditions).scalar() or 0
     total_pages = math.ceil(total / page_size) if total > 0 else 0
@@ -196,6 +248,13 @@ def list_activities(
     else:  # "newest"
         order_clauses = [Activity.created_at.desc(), Activity.id.desc()]
 
+    if boost_sponsored and active_campaigns_map:
+        sponsored_case = case(
+            (Activity.provider_profile_id.in_(list(active_campaigns_map.keys())), 1),
+            else_=0,
+        )
+        order_clauses = [sponsored_case.desc()] + order_clauses
+
     # Fetch paginated results with eager loading to prevent N+1 queries
     offset = (page - 1) * page_size
     activities = (
@@ -211,26 +270,45 @@ def list_activities(
         .all()
     )
 
-    items = [
-        ActivityPublicSummary(
-            id=act.id,
-            title=act.title,
-            category=act.category,
-            district=act.district,
-            city=act.city,
-            duration_minutes=act.duration_minutes,
-            pricing_type=act.pricing_type,
-            price=act.price,
-            currency=act.currency,
-            minimum_age=act.minimum_age,
-            cover_image_url=_resolve_cover_image_url(act.images),
-            short_description=make_short_description(act.description),
-            provider_business_name=(
-                act.provider_profile.business_name if act.provider_profile else None
-            ),
+    items = []
+    for act in activities:
+        camp_id = active_campaigns_map.get(act.provider_profile_id)
+        is_spon = camp_id is not None
+        pkgs = active_discounts_map.get(act.provider_profile_id)
+        (
+            has_disc,
+            disc_pct,
+            disc_amt,
+            disc_price,
+            offer_title,
+        ) = calculate_activity_discount(act.price, pkgs)
+
+        items.append(
+            ActivityPublicSummary(
+                id=act.id,
+                title=act.title,
+                category=act.category,
+                district=act.district,
+                city=act.city,
+                duration_minutes=act.duration_minutes,
+                pricing_type=act.pricing_type,
+                price=act.price,
+                currency=act.currency,
+                minimum_age=act.minimum_age,
+                cover_image_url=_resolve_cover_image_url(act.images),
+                short_description=make_short_description(act.description),
+                provider_business_name=(
+                    act.provider_profile.business_name if act.provider_profile else None
+                ),
+                is_sponsored=is_spon,
+                sponsored_campaign_id=camp_id,
+                has_discount=has_disc,
+                discount_percent=disc_pct,
+                discount_amount=disc_amt,
+                discounted_price=disc_price,
+                special_offer_title=offer_title,
+            )
         )
-        for act in activities
-    ]
 
     return ActivityPagination(
         items=items,
@@ -315,6 +393,22 @@ def get_public_activity_detail(
             description=activity.provider_profile.description,
         )
 
+    # Resolve active campaign (A17) and active discounts (A18)
+    now_utc = datetime.now(timezone.utc)
+    active_campaigns_map = get_active_activity_campaigns_map(db, now_utc=now_utc)
+    active_discounts_map = get_active_activity_discounts_map(db, today=now_utc.date())
+
+    camp_id = active_campaigns_map.get(activity.provider_profile_id)
+    is_spon = camp_id is not None
+    pkgs = active_discounts_map.get(activity.provider_profile_id)
+    (
+        has_disc,
+        disc_pct,
+        disc_amt,
+        disc_price,
+        offer_title,
+    ) = calculate_activity_discount(activity.price, pkgs)
+
     return ActivityPublicDetail(
         id=activity.id,
         title=activity.title,
@@ -347,6 +441,13 @@ def get_public_activity_detail(
             for img in sorted_images
         ],
         created_at=activity.created_at,
+        is_sponsored=is_spon,
+        sponsored_campaign_id=camp_id,
+        has_discount=has_disc,
+        discount_percent=disc_pct,
+        discount_amount=disc_amt,
+        discounted_price=disc_price,
+        special_offer_title=offer_title,
     )
 
 
@@ -391,3 +492,87 @@ def get_public_activity_images(
     )
 
     return images
+
+
+# ==============================================================================
+# 5. Public Promotion Event Tracking (A17)
+# ==============================================================================
+
+
+@router.post(
+    "/campaigns/{campaign_id}/events",
+    response_model=ActivityPromotionEventResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record activity promotion event (A17)",
+)
+def record_campaign_event(
+    campaign_id: int,
+    payload: ActivityPromotionEventCreate,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User | None, Depends(get_optional_current_user)] = None,
+):
+    """
+    Public event tracking endpoint for activity sponsored campaigns (A17).
+    Records impressions, clicks, or inquiries. Rejects fabricated booking conversions.
+    """
+    client_ip = request.client.host if request.client else None
+    user_id = current_user.id if current_user else None
+    return record_activity_promotion_event(
+        db,
+        campaign_id=campaign_id,
+        event_type=payload.event_type,
+        user_id=user_id,
+        ip_address=client_ip,
+    )
+
+
+@router.post(
+    "/{activity_id}/events",
+    response_model=ActivityPromotionEventResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record promotion event for an activity (A17)",
+)
+def record_activity_event(
+    activity_id: int,
+    payload: ActivityPromotionEventCreate,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User | None, Depends(get_optional_current_user)] = None,
+):
+    """
+    Convenience endpoint to record a promotion event directly for an activity (A17).
+    Resolves the activity's active sponsored campaign and records the event.
+    """
+    activity = (
+        db.query(Activity.provider_profile_id)
+        .filter(
+            Activity.id == activity_id,
+            public_activity(),
+        )
+        .first()
+    )
+    if activity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity not found",
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    campaigns_map = get_active_activity_campaigns_map(db, now_utc=now_utc)
+    camp_id = campaigns_map.get(activity.provider_profile_id)
+    if camp_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Activity does not have an active sponsored campaign",
+        )
+
+    client_ip = request.client.host if request.client else None
+    user_id = current_user.id if current_user else None
+    return record_activity_promotion_event(
+        db,
+        campaign_id=camp_id,
+        event_type=payload.event_type,
+        user_id=user_id,
+        ip_address=client_ip,
+    )

@@ -1,7 +1,7 @@
 from datetime import date, datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_admin
@@ -20,14 +20,18 @@ from app.schemas.activity_admin import (
     ActivitySuspensionRequest,
     ActivityUnsuspensionRequest,
     AdminActivityPlatformReportResponse,
+    AdminCampaignReviewRequest,
 )
 from app.schemas.activity_promotion import (
+    ActivityCampaignAnalyticsSummary,
     ActivityCampaignPagination,
     ActivityCampaignResponse,
 )
 from app.services.activity_promotions import (
+    get_admin_activities_promotions_analytics,
     get_admin_campaign,
     list_admin_campaigns,
+    review_admin_campaign,
 )
 from app.services.activity_reports import generate_platform_activity_report
 
@@ -161,6 +165,21 @@ def list_activity_promotions_campaigns(
 
 
 @router.get(
+    "/promotions/campaigns/analytics",
+    response_model=list[ActivityCampaignAnalyticsSummary],
+    summary="Admin activity promotion campaigns analytics (C06)",
+)
+def get_admin_promotions_analytics(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Admin summary of all activity sponsored campaigns performance analytics (C06).
+    """
+    return get_admin_activities_promotions_analytics(db)
+
+
+@router.get(
     "/promotions/campaigns/{campaign_id}",
     response_model=ActivityCampaignResponse,
     summary="Get activity sponsored campaign details for admin review (C06)",
@@ -175,6 +194,32 @@ def get_activity_promotions_campaign(
     Returns 404 for nonexistent or non-activity campaigns.
     """
     return get_admin_campaign(db, campaign_id=campaign_id)
+
+
+@router.post(
+    "/promotions/campaigns/{campaign_id}/review",
+    response_model=ActivityCampaignResponse,
+    summary="Moderate activity sponsored campaign (C06)",
+)
+def review_activity_promotions_campaign(
+    campaign_id: int,
+    payload: AdminCampaignReviewRequest,
+    request: Request,
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Admin moderation decision for activity sponsored campaigns (C06).
+    Supports approve, reject, pause, resume. Enforces state transitions and audit logging.
+    """
+    client_ip = request.client.host if request.client else None
+    return review_admin_campaign(
+        db,
+        campaign_id=campaign_id,
+        payload=payload,
+        admin_user_id=admin.id,
+        ip_address=client_ip,
+    )
 
 
 @router.get(

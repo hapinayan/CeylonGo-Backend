@@ -10,7 +10,70 @@ from app.schemas.weather import CurrentWeather, Forecast, Locations
 from app.services.weather import WeatherService
 
 
-router = APIRouter(prefix="/api/v1/weather", tags=["Weather"])
+def _weather_error_response(description: str, *codes: str, retry_after: str = ""):
+    response = {
+        "description": description,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["detail"],
+                    "properties": {
+                        "detail": {
+                            "type": "object",
+                            "required": ["code"],
+                            "properties": {
+                                "code": {"type": "string", "enum": list(codes)},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+    if retry_after:
+        response["headers"] = {
+            "Retry-After": {
+                "description": retry_after,
+                "schema": {"type": "integer", "minimum": 1},
+            },
+        }
+    return response
+
+
+WEATHER_ERROR_RESPONSES = {
+    429: _weather_error_response(
+        "Local weather quota exceeded.",
+        "weather_quota_exceeded",
+        retry_after="Seconds until the local quota permits another upstream request.",
+    ),
+    502: _weather_error_response(
+        "The upstream provider rejected the request or returned an invalid response.",
+        "weather_upstream_authentication",
+        "weather_upstream_error",
+        "weather_invalid_response",
+    ),
+    503: _weather_error_response(
+        "Weather is unconfigured, unavailable, throttled upstream, or locally busy.",
+        "weather_not_configured",
+        "weather_upstream_unavailable",
+        "weather_upstream_rate_limited",
+        "weather_busy",
+        retry_after=(
+            "Seconds to wait. Present only for weather_upstream_rate_limited "
+            "and weather_busy."
+        ),
+    ),
+    504: _weather_error_response(
+        "The upstream weather request timed out.",
+        "weather_upstream_timeout",
+    ),
+}
+
+
+router = APIRouter(
+    prefix="/api/v1/weather", tags=["Weather"], responses=WEATHER_ERROR_RESPONSES,
+)
 
 
 @lru_cache(maxsize=1)

@@ -29,7 +29,7 @@ from app.core.dependencies import (
     require_approved_provider,
     require_provider,
 )
-from app.core.security import create_access_token
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.provider_profile import ProviderProfile

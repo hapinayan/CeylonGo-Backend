@@ -31,6 +31,7 @@ from app.schemas.community import (
     CommunityTrendingHashtagsResponse,
 )
 from app.services.community_posts import (
+    public_community_post_filter,
     MAX_HASHTAG_LENGTH,
     sanitize_community_text,
     serialize_posts_batch,
@@ -48,7 +49,7 @@ def _published_hashtag_exists():
         .join(User, User.id == CommunityPost.author_id)
         .where(
             CommunityPostHashtag.hashtag_id == CommunityHashtag.id,
-            CommunityPost.is_published == true(),
+            public_community_post_filter(),
             User.is_active == true(),
         )
         .exists()
@@ -109,7 +110,7 @@ def get_community_feed(
         db.query(CommunityPost)
         .join(User, User.id == CommunityPost.author_id)
         .filter(
-            CommunityPost.is_published == true(),
+            public_community_post_filter(),
             CommunityPost.moderation_status == "active",
             User.is_active == true(),
         )
@@ -199,7 +200,7 @@ def _serialize_people_batch(
         for uid, cnt in db.query(CommunityPost.author_id, func.count(CommunityPost.id))
         .filter(
             CommunityPost.author_id.in_(user_ids),
-            CommunityPost.is_published == true(),
+            public_community_post_filter(),
         )
         .group_by(CommunityPost.author_id)
         .all()
@@ -289,7 +290,7 @@ def search_community(
             db.query(CommunityPost)
             .join(User, User.id == CommunityPost.author_id)
             .filter(
-                CommunityPost.is_published == true(),
+                public_community_post_filter(),
                 User.is_active == true(),
                 or_(
                     func.lower(CommunityPost.content).like(like_pattern, escape="\\"),

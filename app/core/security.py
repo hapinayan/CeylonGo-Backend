@@ -7,10 +7,12 @@ from typing import Any
 import jwt
 from dotenv import load_dotenv
 from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
 
 load_dotenv()
 
 password_hash = PasswordHash.recommended()
+ADMIN_AUTH_METHOD = "admin_password"
 
 
 def hash_password(password: str) -> str:
@@ -21,6 +23,17 @@ def verify_password(password: str, hashed_password: str | None) -> bool:
     if not hashed_password:
         return False
     return password_hash.verify(password, hashed_password)
+
+
+def verify_admin_password(password: str, hashed_password: str | None) -> bool:
+    # Put missing accounts and accounts without passwords through the same KDF.
+    if hashed_password:
+        try:
+            return verify_password(password, hashed_password)
+        except UnknownHashError:
+            pass
+    password_hash.hash(password)
+    return False
 
 
 def get_jwt_secret_key() -> str:

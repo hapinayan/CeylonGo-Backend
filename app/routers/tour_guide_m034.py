@@ -13,7 +13,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Path
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin
+from app.core.dependencies import require_admin, require_operations_admin
 from app.database.connection import get_db
 from app.models.user import User
 from app.routers.tour_guide import OwnedGuide
@@ -114,7 +114,7 @@ def public_get_package_requirements(
 def admin_update_guide_verified_experience(
     guide_id: Annotated[int, Path(gt=0)],
     payload: AdminVerifiedExperienceUpdate,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: DatabaseSession,
 ):
     return admin_set_verified_experience_years(

@@ -39,11 +39,16 @@ import threading
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.dependencies import require_admin, require_approved_eco_provider
+from app.core.audit import record_admin_audit_log
+from app.core.dependencies import (
+    require_admin,
+    require_approved_eco_provider,
+    require_operations_or_finance_admin,
+)
 from app.core.security import verify_sponsored_tracking_token
 from app.database.connection import get_db
 from app.models.eco_experience import EcoExperience
@@ -86,7 +91,7 @@ from app.schemas.eco_promotion import (
 admin_eco_promotions_router = APIRouter(
     prefix="/api/v1/admin/eco-promotions",
     tags=["Admin Eco Promotions"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin), Depends(require_operations_or_finance_admin)],
 )
 
 # Provider & Public router
@@ -1376,6 +1381,7 @@ def admin_get_campaign(
 )
 def admin_approve_campaign(
     campaign_id: int,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     current_admin: Annotated[User, Depends(require_admin)],
     payload: EcoCampaignApproveRequest | None = None,
@@ -1428,6 +1434,15 @@ def admin_approve_campaign(
     campaign.starts_at = None
     campaign.ends_at = None
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=current_admin.id,
+        action="eco_promotion_campaign_approved",
+        entity_name="eco_sponsored_promotions",
+        entity_id=campaign.id,
+        details={"eco_experience_id": campaign.eco_experience_id, "notes": campaign.review_reason},
+        request=request,
+    )
     db.commit()
     db.refresh(campaign)
 
@@ -1442,6 +1457,7 @@ def admin_approve_campaign(
 def admin_reject_campaign(
     campaign_id: int,
     payload: EcoCampaignRejectRequest,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     current_admin: Annotated[User, Depends(require_admin)],
 ):
@@ -1483,6 +1499,15 @@ def admin_reject_campaign(
     campaign.review_reason = payload.reason.strip()
     campaign.updated_at = datetime.now(UTC)
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=current_admin.id,
+        action="eco_promotion_campaign_rejected",
+        entity_name="eco_sponsored_promotions",
+        entity_id=campaign.id,
+        details={"eco_experience_id": campaign.eco_experience_id, "reason": campaign.review_reason},
+        request=request,
+    )
     db.commit()
     db.refresh(campaign)
 

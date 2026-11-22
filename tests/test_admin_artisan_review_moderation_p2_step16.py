@@ -18,7 +18,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
@@ -248,6 +249,46 @@ def test_admin_list_reviews_for_moderation(client, admin_headers, review_setup):
     titles = [item["title"] for item in data["items"]]
     assert "Excellent craftsmanship" in titles
     assert "Spam comment with abuse" in titles
+
+
+def test_unified_queue_is_private_scoped_paginated_and_role_gated(client, db_session, review_setup):
+    first, second = review_setup["rev1"], review_setup["rev2"]
+    second.created_at = first.created_at
+    second.is_published = False
+    first.comment = "private@example.com phone 0771234567"
+    listing = review_setup["listing"]
+    artisan_ref = db_session.get(ListingReference, first.listing_reference_id)
+    foreign = ListingReference(module_type="homestay", target_id=listing.id,
+                               provider_profile_id=artisan_ref.provider_profile_id, title="Foreign", district="Kandy")
+    db_session.add(foreign)
+    db_session.flush()
+    db_session.add(Review(listing_reference_id=foreign.id, user_id=first.user_id, rating=1))
+    db_session.commit()
+
+    path = "/api/v1/admin/reviews"
+    for role in ("super_admin", "content_moderator", "admin", "operations_admin", "finance_admin", "support_admin", "traveler"):
+        user = User(full_name=role, email=f"queue-{role}@example.com", role=role)
+        db_session.add(user)
+        db_session.commit()
+        token = create_access_token({"sub": str(user.id)})
+        headers = {"Authorization": f"Bearer {token}"}
+        response = client.get(path, headers=headers, params={"module": "artisan", "page_size": 1})
+        if role not in ("super_admin", "content_moderator", "admin"):
+            assert response.status_code == 403
+            continue
+        assert response.status_code == 200
+        page = response.json()
+        assert page["module"] == "artisan" and page["total"] == 2 and page["total_pages"] == 2
+        assert page["items"][0]["id"] == second.id
+        assert set(page["items"][0]) == {"id", "listing_id", "rating", "is_published",
+                                        "is_verified_booking", "created_at", "updated_at"}
+        filtered = client.get(path, headers=headers, params={"module": "artisan", "is_published": True,
+                                                             "listing_id": listing.id}).json()
+        assert [item["id"] for item in filtered["items"]] == [first.id]
+        assert "private@example.com" not in str(filtered)
+        assert client.get(path, headers=headers, params={"module": "homestay"}).status_code == 422
+        assert client.get(path, headers=headers, params={"module": "artisan", "page_size": 101}).status_code == 422
+    assert client.get(path, params={"module": "artisan"}).status_code == 401
 
 
 def test_admin_hide_review_and_verify_public_isolation(client, admin_headers, review_setup):

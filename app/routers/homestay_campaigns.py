@@ -6,7 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin, require_approved_provider
+from app.core.audit import record_admin_audit_log
+from app.core.dependencies import (
+    require_admin,
+    require_approved_provider,
+    require_finance_admin,
+    require_operations_or_finance_admin,
+)
 from app.core.listing_sync import sync_homestay_listing_reference
 from app.core.attribution import generate_attribution_token, verify_attribution_token
 from app.core.publication import public_homestay
@@ -72,7 +78,7 @@ def list_active_packages(
 def admin_create_package(
     payload: PromotionPackageCreate,
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     provider_profile_id: Annotated[int | None, Query(description="Optional provider profile ID")] = None,
 ):
     """Admin creates a promotion package."""
@@ -117,7 +123,7 @@ def admin_create_package(
 )
 def admin_list_all_packages(
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
 ):
     """Admin retrieves all promotion packages."""
     return db.query(PromotionPackage).order_by(PromotionPackage.id.desc()).all()
@@ -132,7 +138,7 @@ def admin_update_package(
     package_id: int,
     payload: PromotionPackageUpdate,
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
 ):
     """Admin updates promotion package fields or activation status."""
     package = db.query(PromotionPackage).filter(PromotionPackage.id == package_id).first()
@@ -540,7 +546,7 @@ def get_my_advertising_payments(
 )
 def admin_list_advertising_payments(
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_finance_admin)],
     payment_status: Annotated[str | None, Query(description="Filter by payment status")] = None,
     campaign_id: Annotated[int | None, Query(description="Filter by campaign ID")] = None,
     provider_profile_id: Annotated[int | None, Query(description="Filter by provider ID")] = None,
@@ -564,7 +570,7 @@ def admin_list_advertising_payments(
 )
 def admin_get_advertising_revenue_summary(
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_finance_admin)],
 ):
     """Admin summary of total verified advertising revenue, separate from booking fees."""
     total_rev = (
@@ -610,7 +616,7 @@ def admin_get_advertising_revenue_summary(
 )
 def admin_list_campaigns(
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     status_filter: Annotated[str | None, Query(description="Filter by status")] = None,
 ):
     """Admin retrieves all sponsored campaigns across homestays."""
@@ -628,8 +634,9 @@ def admin_list_campaigns(
 )
 def admin_approve_campaign(
     campaign_id: int,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
 ):
     """Admin approves a sponsored campaign."""
     campaign = (
@@ -652,6 +659,15 @@ def admin_approve_campaign(
     else:
         campaign.status = "approved"
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=current_admin.id,
+        action="homestay_campaign_approved",
+        entity_name="promotion_campaigns",
+        entity_id=campaign.id,
+        details={"campaign_name": campaign.campaign_name, "new_status": campaign.status},
+        request=request,
+    )
     db.commit()
     db.refresh(campaign)
     return campaign
@@ -664,8 +680,9 @@ def admin_approve_campaign(
 )
 def admin_reject_campaign(
     campaign_id: int,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
 ):
     """Admin rejects a sponsored campaign."""
     campaign = (
@@ -683,6 +700,15 @@ def admin_reject_campaign(
         )
 
     campaign.status = "cancelled"
+    record_admin_audit_log(
+        db,
+        admin_user_id=current_admin.id,
+        action="homestay_campaign_rejected",
+        entity_name="promotion_campaigns",
+        entity_id=campaign.id,
+        details={"campaign_name": campaign.campaign_name, "new_status": "cancelled"},
+        request=request,
+    )
     db.commit()
     db.refresh(campaign)
     return campaign
@@ -829,7 +855,7 @@ def get_campaign_analytics(
 )
 def admin_get_promotions_analytics(
     db: Annotated[Session, Depends(get_db)],
-    current_admin: Annotated[User, Depends(require_admin)],
+    current_admin: Annotated[User, Depends(require_operations_or_finance_admin)],
 ):
     """Admin summary of all homestay campaigns analytics."""
     campaigns = (

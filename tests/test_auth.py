@@ -22,7 +22,6 @@ from app.core.email import (
 )
 from app.core.rate_limiter import reset_all_limiters
 from app.core.security import (
-    create_access_token,
     decode_access_token,
     get_jwt_algorithm,
     get_jwt_secret_key,
@@ -30,6 +29,7 @@ from app.core.security import (
     hash_reset_token,
     verify_password,
 )
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.password_reset import PasswordReset
@@ -980,13 +980,12 @@ def test_verify_reset_token_already_used(client: TestClient, db_session):
     assert "already been used" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("role", ["traveler", "admin"])
-def test_reset_password_success_and_login(client: TestClient, db_session, role):
+def test_reset_password_success_and_login(client: TestClient, db_session):
     user = User(
         full_name="Reset Login Traveler",
         email="reset.login@example.com",
         password_hash=hash_password("InitialOldPass123!"),
-        role=role,
+        role="traveler",
         is_active=True,
     )
     db_session.add(user)
@@ -1147,7 +1146,7 @@ def test_legacy_jwt_transition(client, db_session, monkeypatch):
     db_session.commit()
     expiry = datetime.now(UTC) + timedelta(minutes=5)
     token = jwt.encode(
-        {"sub": str(user.id), "exp": expiry},
+        {"sub": str(user.id), "exp": expiry, "auth_version": 0},
         get_jwt_secret_key(), algorithm=get_jwt_algorithm(),
     )
     headers = {"Authorization": f"Bearer {token}"}

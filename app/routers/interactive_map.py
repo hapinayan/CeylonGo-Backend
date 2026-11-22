@@ -6,7 +6,10 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin
+from app.core.dependencies import (
+    require_admin,
+    require_operations_or_content_moderator,
+)
 from app.core.map_config import MapSettings
 from app.database.connection import get_db
 from app.models.user import User
@@ -32,9 +35,13 @@ from app.services.map_location_management import (
 from app.services.map_routing import MapRoutingService, RouteError
 
 router = APIRouter(prefix="/api/v1/map", tags=["Interactive Map"])
-admin_router = APIRouter(prefix="/api/v1/admin/map", tags=["Map Administration"])
+admin_router = APIRouter(
+    prefix="/api/v1/admin/map",
+    tags=["Map Administration"],
+    dependencies=[Depends(require_admin), Depends(require_operations_or_content_moderator)],
+)
 Db = Annotated[Session, Depends(get_db)]
-Admin = Annotated[User, Depends(require_admin)]
+Admin = Annotated[User, Depends(require_operations_or_content_moderator)]
 Page = Annotated[int, Query(ge=1, le=10000)]
 PageSize = Annotated[int, Query(ge=1, le=100)]
 Latitude = Annotated[float, Query(ge=-90, le=90)]

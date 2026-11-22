@@ -43,10 +43,12 @@ import uuid
 
 from fastapi import HTTPException, UploadFile, status
 from PIL import Image, ImageOps, UnidentifiedImageError
-from sqlalchemy import false, func, true
+from sqlalchemy import and_, false, func, true, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import lock_booking_resource
+from app.core.dependencies import is_admin_role, resolve_canonical_admin_role
 from app.core.location_validation import validate_coordinate_pair
 from app.core.rate_limiter import SlidingWindowRateLimiter
 from app.models.community import (
@@ -62,6 +64,7 @@ from app.models.community import (
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
 from app.schemas.community import (
+    AdminCommunityPostModerationRequest,
     CommunityAuthorSummary,
     CommunityHashtagResponse,
     CommunityMediaDeleteResponse,
@@ -626,8 +629,20 @@ def serialize_post(
     return serialize_posts_batch(db, [post], viewer=viewer)[0]
 
 
-def _get_post_or_404(db: Session, post_id: int) -> CommunityPost:
-    post = db.get(CommunityPost, post_id)
+def lock_community_post(db: Session, post_id: int) -> None:
+    """Serialize post writers until commit or rollback, across database connections."""
+    if db.get_bind().dialect.name == "sqlite":
+        # SQLite permits one writer. A zero-row UPDATE reserves its write transaction.
+        table = CommunityPost.__table__
+        db.execute(update(table).where(false()).values(id=table.c.id))
+    else:
+        lock_booking_resource(db, f"community_post_mod_{post_id}")
+
+
+def _get_post_or_404(db: Session, post_id: int, *, for_write: bool = False) -> CommunityPost:
+    if for_write:
+        lock_community_post(db, post_id)
+    post = db.get(CommunityPost, post_id, populate_existing=for_write)
     if post is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -636,16 +651,30 @@ def _get_post_or_404(db: Session, post_id: int) -> CommunityPost:
     return post
 
 
+def _is_community_moderator_role(user: User | None) -> bool:
+    if user is None or not is_admin_role(user.role):
+        return False
+    return resolve_canonical_admin_role(user.role) in ("super_admin", "content_moderator")
+
+
 def _can_view_post(post: CommunityPost, viewer: User | None) -> bool:
-    if post.is_published:
+    if is_public_community_post(post):
         return True
     if viewer is None:
         return False
-    return viewer.id == post.author_id or viewer.role == "admin"
+    return viewer.id == post.author_id or _is_community_moderator_role(viewer)
+
+
+def is_public_community_post(post: CommunityPost) -> bool:
+    return bool(post.is_published and post.moderation_status == "active")
+
+
+def public_community_post_filter():
+    return and_(CommunityPost.is_published == true(), CommunityPost.moderation_status == "active")
 
 
 def _require_post_owner_or_admin(post: CommunityPost, current_user: User) -> None:
-    if post.author_id != current_user.id and current_user.role != "admin":
+    if post.author_id != current_user.id and not _is_community_moderator_role(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to modify this post.",
@@ -763,27 +792,42 @@ def update_community_post(
     post_id: int,
     current_user: User,
     payload: CommunityPostUpdate,
+    ip_address: str | None = None,
 ) -> CommunityPostResponse:
-    post = _get_post_or_404(db, post_id)
+    post = _get_post_or_404(db, post_id, for_write=True)
     fields = payload.model_fields_set
 
     is_owner = post.author_id == current_user.id
-    is_admin = current_user.role == "admin"
+    is_admin = _is_community_moderator_role(current_user)
 
-    if not is_owner:
+    if not is_owner or (is_admin and post.moderation_status == "hidden_by_admin"):
         if not is_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You can only edit your own community posts.",
             )
-        # Existing admin moderation policy permits admin visibility toggling (`is_published`)
-        # without rewriting another user's authored caption/location.
+        # Visibility changes to moderator-hidden posts use the audit path even for moderator authors.
         non_moderation_fields = fields - {"is_published"}
         if non_moderation_fields:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Administrators may moderate post visibility (is_published) but cannot rewrite another user's post content.",
             )
+        if payload.is_published is not None:
+            # The moderation service also uses this module's post utilities.
+            from app.services.community_moderation import apply_community_post_moderation
+
+            try:
+                apply_community_post_moderation(
+                    db, post=post, admin_user=current_user, ip_address=ip_address,
+                    payload=AdminCommunityPostModerationRequest(is_published=payload.is_published),
+                )
+                response = serialize_post(db, post, viewer=current_user)
+                _commit(db)
+                return response
+            except Exception:
+                db.rollback()
+                raise
 
     # Critical moderation guard (HR-01):
     # Authors must NEVER edit or republish a post hidden by an admin or marked removed_by_author.
@@ -884,10 +928,6 @@ def update_community_post(
         post.is_promotional = new_is_promotional
         if "is_published" in fields and payload.is_published is not None:
             post.is_published = payload.is_published
-            if is_admin and not is_owner:
-                post.moderation_status = (
-                    "active" if payload.is_published else "hidden_by_admin"
-                )
         post.updated_at = _now_utc()
 
         if desired_tags is not None:
@@ -961,15 +1001,18 @@ def delete_community_post(
     *,
     post_id: int,
     current_user: User,
+    ip_address: str | None = None,
 ) -> CommunityPostDeleteResponse:
     """
     Delete a community post safely under SQL Server foreign-key constraints while
     preserving moderation evidence whenever reports reference the post or its comments.
     """
-    post = _get_post_or_404(db, post_id)
+    post = _get_post_or_404(db, post_id, for_write=True)
     _require_post_owner_or_admin(post, current_user)
 
-    if current_user.role != "admin" and post.moderation_status == "hidden_by_admin":
+    is_admin = _is_community_moderator_role(current_user)
+    moderating_another_author = is_admin and post.author_id != current_user.id
+    if not is_admin and post.moderation_status == "hidden_by_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This post was hidden by an administrator and cannot be deleted by the author.",
@@ -977,13 +1020,17 @@ def delete_community_post(
 
     if _has_moderation_reports(db, post.id):
         try:
-            post.is_published = False
-            post.moderation_status = (
-                "hidden_by_admin"
-                if (current_user.role == "admin" and post.author_id != current_user.id)
-                else "removed_by_author"
-            )
-            post.updated_at = _now_utc()
+            if moderating_another_author:
+                from app.services.community_moderation import apply_community_post_moderation
+
+                apply_community_post_moderation(
+                    db, post=post, admin_user=current_user, ip_address=ip_address,
+                    payload=AdminCommunityPostModerationRequest(is_published=False),
+                )
+            else:
+                post.is_published = False
+                post.moderation_status = "removed_by_author"
+                post.updated_at = _now_utc()
             # Remove private bookmarks & hashtag links so the hidden post disappears
             # from saved lists and hashtag discovery while preserving the post,
             # comments, and media evidence for admin investigation.
@@ -992,7 +1039,7 @@ def delete_community_post(
             ).delete(synchronize_session=False)
             unlink_all_post_hashtags(db, post.id)
             _commit(db)
-        except SQLAlchemyError:
+        except Exception:
             db.rollback()
             raise
         return CommunityPostDeleteResponse(
@@ -1023,6 +1070,20 @@ def delete_community_post(
                 pass
 
     try:
+        if moderating_another_author:
+            from app.services.community_moderation import record_community_admin_audit
+
+            record_community_admin_audit(
+                db, admin_user_id=current_user.id, action="community_post_delete",
+                entity_name="community_post", entity_id=post.id, ip_address=ip_address,
+                details={
+                    "author_id": post.author_id,
+                    "previous_is_published": post.is_published,
+                    "previous_is_featured": post.is_featured,
+                    "previous_moderation_status": post.moderation_status,
+                    "new_moderation_status": "deleted",
+                },
+            )
         unlink_all_post_hashtags(db, post.id)
 
         db.query(CommunitySavedPost).filter(
@@ -1051,7 +1112,7 @@ def delete_community_post(
 
         db.delete(post)
         _commit(db)
-    except SQLAlchemyError:
+    except Exception:
         db.rollback()
         raise
 
@@ -1216,7 +1277,7 @@ async def upload_community_post_photo(
     post = _get_post_or_404(db, post_id)
     _require_post_owner_or_admin(post, current_user)
 
-    if current_user.role != "admin" and post.moderation_status in (
+    if not _is_community_moderator_role(current_user) and post.moderation_status in (
         "hidden_by_admin",
         "removed_by_author",
     ):
@@ -1307,10 +1368,10 @@ def delete_community_post_media(
     current_user: User,
 ) -> CommunityMediaDeleteResponse:
     """Delete a media item belonging to a post (owner or admin only)."""
-    post = _get_post_or_404(db, post_id)
+    post = _get_post_or_404(db, post_id, for_write=True)
     _require_post_owner_or_admin(post, current_user)
 
-    if current_user.role != "admin" and post.moderation_status in (
+    if not _is_community_moderator_role(current_user) and post.moderation_status in (
         "hidden_by_admin",
         "removed_by_author",
     ):
@@ -1335,7 +1396,7 @@ def delete_community_post_media(
 
     # Preserve physical evidence file if moderation reports exist on this post
     preserve_file = _has_moderation_reports(db, post.id)
-    if preserve_file and current_user.role != "admin":
+    if preserve_file and not _is_community_moderator_role(current_user):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Media cannot be deleted while moderation reports reference this post.",

@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.dependencies import is_admin_role, resolve_canonical_admin_role
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
@@ -43,8 +44,11 @@ def require_homestay_manager(
             detail="Inactive user account.",
         )
 
-    # 1. Administrator access
-    if current_user.role == "admin":
+    # 1. Administrator access (Super Admin, legacy 'admin', or Operations Admin)
+    if is_admin_role(current_user.role) and resolve_canonical_admin_role(current_user.role) in (
+        "super_admin",
+        "operations_admin",
+    ):
         return current_user
 
     # 2. Reject non-manager roles immediately
@@ -132,7 +136,10 @@ def check_homestay_ownership(
     3. If provider_profile_id is None (legacy listing or admin-created):
        - homestay.owner_id must match current_user.id.
     """
-    if current_user.role == "admin":
+    if is_admin_role(current_user.role) and resolve_canonical_admin_role(current_user.role) in (
+        "super_admin",
+        "operations_admin",
+    ):
         return True
 
     homestay_profile_id = getattr(homestay, "provider_profile_id", None)

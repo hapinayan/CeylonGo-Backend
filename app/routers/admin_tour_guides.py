@@ -24,7 +24,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.dependencies import require_admin
+from app.core.dependencies import (
+    require_admin,
+    require_operations_admin,
+    require_operations_or_support_read,
+)
 from app.core.notification_service import create_notification
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
@@ -74,7 +78,7 @@ router = APIRouter(
     dependencies=[Depends(require_admin)],
 )
 
-AdminUser = Annotated[User, Depends(require_admin)]
+AdminUser = Annotated[User, Depends(require_operations_admin)]
 DatabaseSession = Annotated[Session, Depends(get_db)]
 
 
@@ -127,6 +131,7 @@ def _require_guide(db: Session, guide_id: int) -> TourGuide:
     "",
     response_model=AdminTourGuideListResponse,
     summary="List tour guide profiles for admin review and moderation",
+    dependencies=[Depends(require_operations_admin)],
 )
 def admin_list_tour_guides(
     db: DatabaseSession,
@@ -230,6 +235,7 @@ def admin_list_tour_guides(
     "/credentials",
     response_model=AdminCredentialListResponse,
     summary="List tour guide qualification credentials for admin review",
+    dependencies=[Depends(require_operations_admin)],
 )
 def admin_list_guide_credentials(
     db: DatabaseSession,
@@ -293,6 +299,7 @@ def admin_list_guide_credentials(
     "/credentials/{credential_id}/document",
     response_class=FileResponse,
     summary="Securely stream a private tour guide credential document to admin",
+    dependencies=[Depends(require_operations_admin)],
 )
 def admin_view_credential_document(
     credential_id: Annotated[int, Path(gt=0)],
@@ -432,6 +439,7 @@ def admin_verify_guide_credential(
     "/bookings",
     response_model=AdminTourGuideBookingListResponse,
     summary="List and monitor all tour guide bookings and issues",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def admin_list_guide_bookings(
     db: DatabaseSession,
@@ -468,6 +476,7 @@ def admin_list_guide_bookings(
     "/bookings/{booking_id}",
     response_model=TourGuideBookingDetailResponse,
     summary="Inspect a specific tour guide booking, policy snapshots, and full audit trail",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def admin_get_guide_booking_detail(
     booking_id: Annotated[int, Path(gt=0)],
@@ -484,6 +493,7 @@ def admin_get_guide_booking_detail(
     "/{guide_id}",
     response_model=AdminTourGuideDetailResponse,
     summary="Inspect complete tour guide profile, packages, credentials, and verification history",
+    dependencies=[Depends(require_operations_admin)],
 )
 def admin_get_tour_guide_detail(
     guide_id: Annotated[int, Path(gt=0)],

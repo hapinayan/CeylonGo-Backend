@@ -538,7 +538,8 @@ def update_artisan_review(
     """
     review = (
         db.query(Review)
-        .filter(Review.id == review_id)
+        .join(ListingReference, Review.listing_reference_id == ListingReference.id)
+        .filter(Review.id == review_id, ListingReference.module_type == ARTISAN_MODULE_TYPE)
         .first()
     )
     if not review:
@@ -585,7 +586,8 @@ def delete_artisan_review(
     """
     review = (
         db.query(Review)
-        .filter(Review.id == review_id)
+        .join(ListingReference, Review.listing_reference_id == ListingReference.id)
+        .filter(Review.id == review_id, ListingReference.module_type == ARTISAN_MODULE_TYPE)
         .first()
     )
     if not review:

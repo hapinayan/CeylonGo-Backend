@@ -14,7 +14,6 @@ Strictly aligned with Migration 028 + Migration 039 + dbo.admin_audit_logs:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import json
 import math
 import os
 import re
@@ -25,7 +24,9 @@ from sqlalchemy import false, func, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.audit import redact_audit_details, sanitize_audit_details
 from app.core.booking_transactions import lock_booking_resource
+from app.core.dependencies import is_admin_role, resolve_canonical_admin_role
 from app.core.rate_limiter import SlidingWindowRateLimiter
 from app.models.community import (
     CommunityComment,
@@ -58,7 +59,12 @@ from app.schemas.community import (
     CommunityReportTargetPreview,
 )
 from app.services.community_engagement import execute_comment_deletion_uncommitted
-from app.services.community_posts import sanitize_community_text
+from app.services.community_posts import (
+    _get_post_or_404,
+    is_public_community_post,
+    lock_community_post,
+    sanitize_community_text,
+)
 
 # =============================================================================
 # CONSTANTS & RATE LIMITER
@@ -134,7 +140,7 @@ def enforce_community_not_suspended(db: Session, current_user: User) -> User:
     - Reads dbo.community_user_profiles only; NEVER reads or modifies dbo.users.is_active.
     - Expired suspensions (suspended_until <= now UTC) are automatically treated as unsuspended.
     """
-    if current_user.role == "admin":
+    if is_admin_role(current_user.role):
         return current_user
 
     profile = db.get(CommunityUserProfile, current_user.id)
@@ -196,18 +202,12 @@ def record_community_admin_audit(
     Never catches or suppresses errors so moderation actions and audit logs commit
     or roll back atomically together.
     """
-    serialized: str | None
-    if isinstance(details, dict):
-        serialized = json.dumps(details, default=str)
-    else:
-        serialized = details
-
     entry = AdminAuditLog(
         admin_user_id=admin_user_id,
         action=action[:50],
         entity_name=entity_name[:50],
         entity_id=entity_id,
-        details=serialized,
+        details=sanitize_audit_details(details),
         ip_address=ip_address[:45] if ip_address else None,
     )
     db.add(entry)
@@ -230,10 +230,13 @@ def _validate_report_target(
     Verify that the polymorphic report target exists, is accessible to the reporter,
     and is not a self-report.
     """
-    is_admin = reporter.role == "admin"
+    is_admin = is_admin_role(reporter.role) and resolve_canonical_admin_role(reporter.role) in (
+        "super_admin",
+        "content_moderator",
+    )
 
     if entity_type == "post":
-        post = db.get(CommunityPost, entity_id)
+        post = db.get(CommunityPost, entity_id, populate_existing=True)
         if post is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -241,7 +244,7 @@ def _validate_report_target(
             )
         author = db.get(User, post.author_id)
         author_active = author is not None and bool(author.is_active)
-        if not is_admin and (not post.is_published or not author_active):
+        if not is_admin and (not is_public_community_post(post) or not author_active):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Report target post not found.",
@@ -254,21 +257,21 @@ def _validate_report_target(
         return
 
     if entity_type == "comment":
-        comment = db.get(CommunityComment, entity_id)
+        comment = db.get(CommunityComment, entity_id, populate_existing=True)
         if comment is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Report target comment not found.",
             )
-        post = db.get(CommunityPost, comment.post_id)
+        post = db.get(CommunityPost, comment.post_id, populate_existing=True)
         post_author = db.get(User, post.author_id) if post else None
         post_accessible = (
             post is not None
-            and post.is_published
+            and is_public_community_post(post)
             and post_author is not None
             and bool(post_author.is_active)
         )
-        if not is_admin and not post_accessible:
+        if post is None or (not is_admin and not post_accessible):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Report target comment not found.",
@@ -329,6 +332,15 @@ def submit_community_report(
         allow_newlines=True,
         required=False,
     )
+
+    # Lock parent post before taking the per-reporter duplicate lock.
+    if payload.entity_type == "post":
+        lock_community_post(db, payload.entity_id)
+    elif payload.entity_type == "comment":
+        post_id = db.query(CommunityComment.post_id).filter_by(id=payload.entity_id).scalar()
+        if post_id is None:
+            raise HTTPException(status_code=404, detail="Report target comment not found.")
+        lock_community_post(db, post_id)
 
     _validate_report_target(
         db,
@@ -658,15 +670,30 @@ def moderate_admin_community_post(
     payload: AdminCommunityPostModerationRequest,
     ip_address: str | None = None,
 ) -> AdminCommunityPostModerationResponse:
-    post = db.get(CommunityPost, post_id)
-    if post is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community post not found.",
+    try:
+        post = _get_post_or_404(db, post_id, for_write=True)
+        outcome = apply_community_post_moderation(
+            db, post=post, admin_user=admin_user, payload=payload,
+            ip_address=ip_address, audit_unchanged=True,
         )
+        assert outcome is not None
+        _commit(db)
+        return outcome
+    except Exception:
+        db.rollback()
+        raise
 
-    lock_booking_resource(db, f"community_post_mod_{post.id}")
-    db.refresh(post)
+
+def apply_community_post_moderation(
+    db: Session,
+    *,
+    post: CommunityPost,
+    admin_user: User,
+    payload: AdminCommunityPostModerationRequest,
+    ip_address: str | None = None,
+    audit_unchanged: bool = False,
+) -> AdminCommunityPostModerationResponse | None:
+    """Apply and audit moderation after the caller locks and reloads the post."""
 
     sanitized_reason = sanitize_community_text(
         payload.reason,
@@ -710,53 +737,61 @@ def moderate_admin_community_post(
     else:
         action = "community_post_unfeature"
 
-    try:
+    state_changed = (previous_is_published, previous_is_featured, previous_moderation_status) != (
+        target_is_published, target_is_featured, target_moderation_status,
+    )
+    if not state_changed and not audit_unchanged:
+        return None
+
+    details = {
+        "author_id": post.author_id,
+        "previous_is_published": previous_is_published,
+        "new_is_published": target_is_published,
+        "previous_is_featured": previous_is_featured,
+        "new_is_featured": target_is_featured,
+        "previous_moderation_status": previous_moderation_status,
+        "new_moderation_status": target_moderation_status,
+        "reason": sanitized_reason,
+        "state_changed": state_changed,
+    }
+    audit_entry = None
+    if state_changed:
         post.is_published = target_is_published
         post.moderation_status = target_moderation_status
         post.is_featured = target_is_featured
         post.updated_at = _now_utc()
         db.flush()
+    else:
+        # The dedicated response requires an audit ID even for an unchanged command.
+        latest = (
+            db.query(AdminAuditLog)
+            .filter_by(entity_name="community_post", entity_id=post.id)
+            .order_by(AdminAuditLog.id.desc())
+            .first()
+        )
+        if (latest and latest.admin_user_id == admin_user.id and latest.action == action
+                and latest.details == sanitize_audit_details(details)):
+            audit_entry = latest
 
+    if audit_entry is None:
         audit_entry = record_community_admin_audit(
-            db,
-            admin_user_id=admin_user.id,
-            action=action,
-            entity_name="community_post",
-            entity_id=post.id,
-            details={
-                "author_id": post.author_id,
-                "previous_is_published": previous_is_published,
-                "new_is_published": bool(post.is_published),
-                "previous_is_featured": previous_is_featured,
-                "new_is_featured": bool(post.is_featured),
-                "previous_moderation_status": previous_moderation_status,
-                "new_moderation_status": post.moderation_status,
-                "reason": sanitized_reason,
-            },
-            ip_address=ip_address,
+            db, admin_user_id=admin_user.id, action=action, entity_name="community_post",
+            entity_id=post.id, details=details, ip_address=ip_address,
         )
 
-        _commit(db)
-        db.refresh(post)
-        return AdminCommunityPostModerationResponse(
-            post_id=post.id,
-            author_id=post.author_id,
-            is_published=bool(post.is_published),
-            previous_is_published=previous_is_published,
-            is_featured=bool(post.is_featured),
-            previous_is_featured=previous_is_featured,
-            moderation_status=post.moderation_status,
-            action=action,  # type: ignore[arg-type]
-            reason=sanitized_reason,
-            updated_at=post.updated_at,
-            audit_log_id=audit_entry.id,
-        )
-    except HTTPException:
-        db.rollback()
-        raise
-    except SQLAlchemyError:
-        db.rollback()
-        raise
+    return AdminCommunityPostModerationResponse(
+        post_id=post.id,
+        author_id=post.author_id,
+        is_published=bool(post.is_published),
+        previous_is_published=previous_is_published,
+        is_featured=bool(post.is_featured),
+        previous_is_featured=previous_is_featured,
+        moderation_status=post.moderation_status,
+        action=action,  # type: ignore[arg-type]
+        reason=sanitized_reason,
+        updated_at=post.updated_at,
+        audit_log_id=audit_entry.id,
+    )
 
 
 # =============================================================================
@@ -782,7 +817,7 @@ def moderate_admin_community_profile_suspension(
             detail="Target user not found.",
         )
 
-    if target_user.role == "admin":
+    if is_admin_role(target_user.role):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Administrator accounts cannot be community-suspended.",
@@ -1186,12 +1221,6 @@ def get_admin_community_activity(
 
     recent_moderation_actions: list[AdminCommunityAuditLogItem] = []
     for a in audit_rows:
-        parsed_details: dict[str, Any] | str | None = a.details
-        if isinstance(a.details, str):
-            try:
-                parsed_details = json.loads(a.details)
-            except ValueError:
-                parsed_details = a.details
         recent_moderation_actions.append(
             AdminCommunityAuditLogItem(
                 id=a.id,
@@ -1200,7 +1229,7 @@ def get_admin_community_activity(
                 action=a.action,
                 entity_name=a.entity_name,
                 entity_id=a.entity_id,
-                details=parsed_details,
+                details=redact_audit_details(a.details),
                 created_at=a.created_at,
             )
         )

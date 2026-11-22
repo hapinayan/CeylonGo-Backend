@@ -5,12 +5,13 @@ import os
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin
+from app.core.audit import record_admin_audit_log
+from app.core.dependencies import require_admin, require_operations_admin
 from app.core.provider_onboarding import lock_onboarding
 from app.core.email import (
     send_provider_approval_email,
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/v1/admin/providers",
     tags=["Admin Providers"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin), Depends(require_operations_admin)],
 )
 
 ALLOWED_DOCUMENT_TYPES = {"selfie", "nic_front", "nic_back"}
@@ -285,6 +286,7 @@ def approve_provider_application(
     provider_id: int,
     admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
+    request: Request = None,
 ):
     """
     Approve a pending provider application.
@@ -350,10 +352,18 @@ def approve_provider_application(
     profile.user.password_hash = None
     profile.user.is_active = False
 
-    db.add(AdminAuditLog(
-        admin_user_id=admin_user.id, action="provider_approved",
-        entity_name="provider_profiles", entity_id=provider_id,
-    ))
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="provider_approved",
+        entity_name="provider_profiles",
+        entity_id=provider_id,
+        details={
+            "business_name": profile.business_name,
+            "provider_type": profile.provider_type,
+        },
+        request=request,
+    )
     db.commit()
     db.refresh(profile)
 
@@ -385,6 +395,7 @@ def reject_provider_application(
     payload: RejectProviderRequest,
     admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
+    request: Request = None,
 ):
     """
     Reject a pending provider application with a mandatory reason.
@@ -436,10 +447,19 @@ def reject_provider_application(
 
     profile.user.is_active = False
 
-    db.add(AdminAuditLog(
-        admin_user_id=admin_user.id, action="provider_rejected",
-        entity_name="provider_profiles", entity_id=provider_id,
-    ))
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="provider_rejected",
+        entity_name="provider_profiles",
+        entity_id=provider_id,
+        details={
+            "business_name": profile.business_name,
+            "provider_type": profile.provider_type,
+            "rejection_reason": payload.reason,
+        },
+        request=request,
+    )
     db.commit()
     db.refresh(profile)
 

@@ -1,10 +1,10 @@
-import json
 from datetime import UTC, datetime
 
 from fastapi import HTTPException
 from sqlalchemy import case, literal, null, select, true, union_all, update
 from sqlalchemy.orm import Session
 
+from app.core.audit import sanitize_audit_details
 from app.core.listing_sync import sync_homestay_listing_reference
 from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
@@ -86,7 +86,7 @@ def record_location_correction(db, admin_id, entity, listing_id, before, after, 
             action="map_location_corrected",
             entity_name=entity,
             entity_id=listing_id,
-            details=json.dumps(
+            details=sanitize_audit_details(
                 {
                     "before": [
                         str(value) if value is not None else None for value in before
@@ -204,7 +204,7 @@ def decide_location(db, module, listing_id, payload, admin_id):
                 action=f"map_location_{payload.decision}",
                 entity_name=model.__tablename__,
                 entity_id=listing_id,
-                details=json.dumps({"reason": payload.reason}),
+                details=sanitize_audit_details({"reason": payload.reason}),
             )
         )
         result = LocationReview(

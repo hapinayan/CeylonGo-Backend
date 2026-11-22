@@ -1,12 +1,12 @@
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.booking_transactions import lock_booking_resource
-from app.core.dependencies import require_admin
+from app.core.dependencies import require_admin, require_content_moderator
 from app.core.homestay_permissions import require_homestay_manager
 from app.core.listing_sync import (
     sync_homestay_booking_reference,
@@ -15,6 +15,7 @@ from app.core.listing_sync import (
 from app.core.notification_service import create_notification
 from app.core.publication import public_homestay
 from app.database.connection import get_db
+from app.services.review_moderation import apply_review_moderation, lock_review_moderation, scoped_reviews
 from app.models.booking import Booking
 from app.models.homestay import Homestay
 from app.models.provider_profile import ProviderProfile
@@ -346,19 +347,19 @@ def list_my_homestay_reviews(
 def moderate_review(
     review_id: int,
     payload: ReviewModerationRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    review = db.query(Review).filter(Review.id == review_id).first()
-    if not review:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Review not found",
-        )
+    lock_review_moderation(db, f"review_moderation_{review_id}")
+    review = scoped_reviews(db, "homestay").filter(Review.id == review_id).populate_existing().first()
+    if review is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Review not found")
 
-    review.is_published = payload.is_published
-    db.commit()
-    db.refresh(review)
+    apply_review_moderation(
+        db, review=review, module="homestay", admin_id=admin.id, published=payload.is_published, reason=payload.reason, request=request,
+    )
 
     return HomestayReviewResponse(
         id=review.id,

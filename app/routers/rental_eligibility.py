@@ -18,7 +18,14 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
-from app.core.dependencies import require_admin
+from app.core.audit import sanitize_audit_details
+from app.core.dependencies import (
+    is_admin_role,
+    require_admin,
+    require_operations_admin,
+    require_operations_or_support_read,
+    resolve_canonical_admin_role,
+)
 from app.core.notification_service import create_notification
 from app.models.rental import RentalEligibilityCheck
 from app.models.shared import AdminAuditLog
@@ -63,7 +70,7 @@ def log_admin_audit(
         action=action,
         entity_name=entity_name,
         entity_id=entity_id,
-        details=details,
+        details=sanitize_audit_details(details),
         ip_address=ip_address,
     )
     db.add(audit)
@@ -286,7 +293,12 @@ def get_license_document_file(
             detail="Document record not found.",
         )
 
-    if current_user.role != "admin" and eligibility.user_id != current_user.id:
+    is_owner = eligibility.user_id == current_user.id
+    is_authorized_admin = (
+        is_admin_role(current_user.role)
+        and resolve_canonical_admin_role(current_user.role) in ("super_admin", "operations_admin")
+    )
+    if not is_owner and not is_authorized_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not authorized to access this driving credential.",
@@ -321,7 +333,7 @@ def get_license_document_file(
     "/admin/all",
     response_model=AdminEligibilityPagination,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_operations_or_support_read)],
     summary="Admin moderation queue for traveler driving eligibility submissions",
 )
 def list_admin_driving_eligibility(
@@ -391,7 +403,7 @@ def list_admin_driving_eligibility(
     "/admin/pending",
     response_model=AdminEligibilityPagination,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_operations_or_support_read)],
     summary="Admin convenience queue for unreviewed driving eligibility submissions",
 )
 def list_pending_driving_eligibility(
@@ -418,7 +430,7 @@ def list_pending_driving_eligibility(
 def review_driving_eligibility(
     eligibility_id: int,
     payload: AdminEligibilityReviewRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     request: Request,
 ):
@@ -498,7 +510,7 @@ def review_driving_eligibility(
         action=action_name,
         entity_name="rental_eligibility_checks",
         entity_id=eligibility.id,
-        details=f"Admin {payload.decision} license #{eligibility.id} for user #{eligibility.user_id} ({eligibility.license_country} - {eligibility.driver_license_number}). Reason: {payload.rejection_reason or 'None'}",
+        details=f"Admin {payload.decision} eligibility check #{eligibility.id} for user #{eligibility.user_id}. Reason: {payload.rejection_reason or 'None'}",
         ip_address=client_ip,
     )
 

@@ -1,14 +1,16 @@
 import math
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_admin_audit_log
 from app.core.publication import public_artisan
 from app.core.dependencies import (
     require_admin,
     require_approved_provider,
+    require_operations_admin,
 )
 from app.core.location_validation import (
     ARTISAN_LOCATION_FIELDS,
@@ -482,7 +484,8 @@ def delete_artisan_listing(
 def update_listing_status(
     id: int,
     payload: ArtisanListingStatusUpdate,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -523,6 +526,20 @@ def update_listing_status(
             setattr(listing, key, value)
 
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_status_updated",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={
+            "approval_status": listing.approval_status,
+            "is_verified": listing.is_verified,
+            "is_featured": listing.is_featured,
+            "is_active": listing.is_active,
+        },
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
     return ArtisanListingResponse.model_validate(listing)

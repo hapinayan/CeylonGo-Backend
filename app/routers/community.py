@@ -8,7 +8,11 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, 
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin, require_approved_provider
+from app.core.dependencies import (
+    require_admin,
+    require_approved_provider,
+    require_content_moderator,
+)
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
@@ -235,11 +239,13 @@ def get_post_endpoint(
 def update_post_endpoint(
     post_id: int,
     payload: CommunityPostUpdate,
+    request: Request,
     current_user: Annotated[User, Depends(require_unsuspended_community_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CommunityPostResponse:
     return update_community_post(
-        db, post_id=post_id, current_user=current_user, payload=payload
+        db, post_id=post_id, current_user=current_user, payload=payload,
+        ip_address=request.client.host if request.client else None,
     )
 
 
@@ -250,10 +256,14 @@ def update_post_endpoint(
 )
 def delete_post_endpoint(
     post_id: int,
+    request: Request,
     current_user: Annotated[User, Depends(require_unsuspended_community_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CommunityPostDeleteResponse:
-    return delete_community_post(db, post_id=post_id, current_user=current_user)
+    return delete_community_post(
+        db, post_id=post_id, current_user=current_user,
+        ip_address=request.client.host if request.client else None,
+    )
 
 
 # =============================================================================
@@ -581,7 +591,7 @@ def submit_report_endpoint(
     summary="List paginated community moderation reports (admin only)",
 )
 def admin_list_reports_endpoint(
-    _admin: Annotated[User, Depends(require_admin)],
+    _admin: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
     report_status: Annotated[ReportStatusType | None, Query()] = None,
     entity_type: Annotated[ReportEntityType | None, Query()] = None,
@@ -606,7 +616,7 @@ def admin_review_report_endpoint(
     report_id: int,
     payload: AdminCommunityReportUpdate,
     request: Request,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ) -> AdminCommunityReportReviewResponse:
     client_ip = request.client.host if request.client else None
@@ -628,7 +638,7 @@ def admin_moderate_post_endpoint(
     post_id: int,
     payload: AdminCommunityPostModerationRequest,
     request: Request,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ) -> AdminCommunityPostModerationResponse:
     client_ip = request.client.host if request.client else None
@@ -650,7 +660,7 @@ def admin_moderate_profile_suspension_endpoint(
     user_id: int,
     payload: AdminCommunityProfileSuspensionRequest,
     request: Request,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ) -> AdminCommunityProfileSuspensionResponse:
     client_ip = request.client.host if request.client else None
@@ -669,7 +679,7 @@ def admin_moderate_profile_suspension_endpoint(
     summary="List and filter community hashtags for admin governance (admin only)",
 )
 def admin_list_hashtags_endpoint(
-    _admin: Annotated[User, Depends(require_admin)],
+    _admin: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
     is_blocked: bool | None = None,
     is_featured: bool | None = None,
@@ -696,7 +706,7 @@ def admin_moderate_hashtag_endpoint(
     hashtag_id: int,
     payload: AdminCommunityHashtagUpdate,
     request: Request,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ) -> AdminCommunityHashtagModerationResponse:
     client_ip = request.client.host if request.client else None
@@ -717,7 +727,7 @@ def admin_moderate_hashtag_endpoint(
 def admin_moderate_delete_comment_endpoint(
     comment_id: int,
     request: Request,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
     reason: Annotated[str | None, Query(max_length=500)] = None,
 ) -> AdminCommunityCommentModerationResponse:
@@ -737,7 +747,7 @@ def admin_moderate_delete_comment_endpoint(
     summary="Get Travel Community moderation counts, open flagged reports & recent audit activity (admin only)",
 )
 def admin_community_activity_endpoint(
-    _admin: Annotated[User, Depends(require_admin)],
+    _admin: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
     recent_limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> AdminCommunityActivityResponse:

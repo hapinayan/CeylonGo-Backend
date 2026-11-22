@@ -2,10 +2,17 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.dependencies import require_admin
+from app.core.audit import record_admin_audit_log
+from app.core.booking_transactions import CAPTURED
+from app.core.dependencies import (
+    require_admin,
+    require_operations_admin,
+    require_operations_or_finance_admin,
+)
 from app.core.listing_sync import sync_homestay_listing_reference
 from app.core.location_validation import HOMESTAY_REVIEW_STATE, write_review_snapshot
 from app.core.notification_service import create_notification
@@ -13,11 +20,11 @@ from app.database.connection import get_db
 from app.models.booking import Booking
 from app.models.homestay import Homestay
 from app.models.shared import (
+    BookingReference,
     ListingReference,
     PaymentRefund,
     PaymentTransaction,
     PromotionCampaign,
-    ProviderSettlement,
     Review,
 )
 from app.models.user import User
@@ -67,7 +74,7 @@ def _get_homestay_or_404(homestay_id: int, db: Session) -> Homestay:
     summary="List homestays awaiting admin review",
 )
 def list_pending_homestays(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     limit: int = Query(default=50, ge=1, le=100),
 ):
@@ -88,9 +95,14 @@ def list_pending_homestays(
     "/dashboard",
     response_model=HomestayAdminDashboardResponse,
     summary="Get homestay administrative summary",
+    description=(
+        "Payment and refund figures cover LKR only. Homestay settlement figures "
+        "are unavailable because settlements are recorded per provider without a "
+        "module allocation. The settlement fields return zero placeholders."
+    ),
 )
 def get_admin_dashboard(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """Aggregate platform-wide homestay administrative metrics."""
@@ -124,47 +136,41 @@ def get_admin_dashboard(
     )
 
     # 3. Payments and refunds
-    payments = (
-        db.query(PaymentTransaction)
+    currency = "LKR"
+    payment_count, payment_volume = (
+        db.query(func.count(PaymentTransaction.id), func.sum(PaymentTransaction.amount))
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .filter(
-            PaymentTransaction.module_type == "homestay",
-            PaymentTransaction.payment_status == "success",
+            BookingReference.module_type == "homestay",
+            PaymentTransaction.payment_status.in_(CAPTURED),
+            PaymentTransaction.payment_method == "online",
+            PaymentTransaction.currency == currency,
         )
-        .all()
+        .one()
     )
-    total_payments_vol = sum((Decimal(str(p.amount)) for p in payments), Decimal("0.00"))
 
-    refunds = (
-        db.query(PaymentRefund)
-        .filter(PaymentRefund.refund_status == "pending")
-        .all()
+    refund_count, refund_volume = (
+        db.query(func.count(PaymentRefund.id), func.sum(PaymentRefund.amount))
+        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .filter(
+            BookingReference.module_type == "homestay",
+            PaymentRefund.refund_status == "pending",
+            PaymentRefund.currency == currency,
+        )
+        .one()
     )
-    total_refunds_vol = sum((Decimal(str(r.amount)) for r in refunds), Decimal("0.00"))
 
     payment_summary = HomestayAdminPaymentSummary(
-        total_online_payments_count=len(payments),
-        total_online_payments_volume=total_payments_vol,
-        pending_refunds_count=len(refunds),
-        pending_refunds_volume=total_refunds_vol,
-        currency="LKR",
+        total_online_payments_count=payment_count,
+        total_online_payments_volume=payment_volume or Decimal("0.00"),
+        pending_refunds_count=refund_count,
+        pending_refunds_volume=refund_volume or Decimal("0.00"),
+        currency=currency,
     )
 
-    # 4. Provider settlements
-    settlements = (
-        db.query(ProviderSettlement)
-        .filter(ProviderSettlement.module_type == "homestay")
-        .all()
-    )
-    pending_settlements = [s for s in settlements if s.settlement_status == "pending"]
-    completed_settlements = [s for s in settlements if s.settlement_status == "paid"]
-
-    settlement_summary = HomestayAdminSettlementSummary(
-        pending_settlements_count=len(pending_settlements),
-        pending_settlements_volume=sum((Decimal(str(s.net_amount)) for s in pending_settlements), Decimal("0.00")),
-        completed_settlements_count=len(completed_settlements),
-        completed_settlements_volume=sum((Decimal(str(s.net_amount)) for s in completed_settlements), Decimal("0.00")),
-        currency="LKR",
-    )
+    # 4. Provider settlements have no module allocation. Keep the legacy numeric fields.
+    settlement_summary = HomestayAdminSettlementSummary(currency=currency)
 
     # 5. Sponsored campaigns
     campaigns = (
@@ -219,7 +225,7 @@ def get_admin_dashboard(
 )
 def get_homestay_review_details(
     homestay_id: int,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     return _get_homestay_or_404(homestay_id, db)
@@ -233,10 +239,12 @@ def get_homestay_review_details(
 def review_homestay(
     homestay_id: int,
     payload: HomestayReviewRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     homestay = _get_homestay_or_404(homestay_id, db)
+    previous_status = homestay.approval_status
 
     changes = {
         "approval_status": payload.decision,
@@ -255,6 +263,20 @@ def review_homestay(
 
     # Synchronize with central listing_references
     sync_homestay_listing_reference(db, homestay)
+
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin.id,
+        action=f"homestay_{payload.decision}",
+        entity_name="homestays",
+        entity_id=homestay.id,
+        details={
+            "previous_approval_status": previous_status,
+            "new_approval_status": payload.decision,
+            "reason": payload.reason,
+        },
+        request=request,
+    )
 
     # In-app notification to property provider
     provider_user_id = homestay.owner_id
@@ -299,11 +321,26 @@ def review_homestay(
 def verify_homestay(
     homestay_id: int,
     payload: HomestayVerificationRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     homestay = _get_homestay_or_404(homestay_id, db)
+    previous_verification = homestay.verification_status
     homestay.verification_status = payload.verification_status
+
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin.id,
+        action=f"homestay_verification_{payload.verification_status}",
+        entity_name="homestays",
+        entity_id=homestay.id,
+        details={
+            "previous_verification_status": previous_verification,
+            "new_verification_status": payload.verification_status,
+        },
+        request=request,
+    )
 
     provider_user_id = homestay.owner_id
     if not provider_user_id and homestay.provider_profile:

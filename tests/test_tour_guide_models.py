@@ -759,7 +759,7 @@ GUIDE_PAYLOAD = {
 
 
 def bearer(user):
-    from app.core.security import create_access_token
+    from tests.access_tokens import create_fixture_access_token as create_access_token
 
     return {"Authorization": f"Bearer {create_access_token({'sub': str(user.id)})}"}
 
@@ -1033,7 +1033,7 @@ def test_create_guide_rejects_unknown_field(
 
 
 def test_create_guide_rejects_expired_jwt(guide_api, sample_guide_user, sample_provider_profile):
-    from app.core.security import create_access_token
+    from tests.access_tokens import create_fixture_access_token as create_access_token
 
     token = create_access_token(
         {"sub": str(sample_guide_user.id)}, expires_delta=timedelta(minutes=-1),

@@ -16,6 +16,7 @@ class ReviewModerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_published: bool
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class HomestayReviewResponse(BaseModel):

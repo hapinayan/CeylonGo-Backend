@@ -29,7 +29,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.community import (
@@ -571,6 +571,164 @@ def test_admin_featured_post_management_and_featured_feed_filtering(
 # =============================================================================
 # 3. BLOCKED & FEATURED HASHTAG GOVERNANCE
 # =============================================================================
+
+@pytest.mark.parametrize("role", ["content_moderator", "super_admin", "admin"])
+def test_generic_post_visibility_uses_audited_moderation(client, db_session, actors, role):
+    author, unrelated = actors["t1"], actors["t2"]
+    moderator = actors["admin"]
+    moderator.role = role
+    db_session.commit()
+    author_headers, moderator_headers = bearer(author), bearer(moderator)
+    post = client.post(f"{COMMUNITY_BASE}/posts", headers=author_headers,
+                       json={"content": "Moderation parity"}).json()
+    path = f"{COMMUNITY_BASE}/posts/{post['id']}"
+    admin_path = f"{COMMUNITY_BASE}/admin/posts/{post['id']}"
+    edit = client.patch(path, headers=author_headers, json={"content": "Author update"})
+    assert edit.status_code == 200
+    assert edit.json()["content"] == "Author update"
+    assert client.patch(path, headers=bearer(unrelated), json={"is_published": False}).status_code == 403
+    assert client.patch(path, headers=moderator_headers,
+                        json={"is_published": False, "content": "Moderator rewrite"}).status_code == 403
+    assert db_session.query(AdminAuditLog).count() == 0
+    upload = client.post(f"{path}/media", headers=author_headers,
+                         files={"file": ("review.jpg", _make_jpeg_bytes(), "image/jpeg")})
+    assert upload.status_code == 201
+    media_url = upload.json()["media_url"]
+    assert client.get(media_url).status_code == 200
+    assert client.patch(admin_path, headers=moderator_headers, json={"is_featured": True}).status_code == 200
+
+    hidden = client.patch(path, headers=moderator_headers, json={"is_published": False})
+    assert hidden.status_code == 200
+    assert set(hidden.json()) == set(post)
+    assert hidden.json()["content"] == "Author update"
+    assert hidden.json()["is_published"] is False
+    assert hidden.json()["is_featured"] is False
+    assert client.get(path).status_code == 404
+    assert client.get(media_url, headers=bearer(unrelated)).status_code == 404
+    assert client.get(media_url, headers=moderator_headers).status_code == 200
+    assert post["id"] not in [item["id"] for item in client.get(f"{COMMUNITY_BASE}/feed").json()["items"]]
+    search = f"{COMMUNITY_BASE}/search"
+    assert client.get(search, params={"q": "Author update", "type": "posts"}).json()["posts"] == []
+    assert client.patch(path, headers=author_headers, json={"is_published": True}).status_code == 403
+    assert client.patch(path, headers=moderator_headers, json={"is_published": False}).status_code == 200
+    assert db_session.query(AdminAuditLog).filter_by(action="community_post_hide").count() == 1
+
+    restored = client.patch(path, headers=moderator_headers, json={"is_published": True})
+    assert restored.status_code == 200
+    assert restored.json()["is_published"] is True
+    assert restored.json()["is_featured"] is False
+    assert client.get(path).status_code == client.get(media_url).status_code == 200
+    assert [item["id"] for item in client.get(search, params={"q": "Author update", "type": "posts"}).json()["posts"]] == [post["id"]]
+    events = db_session.query(AdminAuditLog).order_by(AdminAuditLog.id).all()
+    assert [event.action for event in events] == [
+        "community_post_feature", "community_post_hide", "community_post_restore",
+    ]
+    for event, published, previous, current in (
+        (events[1], False, "active", "hidden_by_admin"),
+        (events[2], True, "hidden_by_admin", "active"),
+    ):
+        assert event.admin_user_id == moderator.id
+        assert event.created_at is not None
+        assert event.entity_id == post["id"]
+        assert json.loads(event.details) == {
+            "author_id": author.id, "previous_is_published": not published, "new_is_published": published,
+            "previous_is_featured": not published, "new_is_featured": False,
+            "previous_moderation_status": previous, "new_moderation_status": current,
+            "reason": None, "state_changed": True,
+        }
+
+    dedicated = client.patch(admin_path, headers=moderator_headers,
+                             json={"is_published": True, "reason": "Already reviewed"})
+    assert dedicated.status_code == 200
+    assert dedicated.json()["reason"] == "Already reviewed"
+    event = db_session.get(AdminAuditLog, dedicated.json()["audit_log_id"])
+    assert json.loads(event.details)["state_changed"] is False
+    retried = client.patch(admin_path, headers=moderator_headers,
+                           json={"is_published": True, "reason": "Already reviewed"})
+    assert retried.status_code == 200
+    assert retried.json()["audit_log_id"] == event.id
+    assert db_session.query(AdminAuditLog).count() == 4
+
+
+def test_public_surfaces_hide_inconsistent_moderated_post(client, db_session, actors):
+    headers = bearer(actors["t1"])
+    post = client.post(f"{COMMUNITY_BASE}/posts", headers=headers,
+                       json={"content": "Legacy inconsistent moderation"}).json()
+    path = f"{COMMUNITY_BASE}/posts/{post['id']}"
+    upload = client.post(f"{path}/media", headers=headers,
+                         files={"file": ("review.jpg", _make_jpeg_bytes(), "image/jpeg")})
+    assert upload.status_code == 201
+    row = db_session.get(CommunityPost, post["id"])
+    assert row.is_published is True
+    row.moderation_status = "hidden_by_admin"
+    db_session.commit()
+
+    assert client.get(path).status_code == 404
+    assert client.get(upload.json()["media_url"]).status_code == 404
+    assert client.get(f"{COMMUNITY_BASE}/feed").json()["items"] == []
+    assert client.get(f"{COMMUNITY_BASE}/search", params={"q": "Legacy"}).json()["posts"] == []
+
+
+@pytest.mark.parametrize("role", ["operations_admin", "finance_admin", "support_admin"])
+def test_generic_and_dedicated_visibility_deny_other_admin_roles(client, db_session, actors, role):
+    denied = actors["admin"]
+    denied.role = role
+    db_session.commit()
+    post = client.post(f"{COMMUNITY_BASE}/posts", headers=bearer(actors["t1"]),
+                       json={"content": "Unchanged post"}).json()
+    for prefix in ("posts", "admin/posts"):
+        response = client.patch(f"{COMMUNITY_BASE}/{prefix}/{post['id']}", headers=bearer(denied),
+                                json={"is_published": False})
+        assert response.status_code == 403
+    assert db_session.get(CommunityPost, post["id"]).is_published is True
+    assert db_session.query(AdminAuditLog).count() == 0
+
+
+@pytest.mark.parametrize("operation", ["patch", "soft_delete", "hard_delete"])
+def test_generic_visibility_and_removal_audit_rollback(client, db_session, actors, monkeypatch, operation):
+    post = client.post(f"{COMMUNITY_BASE}/posts", headers=bearer(actors["t1"]),
+                       json={"content": "Audit rollback #rollback"}).json()
+    path = f"{COMMUNITY_BASE}/posts/{post['id']}"
+    if operation == "soft_delete":
+        report = client.post(f"{COMMUNITY_BASE}/reports", headers=bearer(actors["t2"]),
+                             json={"entity_type": "post", "entity_id": post["id"], "report_reason": "Check"})
+        assert report.status_code == 201
+
+    record_audit = community_moderation.record_community_admin_audit
+
+    def fail_after_audit(*args, **kwargs):
+        record_audit(*args, **kwargs)
+        raise RuntimeError("simulated audit failure after flush")
+
+    def moderate():
+        headers = bearer(actors["admin"])
+        if operation == "patch":
+            return client.patch(path, headers=headers, json={"is_published": False})
+        return client.delete(path, headers=headers)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(community_moderation, "record_community_admin_audit", fail_after_audit)
+        with pytest.raises(RuntimeError, match="simulated audit failure"):
+            moderate()
+    db_session.expire_all()
+    assert db_session.get(CommunityPost, post["id"]).is_published is True
+    assert db_session.query(AdminAuditLog).count() == 0
+
+    response = moderate()
+    assert response.status_code == 200
+    event = db_session.query(AdminAuditLog).one()
+    assert event.admin_user_id == actors["admin"].id
+    assert event.entity_id == post["id"]
+    if operation == "hard_delete":
+        assert response.json()["deletion_mode"] == "hard_deleted"
+        assert event.action == "community_post_delete"
+        assert db_session.get(CommunityPost, post["id"]) is None
+    else:
+        assert event.action == "community_post_hide"
+        assert db_session.get(CommunityPost, post["id"]).is_published is False
+        if operation == "soft_delete":
+            assert response.json()["deletion_mode"] == "soft_unpublished_moderation_preserved"
+
 
 def test_hashtag_governance_blocking_featuring_and_public_visibility(
     client: TestClient, db_session: Session, actors: dict[str, User]

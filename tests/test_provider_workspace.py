@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.main import app
 from app.models.activity_booking import ActivityBooking
 from app.models.activity_slot import ActivitySlot

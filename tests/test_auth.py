@@ -17,12 +17,12 @@ from app.core.email import (
 )
 from app.core.rate_limiter import reset_all_limiters
 from app.core.security import (
-    create_access_token,
     decode_access_token,
     hash_password,
     hash_reset_token,
     verify_password,
 )
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.password_reset import PasswordReset

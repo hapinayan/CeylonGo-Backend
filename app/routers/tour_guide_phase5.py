@@ -11,7 +11,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Path, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin, require_traveler
+from app.core.dependencies import (
+    require_admin,
+    require_content_moderator,
+    require_finance_admin,
+    require_operations_admin,
+    require_operations_or_finance_admin,
+    require_traveler,
+)
 from app.database.connection import get_db
 from app.models.user import User
 from app.routers.tour_guide import GuideProvider, OwnedGuide
@@ -396,7 +403,7 @@ def provider_get_tour_guide_campaign_analytics(
 def admin_moderate_guide_review_endpoint(
     review_id: Annotated[int, Path(gt=0)],
     payload: TourGuideReviewModerationRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_content_moderator)],
     db: DatabaseSession,
 ):
     return admin_moderate_tour_guide_review(
@@ -416,7 +423,7 @@ def admin_moderate_guide_review_endpoint(
 )
 def admin_create_guide_promo_package(
     payload: TourGuidePromotionPackageCreate,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: DatabaseSession,
     provider_profile_id: int | None = Query(default=None, gt=0),
 ):
@@ -434,7 +441,7 @@ def admin_create_guide_promo_package(
     summary="Admin: list all tour guide promotion packages (AD-07)",
 )
 def admin_list_guide_promo_packages(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: DatabaseSession,
 ):
     return admin_list_tour_guide_promotion_packages(db)
@@ -448,7 +455,7 @@ def admin_list_guide_promo_packages(
 def admin_update_guide_promo_package(
     package_id: Annotated[int, Path(gt=0)],
     payload: TourGuidePromotionPackageUpdate,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: DatabaseSession,
 ):
     return admin_update_tour_guide_promotion_package(
@@ -465,7 +472,7 @@ def admin_update_guide_promo_package(
     summary="Admin: list all tour guide sponsored campaigns (AD-07)",
 )
 def admin_list_guide_campaigns(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: DatabaseSession,
     campaign_status: str | None = Query(default=None, alias="status"),
     provider_profile_id: int | None = Query(default=None, gt=0),
@@ -489,7 +496,7 @@ def admin_list_guide_campaigns(
 def admin_decide_guide_campaign(
     campaign_id: Annotated[int, Path(gt=0)],
     payload: AdminCampaignDecisionRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_admin)],
     db: DatabaseSession,
 ):
     return admin_decide_tour_guide_campaign(
@@ -506,7 +513,7 @@ def admin_decide_guide_campaign(
     summary="Admin: oversee tour guide advertising payments and revenue (AD-07)",
 )
 def admin_list_guide_ad_payments(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: DatabaseSession,
     payment_status: str | None = Query(default=None),
     page: Annotated[int, Query(ge=1)] = 1,
@@ -526,7 +533,7 @@ def admin_list_guide_ad_payments(
     summary="Admin: comprehensive tour guide, booking, revenue, and engagement report (AD-08)",
 )
 def admin_get_guide_reports_overview(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: DatabaseSession,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),

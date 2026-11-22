@@ -29,13 +29,15 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
 from app.models.artisan_listing import ArtisanListing
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import (
+    AdminAuditLog,
     BookingReference,
     ListingReference,
     Review,
@@ -699,6 +701,10 @@ def test_update_artisan_review_author_success_and_forbidden_for_other(
         headers=auth_header(second_traveler_user),
     )
     assert put_non_author.status_code == 403
+    assert put_non_author.json() == {"detail": "You can only edit reviews you personally authored"}
+    review = db_session.get(Review, review_id)
+    assert (review.rating, review.title, review.comment) == (Decimal("3.00"), "Initial thought", "Good")
+    assert db_session.query(AdminAuditLog).count() == 0
 
     # Author updates rating and title -> 200 OK
     put_res = client.put(
@@ -708,6 +714,11 @@ def test_update_artisan_review_author_success_and_forbidden_for_other(
     )
     assert put_res.status_code == 200
     data = put_res.json()
+    assert set(data) == {
+        "id", "listing_reference_id", "booking_reference_id", "user_id", "user_name",
+        "rating", "title", "comment", "is_verified_booking", "is_published", "created_at",
+        "updated_at", "artisan_listing_id", "artisan_listing_title", "booking_reference_code",
+    }
     assert float(data["rating"]) == 5.0
     assert data["title"] == "Revised: Exceptional!"
     assert data["comment"] == "After using it for a week, 5 stars!"
@@ -741,6 +752,10 @@ def test_delete_artisan_review_author_success_and_forbidden_for_other(
         headers=auth_header(second_traveler_user),
     )
     assert del_non_author.status_code == 403
+    assert del_non_author.json() == {"detail": "You can only delete reviews you personally authored"}
+    review = db_session.get(Review, review_id)
+    assert (review.rating, review.title) == (Decimal("4.00"), "Will be deleted")
+    assert db_session.query(AdminAuditLog).count() == 0
 
     # Author deletes -> 200 OK
     del_res = client.delete(
@@ -748,6 +763,7 @@ def test_delete_artisan_review_author_success_and_forbidden_for_other(
         headers=auth_header(traveler_user),
     )
     assert del_res.status_code == 200
+    assert del_res.json() == {"message": "Review deleted successfully", "id": review_id}
 
     # Ensure review is removed from DB
     assert db_session.query(Review).filter(Review.id == review_id).first() is None
@@ -756,6 +772,38 @@ def test_delete_artisan_review_author_success_and_forbidden_for_other(
 # ==============================================================================
 # 15. Direct Review Endpoint (/api/v1/artisan-reviews)
 # ==============================================================================
+
+@pytest.mark.parametrize("module", ["homestay", "tour_guide", "rental_vehicle", "activity", "eco_experience"])
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_artisan_author_cannot_mutate_own_foreign_review(
+    client, db_session, traveler_user, approved_artisan_user, module, method,
+):
+    _, profile, artisan_listing = approved_artisan_user
+    reference = ListingReference(
+        module_type=module, target_id=artisan_listing.id, provider_profile_id=profile.id,
+        title="Foreign listing", district="Kandy",
+    )
+    db_session.add(reference)
+    db_session.flush()
+    review = Review(
+        listing_reference_id=reference.id, user_id=traveler_user.id,
+        rating=Decimal("4.50"), title="Original", comment="Original comment",
+    )
+    db_session.add(review)
+    db_session.commit()
+    before = {column.key: getattr(review, column.key) for column in Review.__mapper__.column_attrs}
+    audit_count = db_session.query(AdminAuditLog).count()
+    payload = {"json": {"rating": 1, "title": "Changed"}} if method == "PUT" else {}
+
+    response = client.request(method, f"/api/v1/artisan-reviews/{review.id}",
+                              headers=auth_header(traveler_user), **payload)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Review not found"}
+    db_session.refresh(review)
+    assert {key: getattr(review, key) for key in before} == before
+    assert db_session.query(AdminAuditLog).count() == audit_count
+
 
 def test_direct_artisan_review_submission(
     client: TestClient,

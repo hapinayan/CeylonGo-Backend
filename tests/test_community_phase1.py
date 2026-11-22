@@ -22,7 +22,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.community import (
@@ -37,7 +37,7 @@ from app.models.community import (
     CommunityUserProfile,
 )
 from app.models.provider_profile import ProviderProfile
-from app.models.shared import ListingReference
+from app.models.shared import AdminAuditLog, ListingReference
 from app.models.user import Base, User
 from app.services import community_posts
 from app.services.community_posts import resolve_safe_community_media_path
@@ -71,6 +71,7 @@ def db_session():
 
     tables = [
         User.__table__,
+        AdminAuditLog.__table__,
         ProviderProfile.__table__,
         ListingReference.__table__,
         CommunityUserProfile.__table__,

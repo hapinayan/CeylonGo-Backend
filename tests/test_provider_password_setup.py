@@ -8,7 +8,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.otp import generate_authorization_token, hash_authorization_token
 from app.core.rate_limiter import reset_all_limiters
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.provider_profile import ProviderProfile

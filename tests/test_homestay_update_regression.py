@@ -14,7 +14,7 @@ from app.models.provider_profile import ProviderProfile
 from app.models.homestay import Homestay, HomestayImage, HomestayAmenity
 from app.models.booking import Booking
 from app.models.shared import ListingReference
-from app.core.security import create_access_token
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.core.database_guard import verify_safe_integration_database, DatabaseSafetyError
 from app.schemas.homestay import HomestayUpdateRequest
 

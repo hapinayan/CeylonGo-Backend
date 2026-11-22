@@ -11,7 +11,11 @@ from app.core.booking_transactions import (
     CAPTURED, EXECUTED_REFUNDS, RESERVED_REFUNDS, capture_status,
     executed_refund_status, lock_booking_resource,
 )
-from app.core.dependencies import require_admin
+from app.core.dependencies import (
+    require_admin,
+    require_finance_admin,
+    require_finance_or_support_read,
+)
 from app.core.homestay_permissions import (
     check_homestay_ownership,
     require_homestay_manager,
@@ -1159,7 +1163,7 @@ def request_booking_refund(
 def process_refund(
     refund_id: int,
     payload: RefundProcessRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     refund = db.query(PaymentRefund).filter(PaymentRefund.id == refund_id).first()
@@ -1651,7 +1655,7 @@ def get_settlement_detail(
     summary="Admin oversight: list all payment transactions",
 )
 def list_all_payment_transactions(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ):
@@ -1669,7 +1673,7 @@ def list_all_payment_transactions(
     summary="Admin oversight: list all refund requests",
 )
 def list_all_refunds(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_or_support_read)],
     db: Annotated[Session, Depends(get_db)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ):
@@ -1689,7 +1693,7 @@ def list_all_refunds(
 )
 def create_provider_settlement(
     payload: SettlementCreateRequest,
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     profile = (
@@ -1821,7 +1825,7 @@ def create_provider_settlement(
     summary="Admin financial overview: gross revenue, commission, liabilities, settlements",
 )
 def admin_get_financial_summary(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -1890,7 +1894,7 @@ def admin_get_financial_summary(
     summary="Admin list of payments flagged for reconciliation or late verification",
 )
 def admin_get_reconciliation_queue(
-    admin: Annotated[User, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """

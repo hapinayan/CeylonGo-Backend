@@ -19,10 +19,9 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import jwt
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+from app.routers.auth import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.tour_guide import (
@@ -78,44 +77,7 @@ def get_optional_current_user(
     if credentials is None or not credentials.credentials:
         return None
 
-    try:
-        payload = decode_access_token(credentials.credentials)
-    except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-    except jwt.PyJWTError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-
-    user_id_raw = payload.get("sub")
-    try:
-        user_id = int(user_id_raw)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is inactive. Please contact support.",
-        )
-    return user
+    return get_current_user(credentials, db)
 
 
 # =============================================================================

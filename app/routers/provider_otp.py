@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.dependencies import is_admin_role
 from app.core.provider_onboarding import lock_onboarding
 from app.core.email import send_provider_otp_email
 from app.core.otp import (
@@ -117,7 +118,7 @@ def send_provider_otp(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This email is already registered as a traveler account. A single email cannot be registered for both account types.",
             )
-        if user.role == "admin":
+        if is_admin_role(user.role):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin accounts cannot register as service providers.",
@@ -329,7 +330,7 @@ def verify_provider_otp_endpoint(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Traveler accounts cannot receive provider registration authorization.",
             )
-        if user.role == "admin":
+        if is_admin_role(user.role):
             db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

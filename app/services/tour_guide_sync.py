@@ -13,7 +13,7 @@ Provides:
 from __future__ import annotations
 
 import io
-import json
+from app.core.audit import sanitize_audit_details
 import os
 import re
 import uuid
@@ -278,18 +278,12 @@ def record_tour_guide_admin_audit(
     ip_address: str | None = None,
 ) -> AdminAuditLog:
     """Create a structured entry in dbo.admin_audit_logs."""
-    serialized: str | None
-    if isinstance(details, dict):
-        serialized = json.dumps(details, default=str)
-    else:
-        serialized = details
-
     entry = AdminAuditLog(
         admin_user_id=admin_user_id,
         action=action[:50],
         entity_name=entity_name[:50],
         entity_id=entity_id,
-        details=serialized,
+        details=sanitize_audit_details(details),
         ip_address=ip_address[:45] if ip_address else None,
     )
     db.add(entry)

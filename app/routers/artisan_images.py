@@ -21,7 +21,7 @@ from PIL import Image, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_approved_provider
-from app.core.security import decode_access_token
+from app.routers.auth import get_current_user
 from app.database.connection import get_db
 from app.models.artisan import ArtisanBusinessImage, ArtisanProductImage
 from app.models.artisan_listing import ArtisanListing
@@ -76,12 +76,8 @@ def get_optional_user(
     if not credentials or not credentials.credentials:
         return None
     try:
-        payload = decode_access_token(credentials.credentials)
-        user_id_raw = payload.get("sub")
-        if not user_id_raw:
-            return None
-        return db.query(User).filter(User.id == int(user_id_raw), User.is_active == True).first()
-    except Exception:
+        return get_current_user(credentials, db)
+    except HTTPException:
         return None
 
 

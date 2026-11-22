@@ -19,7 +19,17 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
-from app.core.dependencies import require_admin
+from app.core.audit import sanitize_audit_details
+from app.core.dependencies import (
+    require_admin,
+    require_finance_admin,
+    require_finance_or_support_read,
+    require_operations_admin,
+    require_operations_or_finance_admin,
+    require_operations_or_support_read,
+    require_support_or_operations_admin,
+    resolve_canonical_admin_role,
+)
 from app.core.notification_service import create_notification
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import (
@@ -124,7 +134,7 @@ def log_admin_audit(
         action=action,
         entity_name=entity_name,
         entity_id=entity_id,
-        details=details,
+        details=sanitize_audit_details(details),
         ip_address=ip_address,
     )
     db.add(log_entry)
@@ -140,6 +150,7 @@ def log_admin_audit(
     response_model=AdminVehicleListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental vehicles list with filtering and pagination",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_admin_rental_vehicles(
     db: Annotated[Session, Depends(get_db)],
@@ -229,6 +240,7 @@ def list_admin_rental_vehicles(
     response_model=AdminVehicleListResponse,
     status_code=status.HTTP_200_OK,
     summary="Convenience queue for vehicle listings awaiting administrative approval",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_pending_rental_vehicles(
     db: Annotated[Session, Depends(get_db)],
@@ -253,6 +265,7 @@ def list_pending_rental_vehicles(
     response_model=AdminVehicleDetailResponse,
     status_code=status.HTTP_200_OK,
     summary="Detailed vehicle inspection view for administrative review",
+    dependencies=[Depends(require_operations_admin)],
 )
 def get_admin_vehicle_detail(
     vehicle_id: int,
@@ -357,7 +370,7 @@ def get_admin_vehicle_detail(
 def review_rental_vehicle(
     vehicle_id: int,
     payload: AdminVehicleReviewRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -591,6 +604,7 @@ def review_rental_vehicle(
     response_model=AdminPendingDocumentsResponse,
     status_code=status.HTTP_200_OK,
     summary="Queue of pending vehicle compliance documents awaiting verification",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_pending_vehicle_documents(
     db: Annotated[Session, Depends(get_db)],
@@ -650,6 +664,7 @@ def list_pending_vehicle_documents(
     response_model=list[AdminVehicleDocumentItem],
     status_code=status.HTTP_200_OK,
     summary="List all uploaded compliance documents for a specific vehicle",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_vehicle_documents(
     vehicle_id: int,
@@ -695,6 +710,7 @@ def list_vehicle_documents(
     response_model=AdminVehicleDocumentItem,
     status_code=status.HTTP_200_OK,
     summary="Get single vehicle document details",
+    dependencies=[Depends(require_operations_admin)],
 )
 def get_vehicle_document_detail(
     document_id: int,
@@ -733,6 +749,7 @@ def get_vehicle_document_detail(
     "/documents/{document_id}/file",
     response_class=FileResponse,
     summary="Securely stream a vehicle compliance document file to authenticated Admins",
+    dependencies=[Depends(require_operations_admin)],
 )
 def view_vehicle_document_file(
     document_id: int,
@@ -797,7 +814,7 @@ def view_vehicle_document_file(
 def verify_vehicle_document(
     document_id: int,
     payload: AdminDocumentVerifyRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -850,7 +867,7 @@ def verify_vehicle_document(
 def update_vehicle_verification_status(
     vehicle_id: int,
     payload: AdminVehicleVerifyStatusRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -929,6 +946,7 @@ def update_vehicle_verification_status(
     response_model=AdminRentalBookingListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental booking monitoring with filtering and pagination",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def list_admin_rental_bookings(
     db: Annotated[Session, Depends(get_db)],
@@ -1046,6 +1064,7 @@ def list_admin_rental_bookings(
     response_model=AdminRentalBookingDetailResponse,
     status_code=status.HTTP_200_OK,
     summary="Detailed rental booking inspection with lifecycle, inspections, incidents and deposits",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def get_admin_rental_booking_detail(
     booking_id: int,
@@ -1246,6 +1265,7 @@ def get_admin_rental_booking_detail(
     response_model=AdminIncidentListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental incident and damage report monitoring",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def list_admin_rental_incidents(
     db: Annotated[Session, Depends(get_db)],
@@ -1314,6 +1334,7 @@ def list_admin_rental_incidents(
     response_model=AdminRentalIncidentItem,
     status_code=status.HTTP_200_OK,
     summary="Get single rental incident details",
+    dependencies=[Depends(require_operations_or_support_read)],
 )
 def get_admin_rental_incident_detail(
     incident_id: int,
@@ -1359,7 +1380,7 @@ def get_admin_rental_incident_detail(
 def update_admin_rental_incident(
     incident_id: int,
     payload: AdminIncidentUpdateRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_support_or_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     request: Request,
 ):
@@ -1430,6 +1451,7 @@ def update_admin_rental_incident(
     response_model=AdminRentalPaymentListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental payment transaction monitoring",
+    dependencies=[Depends(require_finance_admin)],
 )
 def list_admin_rental_payments(
     db: Annotated[Session, Depends(get_db)],
@@ -1506,6 +1528,7 @@ def list_admin_rental_payments(
     response_model=AdminRentalSettlementListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental provider settlements monitoring",
+    dependencies=[Depends(require_finance_admin)],
 )
 def list_admin_rental_settlements(
     db: Annotated[Session, Depends(get_db)],
@@ -1568,6 +1591,7 @@ def list_admin_rental_settlements(
     response_model=AdminRentalDepositListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental security deposits monitoring",
+    dependencies=[Depends(require_finance_or_support_read)],
 )
 def list_admin_rental_deposits(
     db: Annotated[Session, Depends(get_db)],
@@ -1622,6 +1646,7 @@ def list_admin_rental_deposits(
     response_model=AdminRentalRefundListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental refund request monitoring",
+    dependencies=[Depends(require_finance_or_support_read)],
 )
 def list_admin_rental_refunds(
     db: Annotated[Session, Depends(get_db)],
@@ -1686,7 +1711,7 @@ def list_admin_rental_refunds(
 def review_admin_rental_refund(
     refund_id: int,
     payload: AdminRentalRefundReviewRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
     request: Request,
 ):
@@ -1765,6 +1790,7 @@ def review_admin_rental_refund(
     response_model=AdminRentalPromotionListResponse,
     status_code=status.HTTP_200_OK,
     summary="Platform-wide rental sponsored promotion campaign monitoring",
+    dependencies=[Depends(require_operations_or_finance_admin)],
 )
 def list_admin_rental_promotions(
     db: Annotated[Session, Depends(get_db)],
@@ -1843,6 +1869,7 @@ def list_admin_rental_promotions(
     response_model=AdminRentalPromotionListItem,
     status_code=status.HTTP_200_OK,
     summary="Get single rental sponsored promotion campaign details",
+    dependencies=[Depends(require_operations_or_finance_admin)],
 )
 def get_admin_rental_promotion_detail(
     campaign_id: int,
@@ -1903,10 +1930,41 @@ def get_admin_rental_promotion_detail(
 def review_admin_rental_promotion(
     campaign_id: int,
     payload: AdminRentalPromotionReviewRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
     request: Request,
 ):
+    # Enforce action-level RBAC BEFORE any DB query, mutation, or side effect:
+    # - Editorial / operational review actions ('approve', 'reject', 'pause') require super_admin (or legacy admin) or operations_admin.
+    # - Financial payment-verified activation ('activate') requires super_admin (or legacy admin) or finance_admin.
+    # - Unknown decisions are rejected immediately (deny-by-default).
+    decision = payload.decision.strip().lower() if isinstance(payload.decision, str) else ""
+    canonical_role = resolve_canonical_admin_role(admin_user.role)
+
+    if decision in ("approve", "reject", "pause"):
+        if canonical_role not in ("super_admin", "operations_admin"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Access forbidden: action '{decision}' requires one of "
+                    f"[operations_admin, super_admin] (current role: '{canonical_role}')"
+                ),
+            )
+    elif decision == "activate":
+        if canonical_role not in ("super_admin", "finance_admin"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Access forbidden: payment-verified action 'activate' requires one of "
+                    f"[finance_admin, super_admin] (current role: '{canonical_role}')"
+                ),
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid review decision '{payload.decision}'. Allowed: approve, reject, activate, pause.",
+        )
+
     client_ip = request.client.host if request.client else None
     row = (
         db.query(PromotionCampaign, ProviderProfile)
@@ -1995,7 +2053,7 @@ def review_admin_rental_promotion(
             action="activate_rental_promotion",
             entity_name="promotion_campaigns",
             entity_id=campaign.id,
-            details=f"Activated promotion campaign '{campaign.campaign_name}' (ID #{campaign.id}). Payment ref: {payload.payment_reference.strip()}",
+            details=f"Activated promotion campaign '{campaign.campaign_name}' (ID #{campaign.id}).",
             ip_address=client_ip,
         )
         create_notification(
@@ -2053,6 +2111,7 @@ def review_admin_rental_promotion(
     response_model=AdminRentalFleetSummaryResponse,
     status_code=status.HTTP_200_OK,
     summary="Fleet inventory analytics across approval states, verification, categories and availability",
+    dependencies=[Depends(require_operations_admin)],
 )
 def get_admin_rental_fleet_summary(
     db: Annotated[Session, Depends(get_db)],
@@ -2122,6 +2181,7 @@ def get_admin_rental_fleet_summary(
     response_model=AdminRentalRevenueAnalyticsResponse,
     status_code=status.HTTP_200_OK,
     summary="Financial performance analytics: gross booking value, payments, commission, settlements",
+    dependencies=[Depends(require_operations_or_finance_admin)],
 )
 def get_admin_rental_revenue_analytics(
     db: Annotated[Session, Depends(get_db)],

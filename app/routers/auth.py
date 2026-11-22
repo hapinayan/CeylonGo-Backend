@@ -9,10 +9,12 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.admin_roles import is_admin_role
 from app.core.email import send_password_reset_email
 from app.core.google_auth import verify_google_id_token
-from app.core.rate_limiter import check_email_limiter, forgot_password_limiter
+from app.core.rate_limiter import admin_login_limiter, check_email_limiter, forgot_password_limiter, shared_auth_limiter
 from app.core.security import (
+    ADMIN_AUTH_METHOD,
     create_access_token,
     decode_access_token,
     generate_password_reset_token,
@@ -21,6 +23,7 @@ from app.core.security import (
     verify_password,
 )
 from app.database.connection import get_db
+from app.core.sensitive_route import SensitiveInputRoute
 from app.models.password_reset import PasswordReset
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
@@ -40,7 +43,7 @@ from app.schemas.auth import (
     VerifyResetTokenResponse,
 )
 
-router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
+router = APIRouter(prefix="/api/v1/auth", tags=["Auth"], route_class=SensitiveInputRoute)
 logger = logging.getLogger(__name__)
 
 security_scheme = HTTPBearer(
@@ -102,6 +105,22 @@ def get_current_user(
             detail="Account is inactive. Please contact support.",
         )
 
+    if user.role == "traveler":
+        version = payload.get("auth_version")
+        if type(version) is not int or version != user.auth_version:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    if is_admin_role(user.role) and payload.get("auth_method") != ADMIN_AUTH_METHOD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return user
 
 
@@ -114,12 +133,35 @@ def get_optional_current_user(
     return get_current_user(credentials, db) if credentials is not None else None
 
 
+def _issue_user_access_token(user: User) -> str:
+    claims: dict[str, str | int] = {"sub": str(user.id)}
+    if user.role == "traveler":
+        claims["auth_version"] = user.auth_version
+    return create_access_token(data=claims)
+
+
 def rate_limit_check_email(request: Request) -> None:
     check_email_limiter.check(request)
 
 
 def rate_limit_forgot_password(request: Request) -> None:
-    forgot_password_limiter.check(request)
+    forgot_password_limiter.check_peer(request, "recovery-request")
+
+
+def rate_limit_reset_verification(request: Request) -> None:
+    admin_login_limiter.check_peer(request, "recovery-verify")
+
+
+def rate_limit_reset_execution(request: Request) -> None:
+    admin_login_limiter.check_peer(request, "recovery-reset")
+
+
+def rate_limit_shared_login(request: Request) -> None:
+    shared_auth_limiter.check_peer(request, "password-login")
+
+
+def rate_limit_google_login(request: Request) -> None:
+    shared_auth_limiter.check_peer(request, "google-login")
 
 
 @router.post(
@@ -155,7 +197,7 @@ def check_email(
 
     return CheckEmailResponse(
         email=normalized_email,
-        is_registered=user is not None,
+        is_registered=user is not None and not is_admin_role(user.role),
     )
 
 
@@ -216,6 +258,7 @@ def register(
     response_model=TokenResponse,
     status_code=status.HTTP_200_OK,
     summary="Authenticate user and return JWT access token",
+    dependencies=[Depends(rate_limit_shared_login)],
 )
 def login(
     request: LoginRequest,
@@ -250,7 +293,7 @@ def login(
             )
 
     # Verify user exists and password matches
-    if not user or not verify_password(request.password, user.password_hash):
+    if not user or is_admin_role(user.role) or not verify_password(request.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -264,7 +307,7 @@ def login(
         )
 
     # Generate signed JWT token with sub claim for user id
-    token = create_access_token(data={"sub": str(user.id)})
+    token = _issue_user_access_token(user)
 
     return TokenResponse(
         access_token=token,
@@ -278,6 +321,7 @@ def login(
     response_model=TokenResponse,
     status_code=status.HTTP_200_OK,
     summary="Authenticate traveler with Google ID token",
+    dependencies=[Depends(rate_limit_google_login)],
 )
 def google_auth(
     request: GoogleAuthRequest,
@@ -306,6 +350,8 @@ def google_auth(
     user = db.query(User).filter(User.google_sub == google_sub).first()
 
     if user:
+        if is_admin_role(user.role):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Could not validate credentials")
         if user.role == "provider":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -321,6 +367,8 @@ def google_auth(
         existing_user = db.query(User).filter(func.lower(User.email) == email).first()
 
         if existing_user:
+            if is_admin_role(existing_user.role):
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Could not validate credentials")
             if existing_user.role == "provider":
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -368,10 +416,6 @@ def google_auth(
                 # Handle concurrent registration race condition
                 user = db.query(User).filter(User.google_sub == google_sub).first()
                 if not user:
-                    user = (
-                        db.query(User).filter(func.lower(User.email) == email).first()
-                    )
-                if not user:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail="An account conflict occurred during Google registration.",
@@ -379,8 +423,17 @@ def google_auth(
             else:
                 user = new_user
 
-    # Generate signed JWT token
-    token = create_access_token(data={"sub": str(user.id)})
+    # Linking and registration can refresh the row or resolve a concurrent insert.
+    if is_admin_role(user.role):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Could not validate credentials")
+    if user.role == "provider" or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Google authentication is not supported for provider accounts."
+            if user.role == "provider" else "Account is inactive. Please contact support.",
+        )
+
+    token = _issue_user_access_token(user)
 
     return TokenResponse(
         access_token=token,
@@ -466,7 +519,7 @@ def forgot_password(
                 )
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error occurred during password reset request.")
+        logger.error("Database error occurred during password reset request.")
 
     return ForgotPasswordResponse(
         message="If an account with that email exists, a password reset link has been sent."
@@ -478,6 +531,7 @@ def forgot_password(
     response_model=VerifyResetTokenResponse,
     status_code=status.HTTP_200_OK,
     summary="Verify if a password reset token is valid and unexpired",
+    dependencies=[Depends(rate_limit_reset_verification)],
 )
 def verify_reset_token(
     token: Annotated[str, Query(min_length=1, description="Password reset token")],
@@ -497,10 +551,13 @@ def verify_reset_token(
             detail="Invalid or expired password reset token.",
         )
 
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    admin_recovery = user is not None and is_admin_role(user.role)
     if reset_record.is_used:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has already been used.",
+            detail="Invalid or expired password reset token." if admin_recovery
+            else "This password reset token has already been used.",
         )
 
     now_utc = datetime.now(UTC).replace(tzinfo=None)
@@ -511,10 +568,10 @@ def verify_reset_token(
     if now_utc > record_expires:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has expired.",
+            detail="Invalid or expired password reset token." if admin_recovery
+            else "This password reset token has expired.",
         )
 
-    user = db.query(User).filter(User.id == reset_record.user_id).first()
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -541,6 +598,7 @@ def verify_reset_token(
     response_model=ResetPasswordResponse,
     status_code=status.HTTP_200_OK,
     summary="Reset password using a valid reset token",
+    dependencies=[Depends(rate_limit_reset_execution)],
 )
 def reset_password(
     request: ResetPasswordRequest,
@@ -560,10 +618,13 @@ def reset_password(
             detail="Invalid or expired password reset token.",
         )
 
+    user = db.query(User).filter(User.id == reset_record.user_id).first()
+    admin_recovery = user is not None and is_admin_role(user.role)
     if reset_record.is_used:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has already been used.",
+            detail="Invalid or expired password reset token." if admin_recovery
+            else "This password reset token has already been used.",
         )
 
     now_utc = datetime.now(UTC).replace(tzinfo=None)
@@ -574,10 +635,10 @@ def reset_password(
     if now_utc > record_expires:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This password reset token has expired.",
+            detail="Invalid or expired password reset token." if admin_recovery
+            else "This password reset token has expired.",
         )
 
-    user = db.query(User).filter(User.id == reset_record.user_id).first()
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -595,9 +656,27 @@ def reset_password(
     hashed_password = hash_password(request.new_password)
 
     try:
-        user.password_hash = hashed_password
-        reset_record.is_used = True
-        reset_record.used_at = now_utc
+        if admin_recovery:
+            consumed_at = datetime.now(UTC).replace(tzinfo=None)
+            consumed = db.query(PasswordReset).filter(
+                PasswordReset.id == reset_record.id,
+                PasswordReset.is_used == False,
+                PasswordReset.expires_at >= consumed_at,
+            ).update({"is_used": True, "used_at": consumed_at}, synchronize_session=False)
+            updated = 0
+            if consumed == 1:
+                updated = db.query(User).filter(
+                    User.id == user.id, User.role == user.role, User.is_active == True,
+                ).update({"password_hash": hashed_password}, synchronize_session=False)
+            if updated != 1:
+                db.rollback()
+                raise HTTPException(400, "Invalid or expired password reset token.")
+            db.expire(user, ["password_hash"])
+            db.expire(reset_record, ["is_used", "used_at"])
+        else:
+            user.password_hash = hashed_password
+            reset_record.is_used = True
+            reset_record.used_at = now_utc
 
         db.query(PasswordReset).filter(
             PasswordReset.user_id == user.id,
@@ -607,7 +686,7 @@ def reset_password(
         db.commit()
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error occurred during password reset execution.")
+        logger.error("Database error occurred during password reset execution.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while resetting the password. Please try again later.",

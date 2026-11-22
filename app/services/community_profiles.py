@@ -56,7 +56,7 @@ from app.schemas.community import (
     ProviderPostEngagementItem,
 )
 from app.services.community_feed import _serialize_people_batch
-from app.services.community_posts import serialize_posts_batch
+from app.services.community_posts import public_community_post_filter, serialize_posts_batch
 
 # =============================================================================
 # RATE LIMITER
@@ -157,7 +157,7 @@ def get_community_profile(
 
     posts_query = db.query(CommunityPost).filter(
         CommunityPost.author_id == target.id,
-        CommunityPost.is_published == true(),
+        public_community_post_filter(),
     )
     posts_total = posts_query.count()
     total_pages = math.ceil(posts_total / page_size) if posts_total > 0 else 0
@@ -638,7 +638,7 @@ def get_provider_community_engagement(
 
     base_posts = db.query(CommunityPost).filter(CommunityPost.author_id == uid)
     total_posts = base_posts.count()
-    published_posts = base_posts.filter(CommunityPost.is_published == true()).count()
+    published_posts = base_posts.filter(public_community_post_filter()).count()
     unpublished_posts = total_posts - published_posts
 
     agg_likes, agg_comments = db.query(

@@ -25,6 +25,7 @@ from sqlalchemy import func, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.dependencies import resolve_canonical_admin_role
 from app.core.notification_service import create_notification
 from app.core.payhere import payhere_service
 from app.models.provider_profile import ProviderProfile
@@ -80,6 +81,7 @@ from app.schemas.tour_guide import (
     TourGuideWishlistListResponse,
     TourGuideWishlistStatusResponse,
 )
+from app.services.review_moderation import apply_review_moderation, lock_review_moderation, scoped_reviews
 from app.services.tour_guide_booking import (
     _booking_eager_query,
     _get_booking_reference_map,
@@ -187,6 +189,7 @@ def submit_tour_guide_review(
     traveler: User,
     payload: TourGuideReviewCreate,
 ) -> TourGuideReviewResponse:
+    lock_review_moderation(db, f"tour_guide_ratings_{guide_id}")
     guide = get_public_guide_or_404(db, guide_id)
 
     booking = (
@@ -393,6 +396,10 @@ def admin_moderate_tour_guide_review(
     admin: User,
     reason: str | None = None,
 ) -> TourGuideReviewResponse:
+    guide_id = scoped_reviews(db, "tour_guide").filter(Review.id == review_id).with_entities(ListingReference.target_id).scalar()
+    if guide_id is None:
+        raise HTTPException(404, "Tour guide review not found.")
+    lock_review_moderation(db, f"tour_guide_ratings_{guide_id}")
     row = (
         db.query(Review, ListingReference, User.full_name)
         .join(ListingReference, Review.listing_reference_id == ListingReference.id)
@@ -400,36 +407,21 @@ def admin_moderate_tour_guide_review(
         .filter(
             Review.id == review_id,
             ListingReference.module_type == "tour_guide",
+            ListingReference.target_id == guide_id,
         )
+        .populate_existing()
         .first()
     )
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide review not found.",
-        )
+        db.rollback()
+        raise HTTPException(404, "Tour guide review not found.")
 
     review, listing_ref, author_name = row
-    guide = db.query(TourGuide).filter(TourGuide.id == listing_ref.target_id).first()
-
-    review.is_published = is_published
-    review.updated_at = _now_utc()
-    db.flush()
-
-    if guide is not None:
-        recalculate_tour_guide_ratings(db, guide)
-
-    log_admin_action(
-        db,
-        admin_user_id=admin.id,
-        action="moderate_tour_guide_review",
-        entity_name="review",
-        entity_id=review.id,
-        details=f"is_published={is_published}; reason={reason or 'N/A'}",
+    guide = db.get(TourGuide, guide_id, populate_existing=True)
+    apply_review_moderation(
+        db, review=review, module="tour_guide", admin_id=admin.id, published=is_published, reason=reason,
+        update_ratings=(lambda: recalculate_tour_guide_ratings(db, guide)) if guide is not None else None,
     )
-
-    _commit(db)
-    db.refresh(review)
 
     return TourGuideReviewResponse(
         id=review.id,
@@ -1756,6 +1748,26 @@ def admin_decide_tour_guide_campaign(
     payload: AdminCampaignDecisionRequest,
     admin: User,
 ) -> TourGuideCampaignResponse:
+    # Enforce action-level RBAC and action allowlist BEFORE any DB mutation or side effect:
+    # - Only 'approve', 'reject', 'pause', 'cancel' are accepted (deny-by-default for unknown actions).
+    # - Only super_admin (including legacy 'admin') and operations_admin may execute campaign moderation decisions.
+    action = payload.action.strip().lower() if isinstance(payload.action, str) else ""
+    if action not in ("approve", "reject", "pause", "cancel"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid campaign decision action '{payload.action}'. Allowed: approve, reject, pause, cancel.",
+        )
+
+    canonical_role = resolve_canonical_admin_role(admin.role)
+    if canonical_role not in ("super_admin", "operations_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Access forbidden: campaign moderation action '{action}' requires one of "
+                f"[operations_admin, super_admin] (current role: '{canonical_role}')"
+            ),
+        )
+
     expire_finished_tour_guide_campaigns(db)
     campaign = (
         db.query(PromotionCampaign)

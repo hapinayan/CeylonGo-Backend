@@ -24,7 +24,7 @@ Concurrency & Counter Integrity:
 --------------------------------
 On Microsoft SQL Server (`mssql`), every like, unlike, comment creation, and comment
 deletion acquires a transaction-scoped exclusive `sp_getapplock` via
-`app.core.booking_transactions.lock_booking_resource(db, f"community_post_engagement_{post_id}")`,
+`lock_community_post(db, post_id)`,
 then recomputes `likes_count` / `comments_count` from authoritative `COUNT(*)` inside the
 same transaction. Notifications are added to the same SQLAlchemy session before commit so
 any transaction failure rolls back both the engagement write and its notification atomically.
@@ -41,7 +41,7 @@ from sqlalchemy import func, true
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.core.booking_transactions import lock_booking_resource
+from app.core.dependencies import is_admin_role, resolve_canonical_admin_role
 from app.core.notification_service import create_notification
 from app.core.rate_limiter import SlidingWindowRateLimiter
 from app.models.community import (
@@ -65,6 +65,9 @@ from app.schemas.community import (
     CommunitySavedPostsResponse,
 )
 from app.services.community_posts import (
+    is_public_community_post,
+    lock_community_post,
+    public_community_post_filter,
     sanitize_community_text,
     serialize_posts_batch,
 )
@@ -121,9 +124,10 @@ def _get_published_post_or_404(db: Session, post_id: int) -> CommunityPost:
         .join(User, User.id == CommunityPost.author_id)
         .filter(
             CommunityPost.id == post_id,
-            CommunityPost.is_published == true(),
+            public_community_post_filter(),
             User.is_active == true(),
         )
+        .populate_existing()
         .first()
     )
     if post is None:
@@ -135,15 +139,16 @@ def _get_published_post_or_404(db: Session, post_id: int) -> CommunityPost:
 
 
 def _can_view_post(post: CommunityPost, viewer: User | None) -> bool:
-    if post.is_published:
+    if is_public_community_post(post):
         return True
     if viewer is None:
         return False
-    return viewer.id == post.author_id or viewer.role == "admin"
-
-
-def _lock_post_engagement(db: Session, post_id: int) -> None:
-    lock_booking_resource(db, f"community_post_engagement_{post_id}")
+    if viewer.id == post.author_id:
+        return True
+    return is_admin_role(viewer.role) and resolve_canonical_admin_role(viewer.role) in (
+        "super_admin",
+        "content_moderator",
+    )
 
 
 def _recompute_likes_count(db: Session, post: CommunityPost) -> int:
@@ -180,14 +185,8 @@ def like_community_post(
 ) -> CommunityLikeResponse:
     community_like_limiter.check_identifier(f"community_like:user:{current_user.id}")
 
+    lock_community_post(db, post_id)
     post = _get_published_post_or_404(db, post_id)
-    _lock_post_engagement(db, post.id)
-    db.refresh(post)
-    if not post.is_published:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community post not found.",
-        )
 
     existing = (
         db.query(CommunityPostLike)
@@ -250,14 +249,8 @@ def unlike_community_post(
 ) -> CommunityLikeResponse:
     community_like_limiter.check_identifier(f"community_like:user:{current_user.id}")
 
+    lock_community_post(db, post_id)
     post = _get_published_post_or_404(db, post_id)
-    _lock_post_engagement(db, post.id)
-    db.refresh(post)
-    if not post.is_published:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community post not found.",
-        )
 
     try:
         deleted_rows = (
@@ -468,14 +461,8 @@ def create_post_comment(
     )
     assert content is not None
 
+    lock_community_post(db, post_id)
     post = _get_published_post_or_404(db, post_id)
-    _lock_post_engagement(db, post.id)
-    db.refresh(post)
-    if not post.is_published:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community post not found.",
-        )
 
     parent_comment: CommunityComment | None = None
     if payload.parent_comment_id is not None:
@@ -569,7 +556,7 @@ def update_community_comment(
         )
 
     post = db.get(CommunityPost, comment.post_id)
-    if post is None or (not post.is_published and post.author_id != current_user.id):
+    if post is None or (not is_public_community_post(post) and post.author_id != current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community post not found.",
@@ -621,7 +608,10 @@ def execute_comment_deletion_uncommitted(
         )
 
     is_owner = comment.author_id == current_user.id
-    is_admin = current_user.role == "admin"
+    is_admin = is_admin_role(current_user.role) and resolve_canonical_admin_role(current_user.role) in (
+        "super_admin",
+        "content_moderator",
+    )
     if not is_owner and not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -635,9 +625,11 @@ def execute_comment_deletion_uncommitted(
             detail="Community post not found.",
         )
 
-    _lock_post_engagement(db, post.id)
-    db.refresh(comment)
-    db.refresh(post)
+    lock_community_post(db, post.id)
+    comment = db.get(CommunityComment, comment_id, populate_existing=True)
+    post = db.get(CommunityPost, post.id, populate_existing=True)
+    if comment is None or post is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
 
     has_reports = (
         db.query(CommunityReport.id)
@@ -809,7 +801,7 @@ def list_saved_community_posts(
         .join(User, User.id == CommunityPost.author_id)
         .filter(
             CommunitySavedPost.user_id == current_user.id,
-            CommunityPost.is_published == true(),
+            public_community_post_filter(),
             User.is_active == true(),
         )
     )

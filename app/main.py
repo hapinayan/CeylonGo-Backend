@@ -19,6 +19,14 @@ from fastapi.middleware.cors import CORSMiddleware
 # AUTHENTICATION ROUTER IMPORTS
 # ==========================================
 
+from app.routers.admin_audit_logs import router as admin_audit_logs_router
+from app.routers.admin_auth import router as admin_auth_router
+from app.routers.admin_dashboard import router as admin_dashboard_router
+from app.routers.admin_promotions import router as admin_promotions_router
+from app.routers.admin_reports import router as admin_reports_router
+from app.routers.admin_support import router as admin_support_router
+from app.routers.admin_reviews import router as admin_reviews_router
+from app.routers.admin_travelers import router as admin_travelers_router
 from app.routers.auth import router as auth_router
 
 # ==========================================
@@ -304,8 +312,16 @@ app.add_middleware(
 # REGISTER ROUTERS
 # ==========================================
 
-# Authentication
+# Authentication & Admin Governance
 app.include_router(auth_router)
+app.include_router(admin_auth_router)
+app.include_router(admin_audit_logs_router)
+app.include_router(admin_dashboard_router)
+app.include_router(admin_promotions_router)
+app.include_router(admin_reports_router)
+app.include_router(admin_support_router)
+app.include_router(admin_reviews_router)
+app.include_router(admin_travelers_router)
 
 # ==========================================
 # ARTISAN MODULE

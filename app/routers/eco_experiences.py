@@ -60,6 +60,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -70,12 +71,14 @@ from sqlalchemy import true
 from sqlalchemy.sql import ColumnElement
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.audit import record_admin_audit_log
 from app.core.publication import public_eco
 from app.routers.auth import get_optional_current_user
 from app.core.dependencies import (
     require_admin,
     require_approved_eco_provider,
     require_approved_provider,
+    require_operations_admin,
 )
 from app.core.email import send_eco_badge_decision_email
 from app.core.location_validation import (
@@ -134,7 +137,7 @@ router = APIRouter(
 admin_eco_router = APIRouter(
     prefix="/api/v1/admin/eco-experiences",
     tags=["Admin Eco Experiences"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin), Depends(require_operations_admin)],
 )
 
 ALLOWED_EVIDENCE_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
@@ -1412,6 +1415,7 @@ def admin_get_eco_experience(
 )
 def admin_approve_eco_experience(
     experience_id: int,
+    request: Request,
     admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -1445,6 +1449,15 @@ def admin_approve_eco_experience(
         "approval_rejection_reason": None,
         "updated_at": now,
     })
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="eco_experience_approved",
+        entity_name="eco_experiences",
+        entity_id=experience.id,
+        details={"title": experience.title, "listing_status": "approved"},
+        request=request,
+    )
 
     db.commit()
     db.refresh(experience)
@@ -1465,6 +1478,7 @@ def admin_approve_eco_experience(
 def admin_reject_eco_experience(
     experience_id: int,
     payload: AdminRejectEcoExperienceRequest,
+    request: Request,
     admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -1496,6 +1510,16 @@ def admin_reject_eco_experience(
     experience.approval_reviewed_at = now
     experience.approval_rejection_reason = payload.reason
     experience.updated_at = now
+
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="eco_experience_rejected",
+        entity_name="eco_experiences",
+        entity_id=experience.id,
+        details={"title": experience.title, "reason": payload.reason},
+        request=request,
+    )
 
     db.commit()
     db.refresh(experience)
@@ -2164,6 +2188,7 @@ def admin_get_eco_evidence_file(
 def admin_badge_decision(
     experience_id: int,
     payload: EcoVerificationDecisionRequest,
+    request: Request,
     admin_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -2221,6 +2246,19 @@ def admin_badge_decision(
         created_at=now,
     )
     db.add(verification)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action=f"eco_badge_{decision}",
+        entity_name="eco_experiences",
+        entity_id=experience.id,
+        details={
+            "previous_badge_status": previous_badge_status,
+            "new_badge_status": decision,
+            "reason": payload.reason,
+        },
+        request=request,
+    )
     db.commit()
     db.refresh(experience)
 

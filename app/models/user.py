@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, Unicode, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Unicode, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -22,6 +22,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(Unicode(30), default="traveler", nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    auth_version: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
 
     google_sub: Mapped[str | None] = mapped_column(
         Unicode(255), unique=True, nullable=True, index=True

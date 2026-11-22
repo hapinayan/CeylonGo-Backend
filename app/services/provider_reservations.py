@@ -63,8 +63,8 @@ def cash_recorded(db, reference_id):
     )
 
 
-def save_event(db, ref, old, new, actor, recipient, action):
-    record_booking_status_change(db, ref.id, old, new, actor, notes=action)
+def save_event(db, ref, old, new, actor, recipient, action, *, notes=None):
+    record_booking_status_change(db, ref.id, old, new, actor, notes=notes or action)
     create_notification(
         db=db,
         user_id=recipient,

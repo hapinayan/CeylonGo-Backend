@@ -146,6 +146,7 @@ from app.schemas.eco_experience import (
     EcoProviderReviewItem,
     EcoProviderReviewListResponse,
     EcoProviderSettlementItem,
+    EcoProviderBookingPayments,
     EcoProviderSettlementPagination,
     EcoReviewCreateRequest,
     EcoReviewListResponse,
@@ -947,6 +948,14 @@ def get_my_eco_experiences_summary(
     total_rev = Decimal(str(booking_agg.total_revenue or "0.00")) if booking_agg and booking_agg.total_revenue is not None else Decimal("0.00")
     pending_cash_rev = Decimal(str(booking_agg.pending_cash_revenue or "0.00")) if booking_agg and booking_agg.pending_cash_revenue is not None else Decimal("0.00")
     refunded_amt = _calculate_eco_refunds(db, provider_profile_id=provider_profile.id)
+    native_scope = eco_financial_reporting.scope(provider_id=provider_profile.id)
+    native_counts = dict(db.execute(
+        native_scope.with_only_columns(
+            EcoReservation.status, func.count(EcoReservation.id),
+            maintain_column_froms=True,
+        ).group_by(EcoReservation.status)
+    ).all())
+    native_financials = eco_financial_reporting.totals(db, native_scope)
 
     if not metrics or metrics.total is None:
         return EcoProviderListingSummary(
@@ -980,15 +989,16 @@ def get_my_eco_experiences_summary(
         published=int(metrics.published or 0),
         verified_badges=int(metrics.verified_badges or 0),
         pending_badges=int(metrics.pending_badges or 0),
-        total_bookings=total_b,
-        pending_bookings=pending_b,
-        confirmed_bookings=confirmed_b,
-        completed_bookings=completed_b,
-        cancelled_bookings=cancelled_b,
-        rejected_bookings=rejected_b,
+        total_bookings=total_b + sum(native_counts.values()),
+        pending_bookings=pending_b + native_counts.get("pending", 0),
+        confirmed_bookings=confirmed_b + native_counts.get("confirmed", 0),
+        completed_bookings=completed_b + native_counts.get("completed", 0),
+        cancelled_bookings=cancelled_b + native_counts.get("cancelled", 0),
+        rejected_bookings=rejected_b + native_counts.get("rejected", 0),
         total_revenue=total_rev,
         pending_cash_revenue=pending_cash_rev,
         refunded_amount=refunded_amt,
+        native_financials=native_financials,
     )
 
 
@@ -1119,6 +1129,23 @@ def get_my_eco_earnings_summary(
             db, provider_profile.id
         ),
         currency="LKR",
+    )
+
+
+@router.get(
+    "/me/earnings/bookings",
+    response_model=EcoProviderBookingPayments,
+    summary="List payment records for the authenticated provider's native Eco bookings",
+)
+def list_my_eco_booking_payments(
+    provider: Annotated[ProviderProfile, Depends(require_approved_eco_provider)],
+    db: Annotated[Session, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+):
+    query = eco_financial_reporting.scope(provider_id=provider.id)
+    return eco_financial_reporting.page(
+        db, query, page, page_size, include_refund_states=False,
     )
 
 
@@ -1529,17 +1556,36 @@ def submit_eco_experience_review(
                 provider_user_id = prof.user_id
 
         if provider_user_id:
+            suffix = f" ({booking_ref.booking_reference})"
+            title = f"New Review for {experience.title}"
             create_notification(
                 db=db,
                 user_id=provider_user_id,
-                title=f"New Review for {experience.title}",
-                message=f"{current_user.full_name} left a {payload.rating}-star review: \"{payload.title or 'Eco Experience Review'}\"",
+                title=title[:150 - len(suffix)] + suffix,
+                message=(
+                    f"{current_user.full_name} left a {payload.rating}-star review "
+                    f"for {experience.title}: \"{payload.title or 'Eco Experience Review'}\""
+                ),
                 notification_type="new_review",
                 link_url=f"/eco-experiences/{experience.id}",
             )
 
-        db.commit()
         db.refresh(review)
+        result = EcoReviewResponse(
+            id=review.id,
+            eco_experience_id=experience.id,
+            booking_id=booking.id,
+            booking_source=payload.booking_source,
+            user_id=current_user.id,
+            reviewer_name=current_user.full_name or "Verified Traveler",
+            rating=review.rating,
+            title=review.title,
+            comment=review.comment,
+            is_verified_booking=review.is_verified_booking,
+            is_published=review.is_published,
+            created_at=review.created_at,
+        )
+        db.commit()
     except Exception:
         db.rollback()
         logger.error("Failed to submit Eco experience review")
@@ -1548,20 +1594,7 @@ def submit_eco_experience_review(
             detail="Failed to submit review due to an internal error",
         )
 
-    return EcoReviewResponse(
-        id=review.id,
-        eco_experience_id=experience.id,
-        booking_id=booking.id,
-        booking_source=payload.booking_source,
-        user_id=current_user.id,
-        reviewer_name=current_user.full_name or "Verified Traveler",
-        rating=review.rating,
-        title=review.title,
-        comment=review.comment,
-        is_verified_booking=review.is_verified_booking,
-        is_published=review.is_published,
-        created_at=review.created_at,
-    )
+    return result
 
 
 @router.get(
@@ -2307,13 +2340,25 @@ def get_admin_eco_experiences_overview(
     platform_comm = (paid_rev * Decimal("0.10")).quantize(Decimal("0.01"))
     net_payable = (paid_rev - platform_comm).quantize(Decimal("0.01"))
 
+    admin_native_scope = eco_financial_reporting.scope()
+    admin_native_counts = dict(
+        db.execute(
+            admin_native_scope.with_only_columns(
+                EcoReservation.status,
+                func.count(EcoReservation.id),
+                maintain_column_froms=True,
+            ).group_by(EcoReservation.status)
+        ).all()
+    )
+    admin_native_financials = eco_financial_reporting.totals(db, admin_native_scope)
+
     booking_metrics = EcoAdminBookingMetrics(
-        total_bookings=total_b,
-        pending_bookings=pending_b,
-        confirmed_bookings=confirmed_b,
-        completed_bookings=completed_b,
-        cancelled_bookings=cancelled_b,
-        rejected_bookings=rejected_b,
+        total_bookings=total_b + sum(admin_native_counts.values()),
+        pending_bookings=pending_b + admin_native_counts.get("pending", 0),
+        confirmed_bookings=confirmed_b + admin_native_counts.get("confirmed", 0),
+        completed_bookings=completed_b + admin_native_counts.get("completed", 0),
+        cancelled_bookings=cancelled_b + admin_native_counts.get("cancelled", 0),
+        rejected_bookings=rejected_b + admin_native_counts.get("rejected", 0),
     )
     financial_metrics = EcoAdminFinancialMetrics(
         gross_booking_value=gross_val,
@@ -2338,6 +2383,7 @@ def get_admin_eco_experiences_overview(
         by_district=by_district,
         booking_metrics=booking_metrics,
         financial_metrics=financial_metrics,
+        native_financials=admin_native_financials,
     )
 
 

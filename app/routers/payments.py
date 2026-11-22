@@ -690,6 +690,13 @@ def handle_payhere_callback(form_data: dict, db: Session):
 
         reject_claimed_capture(db, payment_id)
 
+    if order_id.startswith("ECO-RETRY-"):
+        from app.services.eco_native_payments import capture_retry
+
+        return capture_retry(
+            db, order_id, payment_id, payhere_amount, payhere_currency, status_code
+        )
+
     if order_id.startswith("AD-TG-"):
         return handle_tour_guide_advertising_payment_callback(
             db=db,

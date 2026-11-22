@@ -1,13 +1,21 @@
-from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier, Lock
+from types import SimpleNamespace
 
-from sqlalchemy import select
+from fastapi import HTTPException
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from app.models.activity_booking import ActivityBooking
 from app.models.activity_slot import ActivitySlot
 from app.models.eco_reservation import EcoAvailabilitySlot, EcoRefundReconciliation
-from app.models.shared import BookingReference, PaymentRefund, PaymentTransaction, ProviderSettlement
+from app.models.shared import (
+    BookingReference, Notification, PaymentRefund, PaymentTransaction, ProviderSettlement, Review,
+)
+from app.routers import eco_experiences
+from app.schemas.eco_experience import EcoReviewCreateRequest
 from app.services import eco_reservations
 from tests.test_eco_native_payments import callback, checkout, confirm, enabled
 from tests.test_eco_reservations import API, RESERVATIONS, action, catalog, eco_inventory
@@ -45,6 +53,13 @@ def test_review_uses_explicit_native_source_and_canonical_reference(eco_inventor
     monkeypatch.setattr(eco_reservations, "utc_now", lambda: end + timedelta(minutes=1))
     assert action(client, actor, booking["id"], "complete").status_code == 200
     actor["id"] = 5
+    with monkeypatch.context() as patch:
+        def fail_notification(**kwargs):
+            raise RuntimeError("simulated review notification failure")
+
+        patch.setattr(eco_experiences, "create_notification", fail_notification)
+        assert client.post(path, json=payload).status_code == 500
+    assert client.get(path).json()["items"] == []
     native = client.post(path, json=payload)
     assert native.status_code == 201, native.text
     assert native.json()["booking_source"] == "eco_experience"
@@ -53,9 +68,83 @@ def test_review_uses_explicit_native_source_and_canonical_reference(eco_inventor
     legacy = client.post(path, json=payload)
     assert legacy.status_code == 201, legacy.text
     assert client.post(path, json=payload).status_code == 409
+    with Session(engine) as db:
+        notices = db.scalars(select(Notification).where(
+            Notification.user_id == 12, Notification.notification_type == "new_review",
+        )).all()
+        assert len(notices) == len({notice.title for notice in notices}) == 2
     assert {item["booking_source"] for item in client.get(path).json()["items"]} == {
         "activity", "eco_experience",
     }
+    provider_path = f"{API}/eco-experiences/me/reviews"
+    assert client.get(provider_path).status_code == 403
+    actor["id"] = 12
+    owner_reviews = client.get(provider_path)
+    assert owner_reviews.status_code == 200, owner_reviews.text
+    assert {item["booking_source"] for item in owner_reviews.json()["items"]} == {
+        "activity", "eco_experience",
+    }
+    actor["id"] = 2
+    other_reviews = client.get(provider_path)
+    assert other_reviews.status_code == 200, other_reviews.text
+    assert other_reviews.json()["items"] == []
+
+
+def test_concurrent_native_review_keeps_one_review_and_notice(eco_inventory, monkeypatch, tmp_path):
+    client, actor, source, _ = eco_inventory
+    booking = confirm(eco_inventory)
+    assert action(client, actor, booking["id"], "cash").status_code == 200
+    with Session(source) as db:
+        ends_at = db.get(EcoAvailabilitySlot, booking["slot_id"]).ends_at
+    monkeypatch.setattr(eco_reservations, "utc_now", lambda: ends_at + timedelta(seconds=1))
+    assert action(client, actor, booking["id"], "complete").status_code == 200
+    engine = create_engine(f"sqlite:///{tmp_path / 'eco-review.sqlite'}")
+
+    @event.listens_for(engine, "connect")
+    def install_clock(connection, _):
+        connection.create_function(
+            "sysutcdatetime", 0, lambda: datetime.now(UTC).replace(tzinfo=None).isoformat(" ")
+        )
+
+    lock = Lock()
+    barrier = Barrier(2, timeout=5)
+    payload = EcoReviewCreateRequest(
+        booking_id=booking["id"], booking_source="eco_experience", rating="5.00",
+    )
+    traveler = SimpleNamespace(id=5, full_name="Offline traveler")
+
+    def lock_schedule(db, experience_id):
+        assert experience_id == 1
+        assert lock.acquire(timeout=5)
+        db.info["review_lock"] = True
+
+    def submit():
+        with Session(engine) as db:
+            barrier.wait()
+            try:
+                eco_experiences.submit_eco_experience_review(1, payload, traveler, db)
+                return 201
+            except HTTPException as exc:
+                return exc.status_code
+            finally:
+                db.rollback()
+                if db.info.pop("review_lock", False):
+                    lock.release()
+
+    monkeypatch.setattr(eco_reservations, "lock_schedule", lock_schedule)
+    try:
+        with source.connect() as original, engine.connect() as target:
+            original.connection.driver_connection.backup(target.connection.driver_connection)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(submit), pool.submit(submit)]
+            assert sorted(result.result(timeout=10) for result in results) == [201, 409]
+        with Session(engine) as db:
+            assert db.scalars(select(Review)).one().is_verified_booking
+            assert db.scalars(select(Notification).where(
+                Notification.notification_type == "new_review",
+            )).one().user_id == 12
+    finally:
+        engine.dispose()
 
 
 def test_native_ledger_separates_captures_cash_duplicates_and_refunds(
@@ -106,6 +195,7 @@ def test_native_ledger_separates_captures_cash_duplicates_and_refunds(
             ))
         db.commit()
     earnings = f"{API}/eco-experiences/me/earnings/summary"
+    payments = f"{API}/eco-experiences/me/earnings/bookings"
     report = f"{API}/admin/eco-reservations/report"
     assert client.get(report).status_code == 403
     assert client.get(earnings).status_code == 200
@@ -123,8 +213,26 @@ def test_native_ledger_separates_captures_cash_duplicates_and_refunds(
     assert settlements["currency"] == "USD"
     assert settlements["disbursed"] == "280.00"
     assert settlements["pending"] == "280.00"
+    first_payment = client.get(payments, params={"page_size": 1})
+    assert first_payment.status_code == 200, first_payment.text
+    second_payment = client.get(payments, params={"page_size": 1, "page": 2}).json()
+    assert first_payment.json()["total"] == second_payment["total"] == 2
+    by_method = {
+        row["payment_method"]: row
+        for row in first_payment.json()["items"] + second_payment["items"]
+    }
+    assert by_method["online"]["finance"]["captured_online"] == "3600.00"
+    assert by_method["online"]["finance"]["verified_refunds"] == "250.00"
+    assert by_method["pay_at_location"]["finance"]["cash_receipts"] == "1800.00"
+    assert set(by_method["online"]) == {
+        "booking_reference", "payment_method", "payment_status", "currency",
+        "total_price", "finance",
+    }
+    actor["id"] = 5
+    assert client.get(payments).status_code == 403
     actor["id"] = 2
     assert client.get(earnings).json()["native_financials"] == []
+    assert client.get(payments).json()["items"] == []
     actor["id"] = 4
     first = client.get(report, params={"page_size": 1, "provider_id": provider_id})
     assert first.status_code == 200, first.text
@@ -142,3 +250,7 @@ def test_native_ledger_separates_captures_cash_duplicates_and_refunds(
     assert audit.status_code == 200, audit.text
     assert audit.json()["total"] == 1
     assert audit.json()["native_financials"] == [native]
+    overview = client.get(f"{API}/admin/eco-experiences/overview")
+    assert overview.status_code == 200, overview.text
+    assert overview.json()["native_financials"] == [native]
+    assert overview.json()["booking_metrics"]["total_bookings"] == 3

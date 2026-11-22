@@ -1,5 +1,6 @@
 """Native Eco checkout and ledger transitions using the shared PayHere merchant."""
 import os
+import re
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -7,7 +8,9 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from app.core.booking_transactions import CAPTURED, capture_status, executed_refund_status
+from app.core.booking_transactions import (
+    CAPTURED, EXECUTED_REFUNDS, capture_status, executed_refund_status,
+)
 from app.core.payhere import payhere_service
 from app.models.eco_experience import EcoSeasonRestriction
 from app.models.eco_reservation import (
@@ -17,12 +20,15 @@ from app.models.eco_reservation import (
     EcoReservation,
 )
 from app.models.provider_profile import ProviderProfile
-from app.models.shared import BookingReference, PaymentRefund, PaymentTransaction
+from app.models.shared import (
+    BookingReference, BookingStatusHistory, PaymentRefund, PaymentTransaction,
+)
 from app.services import eco_reservations as reservations
 from app.services.payhere_bookings import capture_amount, checkout_response, lock_capture
 
 CHECKOUT_WINDOW = timedelta(minutes=30)
 CANCELLATION_REFUND_REASON = "Eco free-window cancellation"
+RETRY_ORDER = re.compile(r"ECO-RETRY-([1-9][0-9]{0,9})-([1-9][0-9]{0,9})")
 
 
 def require_activation():
@@ -32,12 +38,15 @@ def require_activation():
 
 
 def require_merchant():
-    if (
-        not payhere_service.merchant_id
-        or payhere_service.merchant_id == "TEST_MERCHANT_ID"
-        or not payhere_service.merchant_secret
-        or payhere_service.merchant_secret == "TEST_MERCHANT_SECRET"
-    ):
+    merchant = payhere_service.merchant_id
+    secret = payhere_service.merchant_secret
+    if any(
+        not value or value.strip() != value or value.upper() == placeholder
+        for value, placeholder in (
+            (merchant, "TEST_MERCHANT_ID"),
+            (secret, "TEST_MERCHANT_SECRET"),
+        )
+    ) or payhere_service.mode not in {"sandbox", "production"}:
         raise HTTPException(503, "Eco platform payment is unavailable")
 
 
@@ -50,12 +59,16 @@ def online_transactions(reference_id):
     )
 
 
-def attempt_for(db, ref):
-    return db.scalar(
-        online_transactions(ref.id)
-        .order_by(PaymentTransaction.id)
-        .limit(1)
-    )
+def attempt_for(db, ref, *, latest=False):
+    identifier = PaymentTransaction.id
+    query = online_transactions(ref.id)
+    if latest:
+        query = query.where(
+            PaymentTransaction.gateway_transaction_id.is_(None)
+        ).order_by(identifier.desc())
+    else:
+        query = query.order_by(identifier)
+    return db.scalar(query.limit(1))
 
 
 def locked_reservation(db, query):
@@ -82,14 +95,21 @@ def checkout(db, traveler, booking_id):
     now = reservations.utc_now()
     if (
         row.status != "confirmed" or row.payment_status != "unpaid"
+        or ref.payment_status != "unpaid"
         or not row.holds_capacity or slot.starts_at <= now or row.total_price <= 0
     ):
         raise HTTPException(409, "Eco reservation is ineligible for online payment")
     listing = reservations.experience(db, slot.eco_experience_id, hold=True)
     reservations.eligible(db, listing.id, slot.starts_at, slot.ends_at, row.participants)
     reservations.require_slot_clearance(db, listing, slot)
-    attempt = attempt_for(db, ref)
-    if attempt is None:
+    first = attempt_for(db, ref)
+    attempt = attempt_for(db, ref, latest=True) if first is not None else None
+    if attempt is not None and attempt.payment_status not in {"pending", "failed"}:
+        raise HTTPException(409, "The Eco payment attempt has closed")
+    if (
+        attempt is None or attempt.payment_status == "failed"
+        or deadline(attempt, slot) <= now
+    ):
         attempt = PaymentTransaction(
             booking_reference_id=ref.id,
             user_id=row.traveler_id,
@@ -101,12 +121,15 @@ def checkout(db, traveler, booking_id):
             created_at=now,
         )
         db.add(attempt)
-    elif attempt.payment_status != "pending" or deadline(attempt, slot) <= now:
-        raise HTTPException(409, "The Eco payment attempt has closed")
+        db.flush()
+    order = ref.booking_reference
+    if first is not None and first.id != attempt.id:
+        order = f"ECO-RETRY-{ref.id}-{attempt.id}"
     response = checkout_response(
-        row.id, ref.booking_reference, "Eco reservation", attempt.amount,
+        row.id, order, "Eco reservation", attempt.amount,
         attempt.currency, traveler,
     )
+    response.booking_reference = ref.booking_reference
     db.commit()
     return response
 
@@ -120,8 +143,10 @@ def payment_status(db, traveler, booking_id):
     if result is None:
         raise HTTPException(404, "Eco reservation not found")
     row, slot, ref, online = result
-    attempt = attempt_for(db, ref)
-    status = ref.payment_status
+    attempt = attempt_for(db, ref, latest=True)
+    status = (
+        row.payment_status if row.payment_status == "no_refund_due" else ref.payment_status
+    )
     if attempt is not None and status == "unpaid":
         status = attempt.payment_status
         if status == "pending" and deadline(attempt, slot) <= reservations.utc_now():
@@ -134,7 +159,15 @@ def payment_status(db, traveler, booking_id):
     }
 
 
-def capture(db, reference_id, payment_id, raw_amount, currency, gateway_status):
+def capture_retry(db, order, payment_id, amount, currency, status):
+    match = RETRY_ORDER.fullmatch(order)
+    if match is None or any(int(value) > 2147483647 for value in match.groups()):
+        raise HTTPException(400, "Invalid Eco retry order")
+    reference_id, attempt_id = map(int, match.groups())
+    return capture(db, reference_id, payment_id, amount, currency, status, attempt_id=attempt_id)
+
+
+def capture(db, reference_id, payment_id, raw_amount, currency, gateway_status, *, attempt_id=None):
     """Handle an already authenticated shared PayHere callback."""
     require_merchant()
     amount = capture_amount(raw_amount)
@@ -161,22 +194,29 @@ def capture(db, reference_id, payment_id, raw_amount, currency, gateway_status):
     ) if payment_id else None
     if prior is not None:
         return {"status": "already_processed"}
-    attempt = attempt_for(db, ref)
+    attempt = (
+        attempt_for(db, ref) if attempt_id is None else db.scalar(
+            online_transactions(ref.id).where(PaymentTransaction.id == attempt_id)
+        )
+    )
     if attempt is None:
         raise HTTPException(409, "No Eco checkout exists for this order")
     if attempt.user_id != row.traveler_id or attempt.amount != amount or attempt.currency != currency:
         raise HTTPException(409, "Eco checkout does not match this payment")
+    latest = attempt_for(db, ref, latest=True)
+    is_latest = latest is not None and attempt.id == latest.id
     if gateway_status != "2":
         if gateway_status in ("-1", "-2") and attempt.payment_status == "pending":
             if row.payment_status == "unpaid" and ref.payment_status == "unpaid":
                 attempt.payment_status = "failed"
-                notify(db, row, ref, "online_payment_failed")
+                if is_latest:
+                    notify(db, row, ref, "online_payment_failed")
                 db.commit()
         return {"status": "ignored"}
     now = reservations.utc_now()
     applicable = (
         row.status == "confirmed" and row.payment_status == "unpaid"
-        and row.holds_capacity and attempt.payment_status == "pending"
+        and row.holds_capacity and attempt.payment_status == "pending" and is_latest
         and now < deadline(attempt, slot)
     )
     if applicable:
@@ -212,7 +252,7 @@ def capture(db, reference_id, payment_id, raw_amount, currency, gateway_status):
             payment_transaction_id=recorded.id, amount=amount, currency=currency,
             refund_status="pending", refund_reason="Late or conflicting Eco capture",
         ))
-        if ref.payment_status == "unpaid":
+        if ref.payment_status == "unpaid" and (is_latest or latest is None):
             ref.payment_status = "refund_pending"
         notify(db, row, ref, "online_payment_requires_reconciliation")
         result = "requires_reconciliation"
@@ -220,10 +260,11 @@ def capture(db, reference_id, payment_id, raw_amount, currency, gateway_status):
     return {"status": result}
 
 
-def notify(db, row, ref, event, *, actor=None, previous_status=None):
+def notify(db, row, ref, event, *, actor=None, previous_status=None, notes=None):
     provider = db.get(ProviderProfile, ref.provider_profile_id)
     reservations.save_event(
-        db, ref, previous_status or row.status, row.status, actor, row.traveler_id, event
+        db, ref, previous_status or row.status, row.status, actor, row.traveler_id, event,
+        notes=notes,
     )
     if provider is not None:
         reservations.notify_reservation_actor(db, provider.user_id, ref, event)
@@ -253,8 +294,12 @@ def cancel_paid(db, traveler, booking_id):
         if snapshot is None:
             raise HTTPException(409, "Paid cancellation is outside the free cancellation policy")
         percentage = snapshot.late_refund_percent
+    payment = qualifying_capture(db, row, ref)
+    if payment is None:
+        raise HTTPException(409, "No qualifying captured payment found")
     cancel_held_reservation(
-        db, row, slot, ref, traveler.id, now, online=True, percentage=percentage
+        db, row, slot, ref, traveler.id, now,
+        payment=payment, percentage=percentage,
     )
     result = reservations.reservation_result(row, slot, ref, True)
     db.commit()
@@ -267,6 +312,9 @@ def qualifying_capture(db, row, ref):
         .where(
             PaymentTransaction.payment_status.in_(CAPTURED),
             PaymentTransaction.gateway_transaction_id.is_not(None),
+            PaymentTransaction.user_id == row.traveler_id,
+            PaymentTransaction.amount == row.total_price,
+            PaymentTransaction.currency == row.currency,
             ~select(PaymentRefund.id)
             .where(PaymentRefund.payment_transaction_id == PaymentTransaction.id)
             .exists(),
@@ -274,14 +322,13 @@ def qualifying_capture(db, row, ref):
         .order_by(PaymentTransaction.id)
         .limit(1)
     )
-    if payment is None or payment.amount != row.total_price or payment.currency != row.currency:
-        raise HTTPException(409, "No qualifying captured payment found")
     return payment
 
 
-def cancel_held_reservation(db, row, slot, ref, actor_id, now, *, online, percentage=100):
+def cancel_held_reservation(
+    db, row, slot, ref, actor_id, now, *, payment=None, percentage=100, notes=None,
+):
     old_status = row.status
-    payment = qualifying_capture(db, row, ref) if online else None
     reservations.release_capacity(db, slot.id, row.capacity_held)
     row.status = ref.booking_status = "cancelled"
     row.cancelled_at = now
@@ -302,7 +349,7 @@ def cancel_held_reservation(db, row, slot, ref, actor_id, now, *, online, percen
         else:
             row.payment_status = "no_refund_due"
             event = "cancelled_no_refund_due"
-    notify(db, row, ref, event, actor=actor_id, previous_status=old_status)
+    notify(db, row, ref, event, actor=actor_id, previous_status=old_status, notes=notes)
 
 
 def cancel_restricted_slots(db, admin, experience_id, restriction_id):
@@ -319,11 +366,14 @@ def cancel_restricted_slots(db, admin, experience_id, restriction_id):
     slot = EcoAvailabilitySlot
     slots = db.scalars(select(slot).where(
         slot.eco_experience_id == experience_id,
-        slot.starts_at > now,
+        slot.ends_at > now,
         slot.starts_at < reservations.local_midnight(restriction.end_date + timedelta(days=1)),
-        slot.ends_at >= reservations.local_midnight(restriction.start_date),
+        slot.ends_at > reservations.local_midnight(restriction.start_date),
     )).all()
     closed = cancelled = 0
+    manual = []
+    restriction_prefix = f"Eco restriction {restriction.id}: "
+    notes = (restriction_prefix + restriction.reason)[:500]
     try:
         for affected in slots:
             rows = db.execute(reservations.reservation_query(
@@ -333,22 +383,43 @@ def cancel_restricted_slots(db, admin, experience_id, restriction_id):
                 EcoReservation.holds_capacity.is_(True),
                 EcoReservation.status.in_(("pending", "confirmed")),
             )).all()
-            if affected.is_open:
+            was_open = affected.is_open
+            if was_open:
                 affected.is_open = False
                 closed += 1
             for row, _, ref, online in rows:
                 paid = row.payment_status == "paid"
-                if paid and (
-                    not online or os.getenv("ECO_NATIVE_PAID_CANCELLATION_ENABLED") != "1"
+                payment = None
+                if (
+                    paid and online and affected.starts_at > now
+                    and os.getenv("ECO_NATIVE_PAID_CANCELLATION_ENABLED") == "1"
                 ):
-                    raise HTTPException(409, "Paid reservation requires manual cancellation")
-                cancel_held_reservation(db, row, affected, ref, admin.id, now, online=paid)
+                    payment = qualifying_capture(db, row, ref)
+                if affected.starts_at <= now or (paid and payment is None):
+                    manual.append(row.id)
+                    history = db.scalar(select(BookingStatusHistory.id).where(
+                        BookingStatusHistory.booking_reference_id == ref.id,
+                        BookingStatusHistory.from_status == BookingStatusHistory.to_status,
+                        BookingStatusHistory.notes.startswith(restriction_prefix),
+                    ).limit(1))
+                    if history is None:
+                        notify(
+                            db, row, ref, "restriction_requires_manual_review",
+                            actor=admin.id, notes=notes,
+                        )
+                    continue
+                cancel_held_reservation(
+                    db, row, affected, ref, admin.id, now, payment=payment, notes=notes,
+                )
                 cancelled += 1
         db.commit()
     except Exception:
         db.rollback()
         raise
-    return {"slots_closed": closed, "reservations_cancelled": cancelled}
+    result = {"slots_closed": closed, "reservations_cancelled": cancelled}
+    if manual:
+        result["manual_reservation_ids"] = sorted(manual)
+    return result
 
 
 def locked_refund(db, refund_id):
@@ -418,6 +489,14 @@ def reconcile_refund(db, admin, refund_id, evidence):
         or (new == "succeeded") != (evidence.refund_reference is not None)
     ):
         raise HTTPException(409, "Invalid Eco refund reconciliation transition")
+    if new == "succeeded":
+        executed = db.scalar(select(func.coalesce(func.sum(PaymentRefund.amount), 0)).where(
+            PaymentRefund.payment_transaction_id == tx.id,
+            PaymentRefund.id != refund.id,
+            PaymentRefund.refund_status.in_(EXECUTED_REFUNDS),
+        ))
+        if executed + refund.amount > tx.amount:
+            raise HTTPException(409, "Cumulative refunds exceed the captured amount")
     if review is None:
         review = EcoRefundReconciliation(refund_id=refund.id)
         db.add(review)

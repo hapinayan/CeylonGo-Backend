@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import case, or_, select, true, update
+from sqlalchemy import case, func, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.booking_transactions import lock_booking_resource
@@ -463,12 +463,63 @@ def require_slot_clearance(db, listing, slot):
         verified = set(db.scalars(select(EcoSlotClearance.kind).where(
             EcoSlotClearance.slot_id == slot.id,
             EcoSlotClearance.kind.in_(required),
+            func.nullif(func.trim(EcoSlotClearance.evidence_reference), "").is_not(None),
             EcoSlotClearance.revoked_at.is_(None),
             EcoSlotClearance.valid_until >= slot.ends_at,
         )))
         if required <= verified:
             return
     raise HTTPException(409, "Required permit or guide verification is unavailable")
+
+
+def change_slot_clearance(db, admin_id, experience_id, slot_id, kind, approval=None):
+    if os.getenv("ECO_NATIVE_SAFETY_RECORDS_ENABLED") != "1":
+        raise HTTPException(503, "Eco clearance management is unavailable")
+    lock_schedule(db, experience_id)
+    slot = db.scalar(select(Slot).where(
+        Slot.id == slot_id, Slot.eco_experience_id == experience_id,
+    ))
+    if slot is None:
+        raise HTTPException(404, "Eco slot not found")
+    clearance = db.get(EcoSlotClearance, (slot_id, kind))
+    now = utc_now()
+    if approval is None:
+        if clearance is None:
+            raise HTTPException(404, "Eco clearance not found")
+        if clearance.revoked_at is None:
+            clearance.revoked_at = now
+    else:
+        valid_until = approval.valid_until.astimezone(UTC).replace(tzinfo=None)
+        if slot.ends_at <= now or valid_until < slot.ends_at:
+            raise HTTPException(422, "Clearance must cover the remaining slot")
+        if clearance is None:
+            if approval.expected_revoked_at is not None:
+                raise HTTPException(409, "Eco clearance has changed")
+            clearance = EcoSlotClearance(slot_id=slot_id, kind=kind)
+            db.add(clearance)
+        elif clearance.revoked_at is not None:
+            if approval.expected_revoked_at != timestamp(clearance.revoked_at):
+                raise HTTPException(409, "Confirm the current revocation before reapproving")
+        elif (
+            clearance.evidence_reference != approval.evidence_reference
+            or clearance.valid_until != valid_until
+        ):
+            raise HTTPException(409, "Revoke the existing Eco clearance before changing it")
+        if clearance.verified_by is None or clearance.revoked_at is not None:
+            clearance.verified_by = admin_id
+            clearance.evidence_reference = approval.evidence_reference
+            clearance.valid_until = valid_until
+            clearance.revoked_at = None
+    result = {
+        "slot_id": slot_id,
+        "kind": kind,
+        "verified_by": clearance.verified_by,
+        "evidence_reference": clearance.evidence_reference,
+        "valid_until": timestamp(clearance.valid_until),
+        "revoked_at": timestamp(clearance.revoked_at) if clearance.revoked_at else None,
+    }
+    db.commit()
+    return result
 
 
 def change_reservation(db, user, reservation_id, action, reason, *, provider=None):

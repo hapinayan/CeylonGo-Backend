@@ -649,7 +649,8 @@ def test_final_submit_missing_sections_blocked(client: TestClient, db_session: S
     assert "Incomplete business details" in res1.json()["detail"]
 
 
-def test_final_submit_success_new_provider(client: TestClient, db_session: Session):
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+def test_final_submit_success_new_provider(client: TestClient, db_session: Session, provider_type):
     email = "ready_provider@ceylongo.com"
     token = issue_test_auth_token(db_session, email)
 
@@ -676,7 +677,7 @@ def test_final_submit_success_new_provider(client: TestClient, db_session: Sessi
         "/api/v1/providers/registration/business",
         json={
             "business_name": "Kandy Mountain Retreat",
-            "provider_type": "homestay",
+            "provider_type": provider_type,
             "secondary_phone": "0711234567",
             "business_province": "Central",
             "business_district": "Kandy",
@@ -723,7 +724,7 @@ def test_final_submit_success_new_provider(client: TestClient, db_session: Sessi
     profile = db_session.query(ProviderProfile).filter_by(user_id=user.id).first()
     assert profile is not None
     assert profile.business_name == "Kandy Mountain Retreat"
-    assert profile.provider_type == "homestay"
+    assert profile.provider_type == provider_type
     assert profile.phone == "0771234567"
     assert profile.district == "Kandy"
     assert profile.nic_number == "198512345678"

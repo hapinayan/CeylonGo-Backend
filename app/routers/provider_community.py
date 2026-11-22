@@ -8,11 +8,15 @@ from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.community import CommunityPost
 from app.models.provider_profile import ProviderProfile
+from app.schemas.community import CommunityPostCreate
 from app.schemas.provider_community import (
     ProviderCommunityPostCreate,
     ProviderCommunityPostListResponse,
     ProviderCommunityPostResponse,
 )
+from app.services.community_moderation import enforce_community_not_suspended
+from app.services.community_posts import create_community_post, delete_community_post
+
 
 router = APIRouter(
     prefix="/api/v1/providers/me/community",
@@ -35,26 +39,21 @@ def create_provider_community_post(
     Publishes a cultural, activity, homestay, or tourism update to the community feed.
     Enforces approved provider status and attributes the post to the provider user.
     """
-    user = provider_profile.user
-    district = payload.district or provider_profile.district
-
-    post = CommunityPost(
-        author_id=user.id,
-        content=payload.content.strip(),
-        location_tag=payload.location_tag.strip() if payload.location_tag else None,
-        district=district.strip() if district else None,
-        likes_count=0,
-        comments_count=0,
-        is_published=True,
+    user = enforce_community_not_suspended(db, provider_profile.user)
+    if not payload.content.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Post caption cannot be empty.",
+        )
+    post = create_community_post(
+        db,
+        current_user=user,
+        payload=CommunityPostCreate(
+            content=payload.content,
+            location_tag=payload.location_tag,
+            district=payload.district or provider_profile.district,
+        ),
     )
-
-    try:
-        db.add(post)
-        db.commit()
-        db.refresh(post)
-    except Exception:
-        db.rollback()
-        raise
 
     return ProviderCommunityPostResponse(
         id=post.id,
@@ -136,7 +135,7 @@ def delete_provider_community_post(
     """
     Deletes a community post owned by the authenticated provider.
     """
-    user = provider_profile.user
+    user = enforce_community_not_suspended(db, provider_profile.user)
     post = (
         db.query(CommunityPost)
         .filter(CommunityPost.id == post_id, CommunityPost.author_id == user.id)
@@ -148,7 +147,6 @@ def delete_provider_community_post(
             detail="Community post not found or not authored by you",
         )
 
-    db.delete(post)
-    db.commit()
+    delete_community_post(db, post_id=post.id, current_user=user)
     return {"message": "Community post deleted successfully", "id": post_id}
 

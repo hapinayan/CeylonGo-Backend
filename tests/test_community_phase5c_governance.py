@@ -951,3 +951,161 @@ def test_governance_actions_roll_back_atomically_if_audit_fails(
         )
     db_session.expire_all()
     assert bool(db_session.get(CommunityHashtag, tag.id).is_blocked) is False  # type: ignore[union-attr]
+
+
+def test_distinct_community_events_show_up_in_recipient_inbox(
+    client, db_session, actors,
+):
+    owner, commenter = actors["t1"], actors["t2"]
+    same_name = User(
+        full_name=commenter.full_name,
+        email="same-name.5c@example.com",
+        password_hash="x",
+        role="tourist",
+        is_active=True,
+    )
+    db_session.add(same_name)
+    db_session.commit()
+    owner_headers, commenter_headers, same_name_headers = map(
+        bearer, (owner, commenter, same_name),
+    )
+    post = client.post(
+        f"{COMMUNITY_BASE}/posts", headers=owner_headers,
+        json={"content": "A trip to Ella"},
+    )
+    assert post.status_code == 201
+    post_path = f"{COMMUNITY_BASE}/posts/{post.json()['id']}"
+    for headers in (
+        commenter_headers, commenter_headers, same_name_headers, owner_headers,
+    ):
+        assert client.put(f"{post_path}/like", headers=headers).status_code == 200
+
+    comment_ids = []
+    for content in ("Great trip!", "What time did you leave?"):
+        comment = client.post(
+            f"{post_path}/comments", headers=commenter_headers,
+            json={"content": content},
+        )
+        assert comment.status_code == 201
+        comment_ids.append(comment.json()["id"])
+
+    reply_ids = []
+    for content in ("Early morning", "Before the crowds"):
+        reply = client.post(
+            f"{post_path}/comments", headers=same_name_headers,
+            json={"content": content, "parent_comment_id": comment_ids[0]},
+        )
+        assert reply.status_code == 201
+        reply_ids.append(reply.json()["id"])
+
+    follow_path = f"{COMMUNITY_BASE}/profiles/{owner.id}/follow"
+    for headers in (commenter_headers, commenter_headers, same_name_headers):
+        assert client.put(follow_path, headers=headers).status_code == 200
+    assert client.put(follow_path, headers=owner_headers).status_code == 400
+
+    inbox_path = "/api/v1/notifications"
+    owner_inbox = client.get(inbox_path, headers=owner_headers)
+    assert owner_inbox.status_code == 200
+    assert owner_inbox.json()["unread_count"] == owner_inbox.json()["total"] == 8
+    items = owner_inbox.json()["items"]
+    assert all(item["user_id"] == owner.id for item in items)
+    assert sum(
+        item["notification_type"] == "community_post_like" for item in items
+    ) == 2
+    assert {
+        item["link_url"] for item in items
+        if item["notification_type"] == "community_post_comment"
+    } == {
+        f"/community/posts/{post.json()['id']}#comment-{comment_id}"
+        for comment_id in comment_ids + reply_ids
+    }
+    assert {
+        item["link_url"] for item in items
+        if item["notification_type"] == "community_new_follower"
+    } == {f"/community/profiles/{commenter.id}", f"/community/profiles/{same_name.id}"}
+    comment_inbox = client.get(inbox_path, headers=commenter_headers)
+    assert comment_inbox.status_code == 200
+    replies = comment_inbox.json()["items"]
+    assert len(replies) == 2
+    assert all(
+        item["notification_type"] == "community_comment_reply" for item in replies
+    )
+    assert {item["link_url"] for item in replies} == {
+        f"/community/posts/{post.json()['id']}#comment-{reply_id}" for reply_id in reply_ids
+    }
+    assert client.get(inbox_path, headers=same_name_headers).json()["total"] == 0
+    assert client.patch(
+        f"{inbox_path}/{items[0]['id']}/read", headers=same_name_headers,
+    ).status_code == 404
+
+
+def test_provider_compatibility_routes_enforce_community_governance(
+    client, db_session, actors,
+):
+    provider, admin = actors["provider"], actors["admin"]
+    db_session.add(ProviderProfile(
+        user_id=provider.id, business_name="Ella Eco Host", provider_type="homestay",
+        phone="0771230001", district="Badulla", nic_number="198512340001",
+        approval_status="approved",
+    ))
+    db_session.commit()
+    provider_headers, admin_headers = bearer(provider), bearer(admin)
+    provider_path = "/api/v1/providers/me/community/posts"
+    post = client.post(
+        provider_path, headers=provider_headers, json={"content": "Ella update #ella"},
+    )
+    assert post.status_code == 201
+    post_id = post.json()["id"]
+    public = client.get(f"{COMMUNITY_BASE}/posts/{post_id}")
+    assert public.status_code == 200
+    assert [tag["tag"] for tag in public.json()["hashtags"]] == ["ella"]
+
+    admin_post = f"{COMMUNITY_BASE}/admin/posts/{post_id}"
+    assert client.patch(
+        admin_post, headers=admin_headers, json={"is_featured": True},
+    ).status_code == 200
+    featured = client.get(f"{COMMUNITY_BASE}/feed", params={"featured_only": True})
+    assert featured.status_code == 200
+    assert any(item["id"] == post_id for item in featured.json()["items"])
+
+    tag = db_session.query(CommunityHashtag).filter_by(tag="ella").one()
+    assert client.patch(
+        f"{COMMUNITY_BASE}/admin/hashtags/{tag.id}",
+        headers=admin_headers, json={"is_blocked": True},
+    ).status_code == 200
+    blocked = client.post(
+        provider_path, headers=provider_headers,
+        json={"content": "Another update #ella"},
+    )
+    assert blocked.status_code == 400
+    assert "Blocked hashtag" in blocked.json()["detail"]
+
+    suspension = f"{COMMUNITY_BASE}/admin/profiles/{provider.id}"
+    assert client.patch(
+        suspension, headers=admin_headers,
+        json={"is_community_suspended": True, "suspension_reason": "Test suspension"},
+    ).status_code == 200
+    assert client.post(
+        provider_path, headers=provider_headers, json={"content": "A new update"},
+    ).status_code == 403
+    deletion = client.delete(f"{provider_path}/{post_id}", headers=provider_headers)
+    assert deletion.status_code == 403
+    assert client.get(provider_path, headers=provider_headers).status_code == 200
+    assert provider.is_active is True
+
+    assert client.patch(
+        suspension, headers=admin_headers, json={"is_community_suspended": False},
+    ).status_code == 200
+    assert client.patch(
+        admin_post, headers=admin_headers, json={"is_published": False},
+    ).status_code == 200
+    deletion = client.delete(f"{provider_path}/{post_id}", headers=provider_headers)
+    assert deletion.status_code == 403
+    assert db_session.get(CommunityPost, post_id) is not None
+    resumed = client.post(
+        provider_path, headers=provider_headers, json={"content": "A new update"},
+    )
+    assert resumed.status_code == 201
+    assert client.delete(
+        f"{provider_path}/{resumed.json()['id']}", headers=provider_headers,
+    ).status_code == 200

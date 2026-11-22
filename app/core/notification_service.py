@@ -11,24 +11,29 @@ def create_notification(
     message: str,
     notification_type: str,
     link_url: str | None = None,
+    *,
+    deduplicate: bool = True,
 ) -> Notification | None:
     """
     Safely creates an in-app notification for a user.
-    Prevents duplicate notifications from repeated/retried requests within 30 seconds.
+    By default, matching titles are deduplicated within 30 seconds. Callers that
+    already identify new domain events can opt out.
     """
-    recent_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
-    duplicate = (
-        db.query(Notification)
-        .filter(
-            Notification.user_id == user_id,
-            Notification.notification_type == notification_type,
-            Notification.title == title,
-            Notification.created_at >= recent_cutoff,
+    if deduplicate:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        recent_cutoff = now - timedelta(seconds=30)
+        duplicate = (
+            db.query(Notification)
+            .filter(
+                Notification.user_id == user_id,
+                Notification.notification_type == notification_type,
+                Notification.title == title,
+                Notification.created_at >= recent_cutoff,
+            )
+            .first()
         )
-        .first()
-    )
-    if duplicate:
-        return duplicate
+        if duplicate:
+            return duplicate
 
     notif = Notification(
         user_id=user_id,

@@ -276,6 +276,7 @@ def follow_community_user(
                 message=f"{current_user.full_name} is now following your CeylonGo Travel Community profile.",
                 notification_type="community_new_follower",
                 link_url=f"/community/profiles/{current_user.id}",
+                deduplicate=False,
             )
 
         _commit(db)

@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import Session
 
 from app.core.booking_transactions import CAPTURED, RESERVED_REFUNDS, lock_booking_resource
@@ -42,6 +42,8 @@ from app.schemas.booking import (
     BookingListResponse,
     BookingRejectRequest,
     BookingResponse,
+    HomestayBookingProviderItem,
+    HomestayCustomerSummary,
     CashPaymentRecordRequest,
 )
 from app.services.booking_expiration import expire_single_booking
@@ -89,7 +91,29 @@ def _verify_booking_provider_ownership(
 
 
 def _acquire_homestay_lock(db: Session, homestay_id: int):
-    lock_booking_resource(db, f"homestay_booking_{homestay_id}")
+    """Best-effort transactional lock on SQL Server; safely ignores SQLite in offline tests."""
+    try:
+        lock_result = db.execute(
+            text("""
+                DECLARE @result INT;
+                EXEC @result = sp_getapplock
+                    @Resource = :lock_name,
+                    @LockMode = 'Exclusive',
+                    @LockOwner = 'Transaction',
+                    @LockTimeout = 5000;
+                SELECT @result;
+            """),
+            {"lock_name": f"homestay_{homestay_id}"},
+        ).scalar()
+        if lock_result is not None and lock_result < 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Homestay is currently being booked by another user. Please try again.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
 
 # TRAVELER: Get personal booking history
@@ -913,6 +937,223 @@ def record_cash_payment(
             link_url=f"/bookings/{booking.id}",
         )
 
+        db.commit()
+        db.refresh(booking)
+    except Exception:
+        db.rollback()
+        raise
+
+    return booking
+
+
+@router.get("/provider/{booking_id}", response_model=HomestayBookingProviderItem)
+def get_provider_homestay_booking_detail(
+    booking_id: int,
+    manager: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Get single booking details with ownership verification."""
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == manager.id)
+        .first()
+    )
+
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not check_homestay_ownership(booking.homestay, manager, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own the homestay for this booking",
+        )
+
+    customer_summary = None
+    if booking.user:
+        customer_summary = HomestayCustomerSummary(
+            id=booking.user.id,
+            full_name=booking.user.full_name,
+            email=booking.user.email,
+        )
+
+    return HomestayBookingProviderItem(
+        id=booking.id,
+        homestay_id=booking.homestay_id,
+        homestay_name=booking.homestay.name if booking.homestay else "Homestay",
+        user_id=booking.user_id,
+        check_in=booking.check_in,
+        check_out=booking.check_out,
+        guests=booking.guests,
+        total_price=booking.total_price,
+        currency=getattr(booking, "currency", "LKR"),
+        status=booking.status,
+        payment_method=getattr(booking, "payment_method", "pay_at_location"),
+        payment_status=getattr(booking, "payment_status", "unpaid"),
+        cancellation_reason=booking.cancellation_reason,
+        cancelled_by=booking.cancelled_by,
+        cancelled_at=booking.cancelled_at,
+        created_at=booking.created_at,
+        customer=customer_summary,
+    )
+
+
+@router.post(
+    "/{booking_id}/check-in",
+    response_model=BookingResponse,
+    summary="Confirm guest check-in for homestay reservation",
+)
+def confirm_homestay_check_in(
+    booking_id: int,
+    manager: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == manager.id)
+        .first()
+    )
+
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not check_homestay_ownership(booking.homestay, manager, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own the homestay for this booking",
+        )
+
+    if booking.status == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="Guest has already checked in",
+        )
+
+    if booking.status != "confirmed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot check in a booking with status '{booking.status}'",
+        )
+
+    today = date.today()
+    if today < booking.check_in:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot check in before the scheduled check-in date ({booking.check_in})",
+        )
+
+    booking.status = "in_progress"
+    booking.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    try:
+        db.commit()
+        db.refresh(booking)
+    except Exception:
+        db.rollback()
+        raise
+
+    return booking
+
+
+@router.post(
+    "/{booking_id}/check-out",
+    response_model=BookingResponse,
+    summary="Confirm guest check-out for homestay reservation",
+)
+def confirm_homestay_check_out(
+    booking_id: int,
+    manager: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == manager.id)
+        .first()
+    )
+
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not check_homestay_ownership(booking.homestay, manager, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own the homestay for this booking",
+        )
+
+    if booking.status == "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Guest has already checked out",
+        )
+
+    if booking.status != "in_progress":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only in-progress bookings can be checked out (current status: '{booking.status}')",
+        )
+
+    booking.status = "completed"
+    booking.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    try:
+        db.commit()
+        db.refresh(booking)
+    except Exception:
+        db.rollback()
+        raise
+
+    return booking
+
+
+@router.post(
+    "/{booking_id}/no-show",
+    response_model=BookingResponse,
+    summary="Mark homestay reservation as guest no-show",
+)
+def mark_homestay_no_show(
+    booking_id: int,
+    manager: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == manager.id)
+        .first()
+    )
+
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not check_homestay_ownership(booking.homestay, manager, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own the homestay for this booking",
+        )
+
+    if booking.status != "confirmed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only confirmed bookings can be marked as no-show (current status: '{booking.status}')",
+        )
+
+    today = date.today()
+    if today <= booking.check_in:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot mark no-show before the check-in date has passed",
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    booking.status = "cancelled"
+    booking.cancellation_reason = "Guest marked as no-show by host"
+    booking.cancelled_by = manager.id
+    booking.cancelled_at = now
+    booking.updated_at = now
+
+    try:
         db.commit()
         db.refresh(booking)
     except Exception:

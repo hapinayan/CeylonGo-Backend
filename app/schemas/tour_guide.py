@@ -40,7 +40,6 @@ CredentialType = Literal[
 
 PackagePricingType = Literal["per_person", "per_group"]
 
-
 # =============================================================================
 # 1. CORE TOUR GUIDE PROFILE SCHEMAS
 # =============================================================================
@@ -86,7 +85,6 @@ class TourGuideCreate(BaseModel):
                 "Latitude and longitude must be provided together"
             )
         return self
-
 
 class TourGuideUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -143,7 +141,6 @@ class TourGuideUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuideResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 
@@ -181,7 +178,6 @@ class TourGuideResponse(BaseModel):
     def categories(self) -> list[str]:
         return extract_category_slugs(self.specialties)
 
-
 # =============================================================================
 # 2. GUIDE CATEGORIES SCHEMAS (PR-07 / TR-03)
 # =============================================================================
@@ -191,12 +187,10 @@ class GuideCategoryInfo(BaseModel):
     name: str
     examples: str
 
-
 class GuideCategoriesUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     categories: list[GuideCategorySlug] = Field(min_length=1, max_length=4)
-
 
 # =============================================================================
 # 3. LANGUAGES SCHEMAS (PR-05 / TR-06)
@@ -223,7 +217,6 @@ class TourGuideLanguageCreate(BaseModel):
             raise ValueError("language_name must be at least 2 characters")
         return cleaned
 
-
 class TourGuideLanguageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -248,7 +241,6 @@ class TourGuideLanguageUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuideLanguageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -259,7 +251,6 @@ class TourGuideLanguageResponse(BaseModel):
     proficiency_level: str
     is_primary: bool
     created_at: datetime
-
 
 # =============================================================================
 # 4. SERVICE AREAS SCHEMAS (PR-06 / TR-07)
@@ -285,7 +276,6 @@ class TourGuideServiceAreaCreate(BaseModel):
     @classmethod
     def clean_city(cls, value: str) -> str:
         return " ".join(value.strip().split())
-
 
 class TourGuideServiceAreaUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -319,7 +309,6 @@ class TourGuideServiceAreaUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuideServiceAreaResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -330,7 +319,6 @@ class TourGuideServiceAreaResponse(BaseModel):
     city: str
     is_primary: bool
     created_at: datetime
-
 
 # =============================================================================
 # 5. PROFILE IMAGE GALLERY SCHEMAS (PR-03 / TR-05)
@@ -350,7 +338,6 @@ class TourGuideImageUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuideImageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -361,7 +348,6 @@ class TourGuideImageResponse(BaseModel):
     display_order: int
     is_profile: bool
     created_at: datetime
-
 
 # =============================================================================
 # 6. PRIVATE CREDENTIALS & QUALIFICATIONS SCHEMAS (PR-04 / GS-02 / AD-02)
@@ -386,7 +372,6 @@ class TourGuideCredentialUpdate(BaseModel):
             raise ValueError("expiry_date must be on or after issue_date")
         return self
 
-
 class TourGuideCredentialResponse(BaseModel):
     """
     Safe credential metadata response for owners & admins.
@@ -408,7 +393,6 @@ class TourGuideCredentialResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-
 class TourGuideVerificationRecordResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -422,7 +406,6 @@ class TourGuideVerificationRecordResponse(BaseModel):
     rejection_reason: str | None = None
     verified_at: datetime
     created_at: datetime
-
 
 # =============================================================================
 # 7. TOUR PACKAGES SCHEMAS (PR-08 / PR-09 / GS-03 / GS-04 / GS-05)
@@ -458,7 +441,6 @@ class TourGuidePackageCreate(BaseModel):
                 "meeting_latitude and meeting_longitude must be provided together"
             )
         return self
-
 
 class TourGuidePackageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -503,7 +485,6 @@ class TourGuidePackageUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuidePackageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -531,7 +512,6 @@ class TourGuidePackageResponse(BaseModel):
     def duration_category(self) -> str:
         return classify_package_duration(float(self.duration_hours))
 
-
 # =============================================================================
 # 8. AVAILABILITY CALENDAR SCHEMAS (PR-10 / TR-10)
 # =============================================================================
@@ -553,7 +533,6 @@ class TourGuideAvailabilityCreate(BaseModel):
             raise ValueError("end_time must be strictly after start_time")
         return self
 
-
 class TourGuideAvailabilityUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -570,7 +549,6 @@ class TourGuideAvailabilityUpdate(BaseModel):
                 raise ValueError(f"{field} cannot be null")
         return self
 
-
 class TourGuideAvailabilityBulkBlockRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -586,7 +564,6 @@ class TourGuideAvailabilityBulkBlockRequest(BaseModel):
             raise ValueError("Bulk availability block cannot exceed 90 days per request")
         return self
 
-
 class TourGuideAvailabilityResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -598,7 +575,6 @@ class TourGuideAvailabilityResponse(BaseModel):
     is_available: bool
     reason: str | None = None
     created_at: datetime
-
 
 # =============================================================================
 # 9. PROVIDER CONTACT & VERIFICATION STATUS SCHEMAS (PR-17 / PR-18)
@@ -630,7 +606,6 @@ class TourGuideContactUpdate(BaseModel):
             raise ValueError("phone cannot be null")
         return self
 
-
 class TourGuideContactResponse(BaseModel):
     tour_guide_id: int
     provider_profile_id: int
@@ -640,7 +615,6 @@ class TourGuideContactResponse(BaseModel):
     secondary_phone: str | None = None
     base_city: str
     base_district: str
-
 
 class TourGuideVerificationStatusResponse(BaseModel):
     tour_guide_id: int
@@ -656,7 +630,6 @@ class TourGuideVerificationStatusResponse(BaseModel):
     credentials_summary: dict[str, int]
     credentials: list[TourGuideCredentialResponse]
     verification_history: list[TourGuideVerificationRecordResponse]
-
 
 # =============================================================================
 # 10. ADMIN REVIEW, MODERATION, CREDENTIAL & BADGE SCHEMAS (AD-01..AD-04)
@@ -683,14 +656,12 @@ class AdminTourGuideListItem(BaseModel):
     approved_credentials_count: int
     created_at: datetime
 
-
 class AdminTourGuideListResponse(BaseModel):
     items: list[AdminTourGuideListItem]
     total: int
     page: int
     page_size: int
     total_pages: int
-
 
 class AdminTourGuideDetailResponse(BaseModel):
     guide: TourGuideResponse
@@ -707,12 +678,10 @@ class AdminTourGuideDetailResponse(BaseModel):
     credentials: list[TourGuideCredentialResponse]
     verification_history: list[TourGuideVerificationRecordResponse]
 
-
 class AdminTourGuideDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str | None = Field(default=None, max_length=1000)
-
 
 class AdminTourGuideActionResponse(BaseModel):
     success: bool
@@ -724,13 +693,11 @@ class AdminTourGuideActionResponse(BaseModel):
     listing_reference_synced: bool
     message: str
 
-
 class AdminCredentialListItem(BaseModel):
     credential: TourGuideCredentialResponse
     business_name: str
     guide_approval_status: str
     guide_verification_status: str
-
 
 class AdminCredentialListResponse(BaseModel):
     items: list[AdminCredentialListItem]
@@ -738,7 +705,6 @@ class AdminCredentialListResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
-
 
 class AdminCredentialVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -762,13 +728,11 @@ class AdminCredentialVerifyRequest(BaseModel):
                 )
         return self
 
-
 class AdminCredentialVerifyResponse(BaseModel):
     credential: TourGuideCredentialResponse
     verification: TourGuideVerificationRecordResponse
     guide_verification_status: str
     message: str
-
 
 class AdminBadgeUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -785,14 +749,12 @@ class AdminBadgeUpdateRequest(BaseModel):
                 )
         return self
 
-
 class AdminBadgeUpdateResponse(BaseModel):
     success: bool
     tour_guide_id: int
     verification_status: str
     is_verified_badge: bool
     message: str
-
 
 # =============================================================================
 # 11. PUBLIC / TRAVELER DISCOVERY, DETAIL, PACKAGES, CALENDAR & PREVIEW (PHASE 2)
@@ -809,7 +771,6 @@ PublicGuideSortBy = Literal[
 
 PriceFilterBasis = Literal["daily", "hourly", "package", "any"]
 
-
 class PublicGuideLanguageSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -817,7 +778,6 @@ class PublicGuideLanguageSummary(BaseModel):
     language_name: str
     proficiency_level: str
     is_primary: bool
-
 
 class PublicGuideServiceAreaSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -827,7 +787,6 @@ class PublicGuideServiceAreaSummary(BaseModel):
     city: str
     is_primary: bool
 
-
 class PublicGuideImageSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -836,7 +795,6 @@ class PublicGuideImageSummary(BaseModel):
     caption: str | None = None
     display_order: int
     is_profile: bool
-
 
 class PublicGuideCredentialBadge(BaseModel):
     """
@@ -849,7 +807,6 @@ class PublicGuideCredentialBadge(BaseModel):
     issuing_authority: str
     expiry_date: date | None = None
     verified: bool = True
-
 
 class PublicTourGuideSummary(BaseModel):
     id: int
@@ -882,7 +839,6 @@ class PublicTourGuideSummary(BaseModel):
     active_packages_count: int
     min_package_price: Decimal | None = None
 
-
 class PublicTourGuideListResponse(BaseModel):
     items: list[PublicTourGuideSummary]
     total: int
@@ -891,9 +847,7 @@ class PublicTourGuideListResponse(BaseModel):
     total_pages: int
     has_more: bool
 
-
 FitnessLevel = Literal["low", "moderate", "challenging", "strenuous"]
-
 
 class PackageSpecialRequirementsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -910,7 +864,6 @@ class PackageSpecialRequirementsPayload(BaseModel):
             return None
         cleaned = value.strip()
         return cleaned if cleaned else None
-
 
 class PublicTourGuidePackageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -938,7 +891,6 @@ class PublicTourGuidePackageResponse(BaseModel):
     def duration_category(self) -> str:
         return classify_package_duration(float(self.duration_hours))
 
-
 class PublicTourGuidePackageDetailResponse(BaseModel):
     package: PublicTourGuidePackageResponse
     guide_id: int
@@ -951,7 +903,6 @@ class PublicTourGuidePackageDetailResponse(BaseModel):
     guide_review_count: int
     cancellation_policy: str | None = None
     free_cancellation_hours: int
-
 
 class PublicTourGuideDetailResponse(BaseModel):
     id: int
@@ -987,13 +938,11 @@ class PublicTourGuideDetailResponse(BaseModel):
     verified_credentials: list[PublicGuideCredentialBadge]
     packages: list[PublicTourGuidePackageResponse]
 
-
 class PublicTimeWindow(BaseModel):
     start_time: time | None = None
     end_time: time | None = None
     full_day: bool = False
     status: Literal["open", "blocked", "booked"]
-
 
 class PublicAvailabilityDay(BaseModel):
     date: date
@@ -1003,14 +952,12 @@ class PublicAvailabilityDay(BaseModel):
     blocked_windows: list[PublicTimeWindow]
     booked_windows: list[PublicTimeWindow]
 
-
 class PublicGuideAvailabilityCalendarResponse(BaseModel):
     tour_guide_id: int
     date_from: date
     date_to: date
     guide_is_available: bool
     days: list[PublicAvailabilityDay]
-
 
 class TourGuidePricePreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1035,7 +982,6 @@ class TourGuidePricePreviewRequest(BaseModel):
             raise ValueError("duration_days is required when rate_type is 'daily'")
         return self
 
-
 class TourGuidePricePreviewResponse(BaseModel):
     tour_guide_id: int
     package_id: int | None = None
@@ -1058,7 +1004,6 @@ class TourGuidePricePreviewResponse(BaseModel):
     cancellation_policy: str | None = None
     free_cancellation_hours: int
 
-
 class PublicGuideContactResponse(BaseModel):
     tour_guide_id: int
     business_name: str
@@ -1077,7 +1022,6 @@ class PublicGuideContactResponse(BaseModel):
     available_channels: list[str]
     privacy_note: str
 
-
 # =============================================================================
 # 12. BOOKING ENGINE, CASH PAYMENT, CANCELLATION & ADMIN MONITORING (PHASE 3)
 # =============================================================================
@@ -1085,7 +1029,6 @@ class PublicGuideContactResponse(BaseModel):
 BookingPaymentMethod = Literal["pay_at_location", "online"]
 TravelerBookingBucket = Literal["all", "upcoming", "past", "cancelled"]
 ProviderBookingBucket = Literal["all", "requests", "upcoming", "completed", "cancelled", "past"]
-
 
 class TourGuideBookingCreate(BaseModel):
     """
@@ -1117,7 +1060,6 @@ class TourGuideBookingCreate(BaseModel):
             raise ValueError("duration_days is required when rate_type is 'daily'")
         return self
 
-
 class BookingReasonRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1131,18 +1073,15 @@ class BookingReasonRequest(BaseModel):
             raise ValueError("reason must be at least 5 characters")
         return cleaned
 
-
 class BookingOptionalNotesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     notes: str | None = Field(default=None, max_length=500)
 
-
 class CashPaymentRecordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     notes: str | None = Field(default=None, max_length=500)
-
 
 class BookingStatusHistoryItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1154,7 +1093,6 @@ class BookingStatusHistoryItem(BaseModel):
     notes: str | None = None
     created_at: datetime
 
-
 class RefundEligibilitySummary(BaseModel):
     is_free_cancellation: bool
     free_cancellation_hours: int
@@ -1163,7 +1101,6 @@ class RefundEligibilitySummary(BaseModel):
     eligible_refund_amount: Decimal
     currency: str
     policy_note: str
-
 
 class TourGuideBookingResponse(BaseModel):
     id: int
@@ -1199,11 +1136,9 @@ class TourGuideBookingResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-
 class TourGuideBookingDetailResponse(TourGuideBookingResponse):
     refund_eligibility: RefundEligibilitySummary | None = None
     status_history: list[BookingStatusHistoryItem] = Field(default_factory=list)
-
 
 class TourGuideBookingListResponse(BaseModel):
     items: list[TourGuideBookingResponse]
@@ -1213,13 +1148,11 @@ class TourGuideBookingListResponse(BaseModel):
     total_pages: int
     has_more: bool
 
-
 class TourGuideBookingCancelResponse(BaseModel):
     booking: TourGuideBookingDetailResponse
     refund_eligibility: RefundEligibilitySummary
     availability_released: bool
     message: str
-
 
 class ProviderCalendarBookingItem(BaseModel):
     booking_id: int
@@ -1233,7 +1166,6 @@ class ProviderCalendarBookingItem(BaseModel):
     payment_method: str
     payment_status: str
 
-
 class ProviderCalendarDay(BaseModel):
     date: date
     availability_slots: list[TourGuideAvailabilityResponse]
@@ -1242,14 +1174,12 @@ class ProviderCalendarDay(BaseModel):
     has_pending_request: bool
     is_blocked: bool
 
-
 class ProviderBookingCalendarResponse(BaseModel):
     tour_guide_id: int
     date_from: date
     date_to: date
     guide_is_available: bool
     days: list[ProviderCalendarDay]
-
 
 class AdminTourGuideBookingListResponse(BaseModel):
     items: list[TourGuideBookingResponse]
@@ -1261,7 +1191,6 @@ class AdminTourGuideBookingListResponse(BaseModel):
     status_counts: dict[str, int]
     issues_count: int
 
-
 # =============================================================================
 # 13. ONLINE PAYMENT PREPARATION, COMMISSION, REFUNDS & EARNINGS (PHASE 4)
 # =============================================================================
@@ -1272,7 +1201,6 @@ class TourGuideCommissionBreakdown(BaseModel):
     commission_amount: Decimal
     provider_payable_amount: Decimal
     currency: str = "LKR"
-
 
 class TourGuidePaymentPrepareResponse(BaseModel):
     booking_id: int
@@ -1295,7 +1223,6 @@ class TourGuidePaymentPrepareResponse(BaseModel):
     notify_url: str
     commission_preview: TourGuideCommissionBreakdown
 
-
 class TourGuideRefundRecordItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -1308,7 +1235,6 @@ class TourGuideRefundRecordItem(BaseModel):
     processed_by: int | None = None
     processed_at: datetime | None = None
     created_at: datetime
-
 
 class TourGuidePaymentStatusResponse(BaseModel):
     booking_id: int
@@ -1327,7 +1253,6 @@ class TourGuidePaymentStatusResponse(BaseModel):
     refund_eligibility: RefundEligibilitySummary | None = None
     refunds: list[TourGuideRefundRecordItem] = Field(default_factory=list)
 
-
 class TourGuideRefundRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1340,7 +1265,6 @@ class TourGuideRefundRequest(BaseModel):
         if len(cleaned) < 5:
             raise ValueError("reason must be at least 5 characters")
         return cleaned
-
 
 class TourGuideRefundResponse(BaseModel):
     id: int
@@ -1355,7 +1279,6 @@ class TourGuideRefundResponse(BaseModel):
     processed_by: int | None = None
     processed_at: datetime | None = None
     created_at: datetime
-
 
 class TourGuideProviderEarningsResponse(BaseModel):
     total_online_gross_earnings: Decimal
@@ -1373,7 +1296,6 @@ class TourGuideProviderEarningsResponse(BaseModel):
     cash_collected_total: Decimal
     total_cash_paid_bookings: int
     currency: str = "LKR"
-
 
 # =============================================================================
 # 14. REVIEWS, WISHLISTS, DASHBOARD, PROMOTIONS & ADMIN REPORTS (PHASE 5)
@@ -1395,7 +1317,6 @@ class TourGuideReviewCreate(BaseModel):
         cleaned = value.strip()
         return cleaned if cleaned else None
 
-
 class TourGuideReviewResponse(BaseModel):
     id: int
     tour_guide_id: int
@@ -1410,7 +1331,6 @@ class TourGuideReviewResponse(BaseModel):
     is_published: bool
     created_at: datetime
 
-
 class TourGuideReviewListResponse(BaseModel):
     items: list[TourGuideReviewResponse]
     total: int
@@ -1421,19 +1341,16 @@ class TourGuideReviewListResponse(BaseModel):
     total_pages: int
     has_more: bool
 
-
 class TourGuideReviewModerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_published: bool
     reason: str | None = Field(default=None, max_length=500)
 
-
 class TourGuideWishlistAddRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     notes: str | None = Field(default=None, max_length=500)
-
 
 class TourGuideWishlistActionResponse(BaseModel):
     message: str
@@ -1441,12 +1358,10 @@ class TourGuideWishlistActionResponse(BaseModel):
     saved: bool
     wishlist_id: int | None = None
 
-
 class TourGuideWishlistStatusResponse(BaseModel):
     tour_guide_id: int
     saved: bool
     wishlist_id: int | None = None
-
 
 class SavedTourGuideItem(BaseModel):
     wishlist_id: int
@@ -1466,7 +1381,6 @@ class SavedTourGuideItem(BaseModel):
     is_available: bool
     profile_image_url: str | None = None
 
-
 class TourGuideWishlistListResponse(BaseModel):
     items: list[SavedTourGuideItem]
     total: int
@@ -1474,7 +1388,6 @@ class TourGuideWishlistListResponse(BaseModel):
     page_size: int
     total_pages: int
     has_more: bool
-
 
 class ProviderOnboardingChecklist(BaseModel):
     has_profile: bool
@@ -1489,7 +1402,6 @@ class ProviderOnboardingChecklist(BaseModel):
     completion_percent: int
     next_steps: list[str]
 
-
 class ProviderDashboardBookingSummary(BaseModel):
     total: int
     pending: int
@@ -1501,14 +1413,12 @@ class ProviderDashboardBookingSummary(BaseModel):
     expired: int
     upcoming_bookings: list[TourGuideBookingResponse] = Field(default_factory=list)
 
-
 class ProviderDashboardPromotionSummary(BaseModel):
     active_campaigns: int
     pending_campaigns: int
     total_impressions: int
     total_clicks: int
     total_attributed_bookings: int
-
 
 class ProviderTourGuideDashboardResponse(BaseModel):
     provider_profile_id: int
@@ -1527,7 +1437,6 @@ class ProviderTourGuideDashboardResponse(BaseModel):
     bookings: ProviderDashboardBookingSummary
     earnings: TourGuideProviderEarningsResponse
     promotions: ProviderDashboardPromotionSummary
-
 
 class TourGuidePromotionPackageCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1552,7 +1461,6 @@ class TourGuidePromotionPackageCreate(BaseModel):
             raise ValueError("valid_to must be on or after valid_from")
         return self
 
-
 class TourGuidePromotionPackageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1564,7 +1472,6 @@ class TourGuidePromotionPackageUpdate(BaseModel):
     valid_from: date | None = None
     valid_to: date | None = None
     is_active: bool | None = None
-
 
 class TourGuidePromotionPackageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1580,7 +1487,6 @@ class TourGuidePromotionPackageResponse(BaseModel):
     valid_to: date
     is_active: bool
     created_at: datetime
-
 
 class TourGuideCampaignCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1603,19 +1509,16 @@ class TourGuideCampaignCreate(BaseModel):
             raise ValueError("ends_at must be strictly after starts_at")
         return self
 
-
 class TourGuideCampaignStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["paused", "active", "cancelled"]
-
 
 class AdminCampaignDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["approve", "reject", "pause", "cancel"]
     reason: str | None = Field(default=None, max_length=500)
-
 
 class TourGuideCampaignResponse(BaseModel):
     id: int
@@ -1638,7 +1541,6 @@ class TourGuideCampaignResponse(BaseModel):
     bookings: int = 0
     latest_payment_status: str | None = None
 
-
 class TourGuideCampaignListResponse(BaseModel):
     items: list[TourGuideCampaignResponse]
     total: int
@@ -1646,7 +1548,6 @@ class TourGuideCampaignListResponse(BaseModel):
     page_size: int
     total_pages: int
     has_more: bool
-
 
 class TourGuideCampaignPaymentPrepareResponse(BaseModel):
     campaign_id: int
@@ -1663,14 +1564,12 @@ class TourGuideCampaignPaymentPrepareResponse(BaseModel):
     cancel_url: str
     notify_url: str
 
-
 class TourGuidePromotionEventCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     campaign_id: int = Field(gt=0)
     event_type: Literal["impression", "click", "inquiry", "booking"]
     booking_id: int | None = Field(default=None, gt=0)
-
 
 class TourGuidePromotionEventResponse(BaseModel):
     id: int
@@ -1679,7 +1578,6 @@ class TourGuidePromotionEventResponse(BaseModel):
     event_type: str
     user_id: int | None = None
     created_at: datetime
-
 
 class TourGuideCampaignAnalyticsResponse(BaseModel):
     campaign_id: int
@@ -1697,7 +1595,6 @@ class TourGuideCampaignAnalyticsResponse(BaseModel):
     bookings: int
     ctr_percent: float
     conversion_rate_percent: float
-
 
 class ProviderTourGuideAnalyticsResponse(BaseModel):
     tour_guide_id: int
@@ -1728,7 +1625,6 @@ class ProviderTourGuideAnalyticsResponse(BaseModel):
     promotion_ctr_percent: float
     promotion_conversion_rate_percent: float
 
-
 class AdminAdPaymentItem(BaseModel):
     id: int
     campaign_id: int
@@ -1742,7 +1638,6 @@ class AdminAdPaymentItem(BaseModel):
     initiated_at: datetime
     verified_at: datetime | None = None
 
-
 class AdminAdPaymentListResponse(BaseModel):
     items: list[AdminAdPaymentItem]
     total: int
@@ -1752,7 +1647,6 @@ class AdminAdPaymentListResponse(BaseModel):
     page_size: int
     total_pages: int
     has_more: bool
-
 
 class AdminTourGuideReportsOverviewResponse(BaseModel):
     date_from: date | None = None
@@ -1780,11 +1674,9 @@ class AdminTourGuideReportsOverviewResponse(BaseModel):
     total_wishlist_saves: int
     active_sponsored_campaigns: int
 
-
 # =============================================================================
 # 15. MIGRATION 034 SCHEMA-GUARDED EXTENSIONS (TR-18, PR-17, GS-01, GS-03, GS-06)
 # =============================================================================
-
 
 class ProviderWhatsAppSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1802,7 +1694,6 @@ class ProviderWhatsAppSettingsUpdate(BaseModel):
             )
         return self
 
-
 class ProviderWhatsAppSettingsResponse(BaseModel):
     tour_guide_id: int
     primary_phone: str
@@ -1812,13 +1703,11 @@ class ProviderWhatsAppSettingsResponse(BaseModel):
     migration_034_active: bool
     status_note: str
 
-
 class AdminVerifiedExperienceUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verified_years_of_experience: int | None = Field(default=None, ge=0, le=80)
     notes: str | None = Field(default=None, max_length=500)
-
 
 class AdminVerifiedExperienceResponse(BaseModel):
     tour_guide_id: int
@@ -1827,7 +1716,6 @@ class AdminVerifiedExperienceResponse(BaseModel):
     experience_is_verified: bool
     migration_034_active: bool
     message: str
-
 
 class PackageExtendedRequirementsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1844,7 +1732,6 @@ class PackageExtendedRequirementsUpdate(BaseModel):
         cleaned = value.strip()
         return cleaned if cleaned else None
 
-
 class PackageExtendedRequirementsResponse(BaseModel):
     package_id: int
     tour_guide_id: int
@@ -1854,3 +1741,58 @@ class PackageExtendedRequirementsResponse(BaseModel):
     special_requirements: PackageSpecialRequirementsPayload | None = None
     migration_034_active: bool
     status_note: str
+
+# ==============================================================================
+# PATITHI BACKEND COMPATIBILITY SCHEMAS & ALIASES
+# ==============================================================================
+
+class TourGuideCredentialCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    credential_type: CredentialType
+    title: str = Field(min_length=2, max_length=150)
+    issuing_authority: str = Field(min_length=2, max_length=150)
+    certificate_number: str | None = Field(default=None, max_length=100)
+    issue_date: date | None = None
+    expiry_date: date | None = None
+    file_reference: str = Field(min_length=3, max_length=1000)
+    is_confidential: bool = True
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.issue_date and self.expiry_date and self.expiry_date < self.issue_date:
+            raise ValueError("expiry_date cannot be earlier than issue_date")
+        return self
+
+class TourGuideBookingProviderItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tour_guide_id: int
+    traveler_id: int
+    package_id: int | None = None
+    booking_date: date
+    start_datetime: datetime
+    end_datetime: datetime
+    number_of_people: int
+    pickup_location: str | None = None
+    special_requests: str | None = None
+    total_price: Decimal
+    currency: str
+    booking_status: str
+    payment_method: str
+    payment_status: str
+    package_title: str | None = None
+    traveler_name: str | None = None
+    traveler_email: str | None = None
+
+class TourGuideBookingProviderListResponse(BaseModel):
+    items: list[TourGuideBookingProviderItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+TourGuideProfileCreate = TourGuideCreate
+TourGuideProfileUpdate = TourGuideUpdate
+TourGuideProfileResponse = TourGuideResponse

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -100,3 +100,29 @@ class RentalBooking(Base):
     inspections = relationship("RentalInspection", back_populates="booking", cascade="all, delete-orphan")
     incidents = relationship("RentalIncident", back_populates="booking", cascade="all, delete-orphan")
     deposits = relationship("RentalDeposit", back_populates="booking", cascade="all, delete-orphan")
+
+    @property
+    def start_date(self) -> date | None:
+        if self.pickup_at:
+            return self.pickup_at.date() if isinstance(self.pickup_at, datetime) else self.pickup_at
+        return None
+
+    @start_date.setter
+    def start_date(self, value):
+        if isinstance(value, datetime):
+            self.pickup_at = value
+        elif isinstance(value, date):
+            self.pickup_at = datetime.combine(value, datetime.min.time())
+
+    @property
+    def end_date(self) -> date | None:
+        if self.return_at:
+            return self.return_at.date() if isinstance(self.return_at, datetime) else self.return_at
+        return None
+
+    @end_date.setter
+    def end_date(self, value):
+        if isinstance(value, datetime):
+            self.return_at = value
+        elif isinstance(value, date):
+            self.return_at = datetime.combine(value, datetime.min.time())

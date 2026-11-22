@@ -1521,4 +1521,6 @@ def delete_availability_block(
     return {
         "message": "Availability block removed successfully",
         "id": block_id,
+        "block_id": block_id,
+        "is_active": False,
     }

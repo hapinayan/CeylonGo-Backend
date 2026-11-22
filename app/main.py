@@ -110,6 +110,15 @@ from app.routers.admin_providers import (
 from app.routers.provider_auth import (
     router as provider_auth_router,
 )
+from app.routers.provider_dashboard import (
+    router as provider_dashboard_router,
+)
+from app.routers.provider_reviews import (
+    router as provider_reviews_router,
+)
+from app.routers.provider_community import (
+    router as provider_community_router,
+)
 from app.routers.provider_workspace import router as provider_workspace_router
 from app.routers.provider_reservations import router as provider_reservations_router
 from app.routers.eco_reservations import router as eco_reservations_router
@@ -247,6 +256,8 @@ from app.routers.community import (
     uploads_router as community_uploads_router,
 )
 
+
+
 # ==========================================
 # FASTAPI APPLICATION
 # ==========================================
@@ -365,6 +376,9 @@ app.include_router(provider_otp_router)
 app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
+app.include_router(provider_dashboard_router)
+app.include_router(provider_reviews_router)
+app.include_router(provider_community_router)
 app.include_router(provider_workspace_router)
 app.include_router(provider_reservations_router)
 app.include_router(eco_reservations_router)
@@ -430,6 +444,8 @@ app.include_router(admin_map_router)
 
 app.include_router(community_uploads_router)
 app.include_router(community_router)
+
+
 
 # ==========================================
 # HEALTH CHECK API

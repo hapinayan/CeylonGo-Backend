@@ -91,4 +91,67 @@ class ProviderMeResponse(BaseModel):
     description: str | None = None
     business_registration_number: str | None = None
     approval_status: str
+    business_province: str | None = None
+    business_district: str | None = None
+    business_city: str | None = None
+    business_landmark: str | None = None
+    business_postal_code: str | None = None
     created_at: datetime
+
+
+class ProviderProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    business_name: str | None = Field(default=None, min_length=2, max_length=150)
+    phone: str | None = Field(default=None, min_length=9, max_length=25)
+    secondary_phone: str | None = Field(default=None, max_length=25)
+    district: str | None = Field(default=None, min_length=2, max_length=100)
+    description: str | None = Field(default=None, max_length=1000)
+    business_province: str | None = Field(default=None, max_length=100)
+    business_district: str | None = Field(default=None, max_length=100)
+    business_city: str | None = Field(default=None, max_length=100)
+    business_landmark: str | None = Field(default=None, max_length=255)
+    business_postal_code: str | None = Field(default=None, max_length=20)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_primary_phone(cls, v: str | None) -> str | None:
+        if v:
+            from app.schemas.provider_registration import validate_sri_lankan_phone
+            return validate_sri_lankan_phone(v)
+        return None
+
+    @field_validator("secondary_phone")
+    @classmethod
+    def validate_sec_phone(cls, v: str | None) -> str | None:
+        if v:
+            from app.schemas.provider_registration import validate_sri_lankan_phone
+            return validate_sri_lankan_phone(v)
+        return None
+
+
+class ProviderPasswordChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(..., min_length=1, description="Current account password")
+    new_password: str = Field(..., min_length=8, max_length=128, description="New password (at least 8 characters)")
+    confirm_new_password: str = Field(..., min_length=8, max_length=128, description="Confirm new password")
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> Self:
+        if self.new_password != self.confirm_new_password:
+            raise ValueError("New password and confirmation password do not match.")
+        if self.new_password == self.current_password:
+            raise ValueError("New password must be different from current password.")
+        return self
+
+
+class ProviderSecurityStatusResponse(BaseModel):
+    user_id: int
+    email: str
+    is_active: bool
+    has_password: bool
+    role: str
+    provider_type: str
+    approval_status: str
+

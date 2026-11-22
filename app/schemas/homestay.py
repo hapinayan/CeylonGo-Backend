@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -144,3 +144,43 @@ class HomestayUpdateRequest(HomestayCreateRequest):
     images: list[HomestayImageInput] | None = None
     amenities: list[str] | None = None
     is_active: bool = True
+
+
+class HomestayAvailabilityBlockCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_date: date
+    end_date: date
+    block_type: str = Field(default="owner_unavailable", max_length=50)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_dates_and_type(self):
+        if self.end_date <= self.start_date:
+            raise ValueError("End date must be after start date")
+        if self.start_date < date.today():
+            raise ValueError("Start date cannot be in the past")
+        allowed = {
+            "maintenance",
+            "owner_unavailable",
+            "admin_block",
+            "renovation",
+            "seasonal_closure",
+            "other",
+        }
+        if self.block_type not in allowed:
+            raise ValueError(f"Invalid block_type. Allowed types: {sorted(allowed)}")
+        return self
+
+
+class HomestayAvailabilityBlockResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    homestay_id: int
+    start_date: date
+    end_date: date
+    block_type: str
+    reason: str | None = None
+    is_active: bool
+    created_at: datetime

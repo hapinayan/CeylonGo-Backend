@@ -86,6 +86,15 @@ from app.routers.admin_providers import (
 from app.routers.provider_auth import (
     router as provider_auth_router,
 )
+from app.routers.provider_dashboard import (
+    router as provider_dashboard_router,
+)
+from app.routers.provider_reviews import (
+    router as provider_reviews_router,
+)
+from app.routers.provider_community import (
+    router as provider_community_router,
+)
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES ROUTER IMPORTS
@@ -130,6 +139,14 @@ from app.routers.rental_vehicles import (
 )
 from app.routers.rental_bookings import (
     router as rental_bookings_router,
+)
+
+# ==========================================
+# TOUR GUIDE MODULE ROUTER IMPORTS
+# ==========================================
+
+from app.routers.tour_guide import (
+    router as tour_guide_router,
 )
 
 # ==========================================
@@ -231,6 +248,9 @@ app.include_router(provider_otp_router)
 app.include_router(provider_registration_router)
 app.include_router(admin_providers_router)
 app.include_router(provider_auth_router)
+app.include_router(provider_dashboard_router)
+app.include_router(provider_reviews_router)
+app.include_router(provider_community_router)
 
 # ==========================================
 # ACTIVITIES & EXPERIENCES MODULE
@@ -258,6 +278,12 @@ app.include_router(admin_eco_promotions_router)
 
 app.include_router(rental_vehicles_router)
 app.include_router(rental_bookings_router)
+
+# ==========================================
+# TOUR GUIDE MODULE
+# ==========================================
+
+app.include_router(tour_guide_router)
 
 # ==========================================
 # HEALTH CHECK API

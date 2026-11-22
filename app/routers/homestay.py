@@ -15,11 +15,14 @@ from app.models.booking import Booking
 from app.models.homestay import (
     Homestay,
     HomestayAmenity,
+    HomestayAvailabilityBlock,
     HomestayImage,
 )
 from app.models.provider_profile import ProviderProfile
 from app.models.user import User
 from app.schemas.homestay import (
+    HomestayAvailabilityBlockCreate,
+    HomestayAvailabilityBlockResponse,
     HomestayCreateRequest,
     HomestayListResponse,
     HomestayResponse,
@@ -604,5 +607,178 @@ def delete_homestay(
     return {
         "message": "Homestay deactivated successfully",
         "id": homestay_id,
+        "is_active": False,
+    }
+
+
+# ==========================================
+# HOMESTAY AVAILABILITY BLOCKS
+# ==========================================
+
+@router.post(
+    "/{homestay_id}/availability-blocks",
+    response_model=HomestayAvailabilityBlockResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create homestay availability block",
+)
+def create_homestay_availability_block(
+    homestay_id: int,
+    payload: HomestayAvailabilityBlockCreate,
+    current_user: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Block specific calendar dates for maintenance, owner unavailability, or seasonal closure.
+    Enforces host ownership and prevents blocking dates with existing confirmed bookings.
+    """
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == current_user.id)
+        .first()
+    )
+
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    if not homestay:
+        raise HTTPException(status_code=404, detail="Homestay not found")
+
+    if not check_homestay_ownership(homestay, current_user, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own this homestay",
+        )
+
+    # 1. Check for conflicting confirmed bookings
+    conflicting_booking = (
+        db.query(Booking)
+        .filter(
+            Booking.homestay_id == homestay_id,
+            Booking.status == "confirmed",
+            Booking.check_in < payload.end_date,
+            Booking.check_out > payload.start_date,
+        )
+        .first()
+    )
+    if conflicting_booking:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot block dates that have existing confirmed bookings",
+        )
+
+    # 2. Check for overlapping active availability blocks
+    overlapping_block = (
+        db.query(HomestayAvailabilityBlock)
+        .filter(
+            HomestayAvailabilityBlock.homestay_id == homestay_id,
+            HomestayAvailabilityBlock.is_active.is_(True),
+            HomestayAvailabilityBlock.start_date < payload.end_date,
+            HomestayAvailabilityBlock.end_date > payload.start_date,
+        )
+        .first()
+    )
+    if overlapping_block:
+        raise HTTPException(
+            status_code=409,
+            detail="Overlapping availability block already exists for these dates",
+        )
+
+    new_block = HomestayAvailabilityBlock(
+        homestay_id=homestay_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        block_type=payload.block_type,
+        reason=payload.reason,
+        is_active=True,
+        created_by=current_user.id,
+    )
+
+    try:
+        db.add(new_block)
+        db.commit()
+        db.refresh(new_block)
+    except Exception:
+        db.rollback()
+        raise
+
+    return new_block
+
+
+@router.get(
+    "/{homestay_id}/availability-blocks",
+    response_model=list[HomestayAvailabilityBlockResponse],
+    summary="List active homestay availability blocks",
+)
+def list_homestay_availability_blocks(
+    homestay_id: int,
+    db: Annotated[Session, Depends(get_db)],
+):
+    """List all active calendar blocks for a homestay."""
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    if not homestay:
+        raise HTTPException(status_code=404, detail="Homestay not found")
+
+    blocks = (
+        db.query(HomestayAvailabilityBlock)
+        .filter(
+            HomestayAvailabilityBlock.homestay_id == homestay_id,
+            HomestayAvailabilityBlock.is_active.is_(True),
+        )
+        .order_by(HomestayAvailabilityBlock.start_date.asc())
+        .all()
+    )
+
+    return blocks
+
+
+@router.delete(
+    "/{homestay_id}/availability-blocks/{block_id}",
+    summary="Remove homestay availability block",
+)
+def delete_homestay_availability_block(
+    homestay_id: int,
+    block_id: int,
+    current_user: Annotated[User, Depends(require_homestay_manager)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Remove or deactivate an existing availability block."""
+    profile = (
+        db.query(ProviderProfile)
+        .filter(ProviderProfile.user_id == current_user.id)
+        .first()
+    )
+
+    homestay = db.query(Homestay).filter(Homestay.id == homestay_id).first()
+    if not homestay:
+        raise HTTPException(status_code=404, detail="Homestay not found")
+
+    if not check_homestay_ownership(homestay, current_user, profile):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not own this homestay",
+        )
+
+    block = (
+        db.query(HomestayAvailabilityBlock)
+        .filter(
+            HomestayAvailabilityBlock.id == block_id,
+            HomestayAvailabilityBlock.homestay_id == homestay_id,
+        )
+        .first()
+    )
+    if not block:
+        raise HTTPException(
+            status_code=404,
+            detail="Availability block not found",
+        )
+
+    block.is_active = False
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "message": "Availability block removed successfully",
+        "id": block_id,
         "is_active": False,
     }

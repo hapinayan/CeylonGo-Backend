@@ -95,3 +95,29 @@ class RentalBooking(Base):
 
     vehicle = relationship("RentalVehicle", backref="bookings")
     user = relationship("User", foreign_keys=[user_id])
+
+    @property
+    def pickup_at(self) -> datetime | None:
+        if self.start_date:
+            return datetime.combine(self.start_date, datetime.min.time())
+        return None
+
+    @pickup_at.setter
+    def pickup_at(self, value):
+        if isinstance(value, datetime):
+            self.start_date = value.date()
+        elif isinstance(value, date):
+            self.start_date = value
+
+    @property
+    def return_at(self) -> datetime | None:
+        if self.end_date:
+            return datetime.combine(self.end_date, datetime.min.time())
+        return None
+
+    @return_at.setter
+    def return_at(self, value):
+        if isinstance(value, datetime):
+            self.end_date = value.date()
+        elif isinstance(value, date):
+            self.end_date = value

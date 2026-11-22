@@ -112,6 +112,8 @@ from app.schemas.eco_experience import (
     EcoProviderListingSummary,
     EcoSafetyRuleInput,
     EcoSafetyRuleResponse,
+    EcoSeasonRestrictionInput,
+    EcoSeasonRestrictionResponse,
     EcoVerificationDecisionRequest,
     EcoVerificationHistoryResponse,
 )
@@ -2574,6 +2576,151 @@ def list_eco_experience_images(
         .all()
     )
     return [EcoExperienceImageResponse.model_validate(img) for img in images]
+
+
+# ==========================================================
+# ECO SEASON RESTRICTIONS
+# ==========================================================
+
+@router.post(
+    "/{experience_id}/season-restrictions",
+    response_model=EcoSeasonRestrictionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a seasonal restriction to an eco experience",
+)
+def add_eco_season_restriction(
+    experience_id: int,
+    payload: EcoSeasonRestrictionInput,
+    provider_profile: Annotated[
+        ProviderProfile, Depends(require_approved_eco_provider)
+    ],
+    db: Annotated[Session, Depends(get_db)],
+):
+    experience = (
+        db.query(EcoExperience)
+        .filter(EcoExperience.id == experience_id)
+        .first()
+    )
+    if not experience:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Eco experience not found",
+        )
+    if experience.provider_profile_id != provider_profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: you do not own this eco experience",
+        )
+
+    overlap = (
+        db.query(EcoSeasonRestriction)
+        .filter(
+            EcoSeasonRestriction.eco_experience_id == experience_id,
+            EcoSeasonRestriction.is_active.is_(True),
+            EcoSeasonRestriction.restriction_type == payload.restriction_type,
+            EcoSeasonRestriction.start_date <= payload.end_date,
+            EcoSeasonRestriction.end_date >= payload.start_date,
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An active {payload.restriction_type} restriction already covers this date range",
+        )
+
+    restriction = EcoSeasonRestriction(
+        eco_experience_id=experience_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        restriction_type=payload.restriction_type,
+        reason=payload.reason,
+        is_active=payload.is_active,
+        created_by=provider_profile.user_id,
+    )
+    db.add(restriction)
+    db.commit()
+    db.refresh(restriction)
+    return restriction
+
+
+@router.get(
+    "/{experience_id}/season-restrictions",
+    response_model=list[EcoSeasonRestrictionResponse],
+    summary="List active seasonal restrictions for an eco experience",
+)
+def list_eco_season_restrictions(
+    experience_id: int,
+    db: Annotated[Session, Depends(get_db)],
+):
+    experience = (
+        db.query(EcoExperience)
+        .filter(EcoExperience.id == experience_id)
+        .first()
+    )
+    if not experience:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Eco experience not found",
+        )
+
+    restrictions = (
+        db.query(EcoSeasonRestriction)
+        .filter(
+            EcoSeasonRestriction.eco_experience_id == experience_id,
+            EcoSeasonRestriction.is_active.is_(True),
+        )
+        .order_by(EcoSeasonRestriction.start_date.asc())
+        .all()
+    )
+    return restrictions
+
+
+@router.delete(
+    "/{experience_id}/season-restrictions/{restriction_id}",
+    summary="Deactivate or remove a seasonal restriction",
+)
+def delete_eco_season_restriction(
+    experience_id: int,
+    restriction_id: int,
+    provider_profile: Annotated[
+        ProviderProfile, Depends(require_approved_eco_provider)
+    ],
+    db: Annotated[Session, Depends(get_db)],
+):
+    experience = (
+        db.query(EcoExperience)
+        .filter(EcoExperience.id == experience_id)
+        .first()
+    )
+    if not experience:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Eco experience not found",
+        )
+    if experience.provider_profile_id != provider_profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: you do not own this eco experience",
+        )
+
+    restriction = (
+        db.query(EcoSeasonRestriction)
+        .filter(
+            EcoSeasonRestriction.id == restriction_id,
+            EcoSeasonRestriction.eco_experience_id == experience_id,
+        )
+        .first()
+    )
+    if not restriction:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Season restriction not found",
+        )
+
+    restriction.is_active = False
+    db.commit()
+    return {"message": "Season restriction deactivated successfully", "id": restriction_id, "is_active": False}
 
 
 @router.get(

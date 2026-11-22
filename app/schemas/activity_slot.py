@@ -1,5 +1,5 @@
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from pydantic import (
     BaseModel,
@@ -48,6 +48,40 @@ class ActivitySlotCreate(BaseModel):
         return self
 
 
+class ActivitySlotBatchCreate(BaseModel):
+    """Batch generate recurring slots across a date range."""
+
+    start_date: date
+    end_date: date
+    start_time: time
+    end_time: time
+    capacity: int = Field(
+        ge=1,
+        le=10000,
+        description="Maximum participants allowed per slot",
+    )
+    days_of_week: list[int] | None = Field(
+        default=None,
+        description="Optional day of week filters: 0=Monday, 6=Sunday",
+    )
+
+    @model_validator(mode="after")
+    def validate_batch(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be greater than or equal to start_date")
+        if (self.end_date - self.start_date).days > 90:
+            raise ValueError("Batch slot generation cannot exceed 90 days")
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time must be after start_time")
+        if self.days_of_week is not None:
+            for day in self.days_of_week:
+                if day < 0 or day > 6:
+                    raise ValueError(
+                        "days_of_week elements must be between 0 (Monday) and 6 (Sunday)"
+                    )
+        return self
+
+
 class ActivitySlotResponse(BaseModel):
     """Scheduled slot details."""
 
@@ -64,6 +98,14 @@ class ActivitySlotResponse(BaseModel):
     is_active: bool
 
     created_at: datetime
+
+
+class ActivitySlotBatchResponse(BaseModel):
+    """Response summary for batch slot generation."""
+
+    created_count: int
+    slots: list[ActivitySlotResponse]
+    message: str
 
 
 class ActivitySlotAvailability(BaseModel):

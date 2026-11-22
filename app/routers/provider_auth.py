@@ -26,8 +26,11 @@ from app.schemas.provider_auth import (
     ProviderLoginRequest,
     ProviderLoginResponse,
     ProviderMeResponse,
+    ProviderPasswordChangeRequest,
     ProviderPasswordSetupRequest,
     ProviderPasswordSetupResponse,
+    ProviderProfileUpdateRequest,
+    ProviderSecurityStatusResponse,
     ProviderUserResponse,
 )
 
@@ -272,5 +275,153 @@ def get_current_provider_profile(
         description=profile.description,
         business_registration_number=profile.business_registration_number,
         approval_status=profile.approval_status,
+        business_province=profile.business_province,
+        business_district=profile.business_district,
+        business_city=profile.business_city,
+        business_landmark=profile.business_landmark,
+        business_postal_code=profile.business_postal_code,
         created_at=profile.created_at,
+    )
+
+
+ALLOWED_PROFILE_UPDATE_FIELDS = {
+    "business_name",
+    "phone",
+    "secondary_phone",
+    "district",
+    "description",
+    "business_province",
+    "business_district",
+    "business_city",
+    "business_landmark",
+    "business_postal_code",
+}
+
+
+@router.put(
+    "/me",
+    response_model=ProviderMeResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update approved provider business profile",
+)
+@router.patch(
+    "/me",
+    response_model=ProviderMeResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Partially update approved provider business profile",
+)
+def update_current_provider_profile(
+    payload: ProviderProfileUpdateRequest,
+    profile: Annotated[ProviderProfile, Depends(require_approved_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Update editable operational fields of an approved provider profile.
+    Strictly forbids modifying provider_type, approval_status, user_id, or identity/KYC records.
+    """
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No fields provided for update",
+        )
+
+    for field, value in update_data.items():
+        if field in ALLOWED_PROFILE_UPDATE_FIELDS:
+            setattr(profile, field, value)
+
+    try:
+        db.commit()
+        db.refresh(profile)
+    except Exception:
+        db.rollback()
+        raise
+
+    user = profile.user
+    return ProviderMeResponse(
+        id=profile.id,
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+        is_active=user.is_active,
+        business_name=profile.business_name,
+        provider_type=profile.provider_type,
+        phone=profile.phone,
+        secondary_phone=profile.secondary_phone,
+        district=profile.district,
+        description=profile.description,
+        business_registration_number=profile.business_registration_number,
+        approval_status=profile.approval_status,
+        business_province=profile.business_province,
+        business_district=profile.business_district,
+        business_city=profile.business_city,
+        business_landmark=profile.business_landmark,
+        business_postal_code=profile.business_postal_code,
+        created_at=profile.created_at,
+    )
+
+
+# ==========================================
+# PROVIDER ACCOUNT SECURITY & PASSWORD CHANGE
+# ==========================================
+
+@router.post(
+    "/me/change-password",
+    summary="Change authenticated provider password",
+)
+def change_provider_password(
+    payload: ProviderPasswordChangeRequest,
+    profile: Annotated[ProviderProfile, Depends(require_approved_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Safely changes the authenticated provider's account password.
+    Requires verification of the current password before applying the new hash.
+    """
+    user = profile.user
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found",
+        )
+
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect current password",
+        )
+
+    user.password_hash = hash_password(payload.new_password)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {"message": "Password changed successfully"}
+
+
+@router.get(
+    "/me/security-status",
+    response_model=ProviderSecurityStatusResponse,
+    summary="Get provider account security status",
+)
+def get_provider_security_status(
+    profile: Annotated[ProviderProfile, Depends(require_approved_provider)],
+):
+    """
+    Returns account activation, password presence, and authorization tier.
+    """
+    user = profile.user
+    return ProviderSecurityStatusResponse(
+        user_id=user.id,
+        email=user.email,
+        is_active=user.is_active,
+        has_password=bool(user.password_hash),
+        role=user.role,
+        provider_type=profile.provider_type,
+        approval_status=profile.approval_status,
     )

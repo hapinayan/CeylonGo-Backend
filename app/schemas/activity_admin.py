@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -441,3 +441,107 @@ class AdminCampaignReviewRequest(BaseModel):
                 f"Cannot execute '{self.action}' on campaign with status '{current_status}'. "
                 f"Eligible status(es): {', '.join(eligible)}"
             )
+
+
+# ==============================================================================
+# Admin Activity Payment Monitoring & Financial Reconciliation Schemas (C05)
+# ==============================================================================
+
+
+class AdminActivityPaymentOverviewResponse(BaseModel):
+    """
+    Platform-wide administrative financial overview for activity bookings (C05).
+    Aggregates captured online payments, unverified pay-at-location cash,
+    earned/reversed commission, provider payable, settlements, and refund liabilities.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    captured_online_revenue: Decimal = Field(ge=0, decimal_places=2)
+    online_transaction_count: int = Field(ge=0)
+    pay_at_location_unverified_value: Decimal = Field(
+        ge=0,
+        decimal_places=2,
+        description="Booking value with pay_at_location method, representing unverified on-site cash collections rather than confirmed platform revenue.",
+    )
+    pay_at_location_booking_count: int = Field(ge=0)
+    platform_commission_earned: Decimal = Field(ge=0, decimal_places=2)
+    commission_reversed: Decimal = Field(ge=0, decimal_places=2)
+    net_platform_commission: Decimal = Field(ge=0, decimal_places=2)
+    provider_payable_amount: Decimal = Field(ge=0, decimal_places=2)
+    total_settled: Decimal = Field(ge=0, decimal_places=2)
+    pending_settlement_liability: Decimal = Field(ge=0, decimal_places=2)
+    completed_refunds_amount: Decimal = Field(ge=0, decimal_places=2)
+    completed_refunds_count: int = Field(ge=0)
+    pending_refund_obligations: Decimal = Field(ge=0, decimal_places=2)
+    pending_refunds_count: int = Field(ge=0)
+    failed_payment_count: int = Field(ge=0)
+    pending_payment_count: int = Field(ge=0)
+    refunded_transaction_count: int = Field(ge=0)
+    net_platform_revenue: Decimal = Field(ge=0, decimal_places=2)
+    outstanding_payout_exposure: Decimal = Field(ge=0, decimal_places=2)
+    currency: str = "LKR"
+    date_from: date | None = None
+    date_to: date | None = None
+    provider_profile_id: int | None = None
+    activity_id: int | None = None
+
+
+class AdminActivityPaymentTransactionItem(BaseModel):
+    """Detailed activity payment transaction record for admin audit and monitoring (C05)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    transaction_id: int
+    gateway_transaction_id: str | None = None
+    booking_id: int
+    booking_reference: str
+    activity_id: int
+    activity_title: str
+    provider_profile_id: int
+    provider_business_name: str
+    payment_method: str
+    payment_status: str
+    booking_status: str
+    amount: Decimal
+    gross_amount: Decimal | None = None
+    currency: str = "LKR"
+    commission_rate: Decimal | None = None
+    commission_amount: Decimal | None = None
+    provider_payable_amount: Decimal | None = None
+    refund_status: str | None = None
+    refund_amount: Decimal | None = None
+    paid_at: datetime | None = None
+    created_at: datetime
+
+
+class AdminActivityPaymentTransactionListResponse(BaseModel):
+    """Paginated list of activity payment transactions for administrative review (C05)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    items: list[AdminActivityPaymentTransactionItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminActivityPaymentReconciliationResponse(BaseModel):
+    """
+    Read-only activity payment reconciliation report detecting anomalies,
+    mismatches, unreviewed refunds, and pending gateway verifications (C05).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    healthy: bool
+    total_discrepancies: int
+    is_live_gateway_checked: bool = False
+    unmatched_paid_bookings: list[dict[str, Any]] = []
+    inconsistent_status_transactions: list[dict[str, Any]] = []
+    duplicate_gateway_references: list[dict[str, Any]] = []
+    amount_currency_mismatches: list[dict[str, Any]] = []
+    unreviewed_refund_requests: list[dict[str, Any]] = []
+    excessive_settlements: list[dict[str, Any]] = []
+    gateway_verification_pending: list[dict[str, Any]] = []
+    generated_at: datetime

@@ -19,6 +19,9 @@ from app.schemas.activity_admin import (
     ActivityRejectionRequest,
     ActivitySuspensionRequest,
     ActivityUnsuspensionRequest,
+    AdminActivityPaymentOverviewResponse,
+    AdminActivityPaymentReconciliationResponse,
+    AdminActivityPaymentTransactionListResponse,
     AdminActivityPlatformReportResponse,
     AdminCampaignReviewRequest,
 )
@@ -26,6 +29,11 @@ from app.schemas.activity_promotion import (
     ActivityCampaignAnalyticsSummary,
     ActivityCampaignPagination,
     ActivityCampaignResponse,
+)
+from app.services.activity_payments import (
+    generate_admin_activity_payment_reconciliation,
+    get_admin_activity_payments_overview,
+    list_admin_activity_payment_transactions,
 )
 from app.services.activity_promotions import (
     get_admin_activities_promotions_analytics,
@@ -219,6 +227,143 @@ def review_activity_promotions_campaign(
         payload=payload,
         admin_user_id=admin.id,
         ip_address=client_ip,
+    )
+
+
+# ==============================================================================
+# Admin Activity Payments & Reconciliation Endpoints (C05)
+# ==============================================================================
+
+
+@router.get(
+    "/payments/overview",
+    response_model=AdminActivityPaymentOverviewResponse,
+    summary="Get platform-wide activity payment monitoring overview (C05)",
+)
+def get_activity_payments_overview(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    date_from: date | None = Query(
+        default=None,
+        description="Filter payments on or after date (YYYY-MM-DD)",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Filter payments on or before date (YYYY-MM-DD)",
+    ),
+    provider_profile_id: int | None = Query(
+        default=None,
+        description="Filter by provider profile ID",
+    ),
+    activity_id: int | None = Query(
+        default=None,
+        description="Filter by activity ID",
+    ),
+    payment_status: str | None = Query(
+        default=None,
+        description="Filter by payment status",
+    ),
+):
+    """
+    Platform-wide activity payment monitoring overview (C05).
+    Exposes 14 authoritative financial metrics including captured revenue,
+    commissions, refund deductions, provider payable liability, settlements,
+    and segregated pay-at-location cash metrics.
+    """
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_from must not be later than date_to",
+        )
+    return get_admin_activity_payments_overview(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        provider_profile_id=provider_profile_id,
+        activity_id=activity_id,
+        payment_status=payment_status,
+    )
+
+
+@router.get(
+    "/payments/transactions",
+    response_model=AdminActivityPaymentTransactionListResponse,
+    summary="List activity payment transactions for administrative audit (C05)",
+)
+def list_activity_payment_transactions(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    date_from: date | None = Query(
+        default=None,
+        description="Filter transactions on or after date (YYYY-MM-DD)",
+    ),
+    date_to: date | None = Query(
+        default=None,
+        description="Filter transactions on or before date (YYYY-MM-DD)",
+    ),
+    payment_status: str | None = Query(
+        default=None,
+        description="Filter by payment status",
+    ),
+    provider_profile_id: int | None = Query(
+        default=None,
+        description="Filter by provider profile ID",
+    ),
+    activity_id: int | None = Query(
+        default=None,
+        description="Filter by activity ID",
+    ),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Page size"),
+):
+    """
+    List detailed activity payment transaction records with pagination,
+    filtering, and refund status tracking (C05).
+    """
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_from must not be later than date_to",
+        )
+    return list_admin_activity_payment_transactions(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        payment_status=payment_status,
+        provider_profile_id=provider_profile_id,
+        activity_id=activity_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/payments/reconciliation",
+    response_model=AdminActivityPaymentReconciliationResponse,
+    summary="Generate activity financial reconciliation report (C05)",
+)
+def get_activity_payment_reconciliation(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    provider_profile_id: int | None = Query(
+        default=None,
+        description="Filter by provider profile ID",
+    ),
+    activity_id: int | None = Query(
+        default=None,
+        description="Filter by activity ID",
+    ),
+):
+    """
+    Read-only activity payment reconciliation report (C05).
+    Detects financial discrepancies: unmatched paid bookings, inconsistent booking/payment statuses,
+    duplicate gateway transaction references, amount/currency mismatches, unreviewed refunds,
+    excessive settlements, and transactions pending external gateway verification.
+    """
+    return generate_admin_activity_payment_reconciliation(
+        db,
+        provider_profile_id=provider_profile_id,
+        activity_id=activity_id,
     )
 
 

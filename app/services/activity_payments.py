@@ -12,7 +12,7 @@ Encapsulates:
 - Safe audit logging ensuring zero credentials, tokens, or merchant secrets are exposed.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import logging
 from typing import Any
@@ -949,3 +949,604 @@ class MockActivityPayoutAdapter:
             "mode": self.mode,
             "is_live": False,
         }
+
+
+# ==========================================================
+# 5. ADMIN ACTIVITY PAYMENT MONITORING & RECONCILIATION (C05)
+# ==========================================================
+
+def get_admin_activity_payments_overview(
+    db: Session,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    provider_profile_id: int | None = None,
+    activity_id: int | None = None,
+    payment_status: str | None = None,
+) -> dict[str, Any]:
+    """
+    Platform-wide administrative financial overview for activity bookings (C05).
+    Server-authoritative Decimal-safe calculations covering online captures, unverified
+    pay-at-location cash, platform commission earned/reversed, provider liabilities,
+    settlements, and refund obligations.
+    """
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="date_from cannot be after date_to",
+        )
+
+    # 1. Online transactions query
+    tx_query = (
+        db.query(
+            PaymentTransaction,
+            ActivityBooking,
+            ActivitySlot,
+            Activity,
+            ProviderProfile,
+        )
+        .join(
+            BookingReference,
+            PaymentTransaction.booking_reference_id == BookingReference.id,
+        )
+        .join(
+            ActivityBooking,
+            BookingReference.target_booking_id == ActivityBooking.id,
+        )
+        .join(
+            ActivitySlot,
+            ActivityBooking.activity_slot_id == ActivitySlot.id,
+        )
+        .join(
+            Activity,
+            ActivitySlot.activity_id == Activity.id,
+        )
+        .join(
+            ProviderProfile,
+            Activity.provider_profile_id == ProviderProfile.id,
+        )
+        .filter(
+            BookingReference.module_type == "activity",
+            PaymentTransaction.payment_method == "online",
+            PaymentTransaction.currency == "LKR",
+            BookingReference.currency == "LKR",
+            ActivityBooking.currency == "LKR",
+        )
+    )
+
+    if provider_profile_id is not None:
+        tx_query = tx_query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        tx_query = tx_query.filter(Activity.id == activity_id)
+    if payment_status is not None:
+        cleaned_status = payment_status.strip().lower()
+        tx_query = tx_query.filter(PaymentTransaction.payment_status == cleaned_status)
+    if date_from is not None:
+        tx_query = tx_query.filter(ActivitySlot.starts_at >= datetime.combine(date_from, datetime.min.time()))
+    if date_to is not None:
+        tx_query = tx_query.filter(ActivitySlot.starts_at <= datetime.combine(date_to, datetime.max.time()))
+
+    tx_rows = tx_query.all()
+
+    captured_online_revenue = Decimal("0.00")
+    online_transaction_count = 0
+    platform_commission_earned = Decimal("0.00")
+    completed_provider_payable = Decimal("0.00")
+    pending_earnings = Decimal("0.00")
+    failed_payment_count = 0
+    pending_payment_count = 0
+    tx_ids: list[int] = []
+    tx_by_id: dict[int, Any] = {}
+
+    for tx, booking, slot, act, prov in tx_rows:
+        tx_ids.append(tx.id)
+        tx_by_id[tx.id] = (tx, booking, slot, act, prov)
+        gross = tx.gross_amount or tx.amount or Decimal("0.00")
+        rate = (
+            tx.commission_rate
+            if tx.commission_rate is not None
+            else PLATFORM_COMMISSION_RATE
+        )
+        comm = (
+            tx.commission_amount
+            if tx.commission_amount is not None
+            else (gross * (rate / Decimal("100"))).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        )
+        payable = (
+            tx.provider_payable_amount
+            if tx.provider_payable_amount is not None
+            else (gross - comm)
+        )
+
+        if tx.payment_status in CAPTURED:
+            captured_online_revenue += gross
+            online_transaction_count += 1
+            platform_commission_earned += comm
+
+            if booking.booking_status == "completed":
+                completed_provider_payable += payable
+            elif booking.booking_status in ("confirmed", "pending"):
+                pending_earnings += payable
+
+        elif tx.payment_status in ("failed", "cancelled"):
+            failed_payment_count += 1
+        elif tx.payment_status == "pending":
+            pending_payment_count += 1
+
+    # 2. Pay-at-location cash bookings (unverified on-site collection)
+    pal_query = (
+        db.query(ActivityBooking, ActivitySlot, Activity)
+        .join(ActivitySlot, ActivityBooking.activity_slot_id == ActivitySlot.id)
+        .join(Activity, ActivitySlot.activity_id == Activity.id)
+        .filter(
+            ActivityBooking.payment_method == "pay_at_location",
+            ActivityBooking.currency == "LKR",
+        )
+    )
+    if provider_profile_id is not None:
+        pal_query = pal_query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        pal_query = pal_query.filter(Activity.id == activity_id)
+    if payment_status is not None:
+        pal_query = pal_query.filter(ActivityBooking.payment_status == payment_status.strip().lower())
+    if date_from is not None:
+        pal_query = pal_query.filter(ActivitySlot.starts_at >= datetime.combine(date_from, datetime.min.time()))
+    if date_to is not None:
+        pal_query = pal_query.filter(ActivitySlot.starts_at <= datetime.combine(date_to, datetime.max.time()))
+
+    pal_rows = pal_query.all()
+    pay_at_location_unverified_value = sum(
+        (b.total_price for b, _, _ in pal_rows if b.total_price is not None),
+        Decimal("0.00"),
+    )
+    pay_at_location_booking_count = len(pal_rows)
+
+    # 3. Refunds query
+    completed_refunds_amount = Decimal("0.00")
+    completed_refunds_count = 0
+    commission_reversed = Decimal("0.00")
+    provider_refund_reduction = Decimal("0.00")
+    pending_refund_obligations = Decimal("0.00")
+    pending_refunds_count = 0
+    refunded_tx_ids: set[int] = set()
+
+    if tx_ids:
+        refunds = (
+            db.query(PaymentRefund)
+            .filter(
+                PaymentRefund.payment_transaction_id.in_(tx_ids),
+                PaymentRefund.currency == "LKR",
+            )
+            .all()
+        )
+        for r in refunds:
+            orig = tx_by_id.get(r.payment_transaction_id)
+            orig_tx = orig[0] if orig else None
+            orig_rate = (
+                orig_tx.commission_rate
+                if orig_tx and orig_tx.commission_rate is not None
+                else PLATFORM_COMMISSION_RATE
+            )
+            comm_rev = (r.amount * (orig_rate / Decimal("100"))).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            prov_red = r.amount - comm_rev
+
+            if r.refund_status in EXECUTED_REFUNDS:
+                completed_refunds_amount += r.amount
+                completed_refunds_count += 1
+                commission_reversed += comm_rev
+                provider_refund_reduction += prov_red
+                refunded_tx_ids.add(r.payment_transaction_id)
+            elif r.refund_status in ("pending", "approved", "in_review", "processing"):
+                pending_refund_obligations += r.amount
+                pending_refunds_count += 1
+
+    # 4. Settlements query for activity providers
+    prov_query = db.query(Activity.provider_profile_id).distinct()
+    if provider_profile_id is not None:
+        prov_query = prov_query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        prov_query = prov_query.filter(Activity.id == activity_id)
+    target_provider_ids = [p[0] for p in prov_query.all() if p[0] is not None]
+
+    total_settled = Decimal("0.00")
+    pending_settlement_liability = Decimal("0.00")
+
+    if target_provider_ids:
+        settlements = (
+            db.query(ProviderSettlement)
+            .filter(
+                ProviderSettlement.provider_profile_id.in_(target_provider_ids),
+                ProviderSettlement.currency == "LKR",
+            )
+            .all()
+        )
+        for s in settlements:
+            if s.settlement_status in ("completed", "paid"):
+                total_settled += s.net_payable
+            elif s.settlement_status in ("pending", "approved"):
+                pending_settlement_liability += s.net_payable
+
+    # 5. Derived financial totals
+    net_platform_commission = max(Decimal("0.00"), platform_commission_earned - commission_reversed)
+    provider_payable_amount = max(Decimal("0.00"), completed_provider_payable - provider_refund_reduction)
+    settlement_commitments = total_settled + pending_settlement_liability
+    available_balance = max(Decimal("0.00"), provider_payable_amount - settlement_commitments)
+    outstanding_payout_exposure = available_balance + pending_settlement_liability
+    net_platform_revenue = net_platform_commission
+    refunded_transaction_count = len(refunded_tx_ids)
+
+    return {
+        "captured_online_revenue": captured_online_revenue,
+        "online_transaction_count": online_transaction_count,
+        "pay_at_location_unverified_value": pay_at_location_unverified_value,
+        "pay_at_location_booking_count": pay_at_location_booking_count,
+        "platform_commission_earned": platform_commission_earned,
+        "commission_reversed": commission_reversed,
+        "net_platform_commission": net_platform_commission,
+        "provider_payable_amount": provider_payable_amount,
+        "total_settled": total_settled,
+        "pending_settlement_liability": pending_settlement_liability,
+        "completed_refunds_amount": completed_refunds_amount,
+        "completed_refunds_count": completed_refunds_count,
+        "pending_refund_obligations": pending_refund_obligations,
+        "pending_refunds_count": pending_refunds_count,
+        "failed_payment_count": failed_payment_count,
+        "pending_payment_count": pending_payment_count,
+        "refunded_transaction_count": refunded_transaction_count,
+        "net_platform_revenue": net_platform_revenue,
+        "outstanding_payout_exposure": outstanding_payout_exposure,
+        "currency": "LKR",
+        "date_from": date_from,
+        "date_to": date_to,
+        "provider_profile_id": provider_profile_id,
+        "activity_id": activity_id,
+    }
+
+
+def list_admin_activity_payment_transactions(
+    db: Session,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    payment_status: str | None = None,
+    provider_profile_id: int | None = None,
+    activity_id: int | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, Any]:
+    """
+    Paginated administrative listing of activity payment transactions (C05).
+    Exposes booking reference, gateway ID, provider info, fees, and refund state.
+    Never exposes merchant secrets, bank accounts, or credentials.
+    """
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="date_from cannot be after date_to",
+        )
+
+    query = (
+        db.query(
+            PaymentTransaction,
+            ActivityBooking,
+            ActivitySlot,
+            Activity,
+            ProviderProfile,
+            BookingReference,
+        )
+        .join(
+            BookingReference,
+            PaymentTransaction.booking_reference_id == BookingReference.id,
+        )
+        .join(
+            ActivityBooking,
+            BookingReference.target_booking_id == ActivityBooking.id,
+        )
+        .join(
+            ActivitySlot,
+            ActivityBooking.activity_slot_id == ActivitySlot.id,
+        )
+        .join(
+            Activity,
+            ActivitySlot.activity_id == Activity.id,
+        )
+        .join(
+            ProviderProfile,
+            Activity.provider_profile_id == ProviderProfile.id,
+        )
+        .filter(
+            BookingReference.module_type == "activity",
+            PaymentTransaction.currency == "LKR",
+            ActivityBooking.currency == "LKR",
+        )
+    )
+
+    if provider_profile_id is not None:
+        query = query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        query = query.filter(Activity.id == activity_id)
+    if payment_status is not None:
+        query = query.filter(PaymentTransaction.payment_status == payment_status.strip().lower())
+    if date_from is not None:
+        query = query.filter(ActivitySlot.starts_at >= datetime.combine(date_from, datetime.min.time()))
+    if date_to is not None:
+        query = query.filter(ActivitySlot.starts_at <= datetime.combine(date_to, datetime.max.time()))
+
+    total = query.count()
+    offset = (page - 1) * page_size
+    rows = (
+        query.order_by(PaymentTransaction.id.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+
+    items: list[dict[str, Any]] = []
+    if rows:
+        row_tx_ids = [tx.id for tx, _, _, _, _, _ in rows]
+        refunds = (
+            db.query(PaymentRefund)
+            .filter(
+                PaymentRefund.payment_transaction_id.in_(row_tx_ids),
+                PaymentRefund.currency == "LKR",
+            )
+            .order_by(PaymentRefund.id.desc())
+            .all()
+        )
+        refund_by_tx: dict[int, PaymentRefund] = {}
+        for r in refunds:
+            if r.payment_transaction_id not in refund_by_tx:
+                refund_by_tx[r.payment_transaction_id] = r
+
+        for tx, booking, slot, act, prov, booking_ref in rows:
+            ref = refund_by_tx.get(tx.id)
+            items.append({
+                "transaction_id": tx.id,
+                "gateway_transaction_id": tx.gateway_transaction_id,
+                "booking_id": booking.id,
+                "booking_reference": booking_ref.booking_reference,
+                "activity_id": act.id,
+                "activity_title": act.title,
+                "provider_profile_id": prov.id,
+                "provider_business_name": prov.business_name or f"Provider #{prov.id}",
+                "payment_method": tx.payment_method,
+                "payment_status": tx.payment_status,
+                "booking_status": booking.booking_status,
+                "amount": tx.amount,
+                "gross_amount": tx.gross_amount or tx.amount,
+                "currency": tx.currency or "LKR",
+                "commission_rate": tx.commission_rate,
+                "commission_amount": tx.commission_amount,
+                "provider_payable_amount": tx.provider_payable_amount,
+                "refund_status": ref.refund_status if ref else None,
+                "refund_amount": ref.amount if ref else None,
+                "paid_at": tx.paid_at,
+                "created_at": tx.created_at,
+            })
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+def generate_admin_activity_payment_reconciliation(
+    db: Session,
+    provider_profile_id: int | None = None,
+    activity_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Read-only activity payment reconciliation preview (C05).
+    Detects anomalies without mutating financial state or making live external calls:
+    1. Paid bookings without captured transactions
+    2. Captured transactions on cancelled/rejected bookings
+    3. Duplicate gateway payment references
+    4. Amount or currency mismatches
+    5. Unreviewed refund requests
+    6. Excessive settlements
+    7. Pending payments requiring gateway reconciliation
+    """
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    unmatched_paid_bookings: list[dict[str, Any]] = []
+    inconsistent_status_transactions: list[dict[str, Any]] = []
+    duplicate_gateway_references: list[dict[str, Any]] = []
+    amount_currency_mismatches: list[dict[str, Any]] = []
+    unreviewed_refund_requests: list[dict[str, Any]] = []
+    excessive_settlements: list[dict[str, Any]] = []
+    gateway_verification_pending: list[dict[str, Any]] = []
+
+    # 1. Paid bookings without captured transactions
+    paid_bookings_query = (
+        db.query(ActivityBooking, ActivitySlot, Activity)
+        .join(ActivitySlot, ActivityBooking.activity_slot_id == ActivitySlot.id)
+        .join(Activity, ActivitySlot.activity_id == Activity.id)
+        .filter(
+            ActivityBooking.payment_method == "online",
+            ActivityBooking.payment_status.in_(("paid", "completed")),
+        )
+    )
+    if provider_profile_id is not None:
+        paid_bookings_query = paid_bookings_query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        paid_bookings_query = paid_bookings_query.filter(Activity.id == activity_id)
+
+    for b, slot, act in paid_bookings_query.all():
+        captured_tx = (
+            db.query(PaymentTransaction)
+            .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+            .filter(
+                BookingReference.module_type == "activity",
+                BookingReference.target_booking_id == b.id,
+                PaymentTransaction.payment_status.in_(CAPTURED),
+            )
+            .first()
+        )
+        if not captured_tx:
+            unmatched_paid_bookings.append({
+                "booking_id": b.id,
+                "user_id": b.user_id,
+                "activity_id": act.id,
+                "activity_title": act.title,
+                "total_price": str(b.total_price),
+                "payment_status": b.payment_status,
+                "booking_status": b.booking_status,
+                "reason": "PAID_BOOKING_WITHOUT_CAPTURED_TRANSACTION",
+            })
+
+    # 2 & 4. Inconsistent status and amount/currency mismatches on activity transactions
+    tx_check_query = (
+        db.query(PaymentTransaction, ActivityBooking, BookingReference, Activity)
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .join(ActivityBooking, BookingReference.target_booking_id == ActivityBooking.id)
+        .join(ActivitySlot, ActivityBooking.activity_slot_id == ActivitySlot.id)
+        .join(Activity, ActivitySlot.activity_id == Activity.id)
+        .filter(BookingReference.module_type == "activity")
+    )
+    if provider_profile_id is not None:
+        tx_check_query = tx_check_query.filter(Activity.provider_profile_id == provider_profile_id)
+    if activity_id is not None:
+        tx_check_query = tx_check_query.filter(Activity.id == activity_id)
+
+    for tx, booking, ref, act in tx_check_query.all():
+        # Check inconsistent status
+        if tx.payment_status in CAPTURED:
+            if booking.booking_status in ("cancelled", "rejected") and booking.payment_status not in ("refund_pending", "refunded"):
+                inconsistent_status_transactions.append({
+                    "transaction_id": tx.id,
+                    "booking_id": booking.id,
+                    "booking_status": booking.booking_status,
+                    "payment_status": booking.payment_status,
+                    "reason": "CAPTURED_PAYMENT_ON_CANCELLED_OR_REJECTED_BOOKING",
+                })
+
+        # Check amount or currency mismatch
+        gross = tx.gross_amount or tx.amount or Decimal("0.00")
+        if gross != booking.total_price or (tx.currency or "LKR") != (booking.currency or "LKR"):
+            amount_currency_mismatches.append({
+                "transaction_id": tx.id,
+                "booking_id": booking.id,
+                "tx_amount": str(gross),
+                "booking_amount": str(booking.total_price),
+                "tx_currency": tx.currency or "LKR",
+                "booking_currency": booking.currency or "LKR",
+                "reason": "AMOUNT_OR_CURRENCY_MISMATCH",
+            })
+
+        # Check pending gateway verification
+        if tx.payment_status == "pending":
+            if tx.created_at and (now_utc - tx.created_at) > timedelta(minutes=30):
+                gateway_verification_pending.append({
+                    "transaction_id": tx.id,
+                    "booking_reference": ref.booking_reference,
+                    "gateway_name": tx.gateway_name or "payhere",
+                    "amount": str(tx.amount),
+                    "currency": tx.currency or "LKR",
+                    "status": "EXTERNAL_VERIFICATION_PENDING",
+                    "reconciliation_state": "EXTERNAL_VERIFICATION_PENDING",
+                    "created_at": tx.created_at.isoformat(),
+                    "reason": "PENDING_TRANSACTION_REQUIRING_GATEWAY_RECONCILIATION",
+                })
+
+    # 3. Duplicate gateway payment references
+    dup_refs = (
+        db.query(
+            PaymentTransaction.gateway_transaction_id,
+            func.count(PaymentTransaction.id).label("count_tx"),
+        )
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .filter(
+            BookingReference.module_type == "activity",
+            PaymentTransaction.gateway_transaction_id.is_not(None),
+        )
+        .group_by(PaymentTransaction.gateway_transaction_id)
+        .having(func.count(PaymentTransaction.id) > 1)
+        .all()
+    )
+    for gw_id, count in dup_refs:
+        dup_txs = (
+            db.query(PaymentTransaction.id, BookingReference.booking_reference)
+            .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+            .filter(PaymentTransaction.gateway_transaction_id == gw_id)
+            .all()
+        )
+        duplicate_gateway_references.append({
+            "gateway_transaction_id": gw_id,
+            "occurrences": count,
+            "transaction_ids": [t[0] for t in dup_txs],
+            "booking_references": [t[1] for t in dup_txs],
+            "reason": "DUPLICATE_GATEWAY_REFERENCE",
+        })
+
+    # 5. Unreviewed refund requests
+    unreviewed_refunds = (
+        db.query(PaymentRefund, PaymentTransaction, BookingReference)
+        .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
+        .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
+        .filter(
+            BookingReference.module_type == "activity",
+            PaymentRefund.refund_status.in_(("pending", "approved", "in_review", "processing")),
+            PaymentRefund.currency == "LKR",
+        )
+        .all()
+    )
+    for r, tx, ref in unreviewed_refunds:
+        unreviewed_refund_requests.append({
+            "refund_id": r.id,
+            "payment_transaction_id": tx.id,
+            "booking_reference": ref.booking_reference,
+            "amount": str(r.amount),
+            "currency": r.currency,
+            "refund_status": r.refund_status,
+            "refund_reason": r.refund_reason,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "reason": "REFUND_AWAITING_EXECUTION",
+        })
+
+    # 6. Excessive settlements
+    act_providers = db.query(Activity.provider_profile_id).distinct()
+    if provider_profile_id is not None:
+        act_providers = act_providers.filter(Activity.provider_profile_id == provider_profile_id)
+    target_prov_ids = [p[0] for p in act_providers.all() if p[0] is not None]
+
+    for p_id in target_prov_ids:
+        balances = calculate_activity_provider_earnings_balances(db, p_id)
+        if balances["outstanding_liability"] > Decimal("0.00"):
+            excessive_settlements.append({
+                "provider_profile_id": p_id,
+                "outstanding_liability": str(balances["outstanding_liability"]),
+                "total_settled": str(balances["total_settled"]),
+                "provider_net_earnings": str(balances["provider_net_earnings"]),
+                "reason": "SETTLEMENT_EXCEEDS_ELIGIBLE_EARNINGS",
+            })
+
+    total_discrepancies = sum(
+        len(lst)
+        for lst in [
+            unmatched_paid_bookings,
+            inconsistent_status_transactions,
+            duplicate_gateway_references,
+            amount_currency_mismatches,
+            unreviewed_refund_requests,
+            excessive_settlements,
+            gateway_verification_pending,
+        ]
+    )
+
+    return {
+        "healthy": total_discrepancies == 0,
+        "total_discrepancies": total_discrepancies,
+        "is_live_gateway_checked": False,
+        "unmatched_paid_bookings": unmatched_paid_bookings,
+        "inconsistent_status_transactions": inconsistent_status_transactions,
+        "duplicate_gateway_references": duplicate_gateway_references,
+        "amount_currency_mismatches": amount_currency_mismatches,
+        "unreviewed_refund_requests": unreviewed_refund_requests,
+        "excessive_settlements": excessive_settlements,
+        "gateway_verification_pending": gateway_verification_pending,
+        "generated_at": now_utc,
+    }

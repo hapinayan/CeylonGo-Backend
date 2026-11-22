@@ -26,7 +26,7 @@ def reserve_activity_capacity(
         update(ActivitySlot)
         .where(
             ActivitySlot.id == slot_id,
-            ActivitySlot.is_active.is_(True),
+            ActivitySlot.is_active == True,
             ActivitySlot.reserved_count
             <= ActivitySlot.capacity - participants,
         )

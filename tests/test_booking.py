@@ -12,8 +12,9 @@ from sqlalchemy.pool import StaticPool
 
 from app.database.connection import get_db
 from app.models.booking import Booking
-from app.models.homestay import Homestay
+from app.models.homestay import Homestay, HomestayAvailabilityBlock
 from app.models.user import User, Base
+from app.models.provider_profile import ProviderProfile
 from app.routers.auth import get_current_user
 
 
@@ -76,7 +77,9 @@ def booking_test_db():
         bind=engine,
         tables=[
             User.__table__,
+            ProviderProfile.__table__,
             Homestay.__table__,
+            HomestayAvailabilityBlock.__table__,
             Booking.__table__,
             HomestayPromotion.__table__,
         ],
@@ -333,7 +336,7 @@ def test_booking_saves_highest_promotion_discount(
 
         assert saved_booking is not None
         assert saved_booking.user_id == traveler.id
-        assert saved_booking.status == "confirmed"
+        assert saved_booking.status == "pending"
         assert saved_booking.total_price == Decimal("11250.00")
 
     finally:
@@ -402,7 +405,7 @@ def test_booking_without_promotion_saves_original_price(
 
         assert saved_booking is not None
         assert saved_booking.total_price == Decimal("15000.00")
-        assert saved_booking.status == "confirmed"
+        assert saved_booking.status == "pending"
 
     finally:
         app.dependency_overrides.pop(get_current_user, None)
@@ -503,7 +506,7 @@ def test_booking_ignores_ineligible_promotions(
 
         assert saved_booking is not None
         assert saved_booking.total_price == Decimal("15000.00")
-        assert saved_booking.status == "confirmed"
+        assert saved_booking.status == "pending"
 
     finally:
         app.dependency_overrides.pop(get_current_user, None)

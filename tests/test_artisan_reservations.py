@@ -14,7 +14,9 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.services.provider_reservations import LOCAL
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
@@ -147,6 +149,7 @@ def approved_artisan_user(db_session) -> tuple[User, ProviderProfile, ArtisanLis
         city="Pilimathalawa",
         approval_status="approved",
         is_active=True,
+        is_verified=True,
     )
     db_session.add(listing)
     db_session.commit()
@@ -463,7 +466,7 @@ def test_get_single_reservation_authorization(client: TestClient, approved_artis
 
 def test_full_reservation_lifecycle(client: TestClient, db_session, traveler_user, approved_artisan_user, reservable_product):
     artisan, _, _ = approved_artisan_user
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = datetime.now(LOCAL).date()
 
     # 1. Traveler creates reservation (pending)
     res_create = client.post(
@@ -616,7 +619,7 @@ def test_provider_cancel_active_reservation_releases_stock(client: TestClient, d
 
 def test_cannot_cancel_completed_reservation(client: TestClient, db_session, approved_artisan_user, traveler_user, reservable_product):
     artisan, _, _ = approved_artisan_user
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = datetime.now(LOCAL).date()
 
     # 1. Create & complete reservation
     res_create = client.post(
@@ -684,4 +687,3 @@ def test_stock_exhaustion_sequential_reservations(client: TestClient, db_session
     )
     assert res4.status_code == 400
     assert "insufficient stock" in res4.json()["detail"].lower()
-

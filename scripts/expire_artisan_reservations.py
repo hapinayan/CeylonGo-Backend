@@ -24,6 +24,7 @@ from app.database.connection import SessionLocal
 from app.services.artisan_reservation_expiry import (
     DEFAULT_ELIGIBLE_STATUSES,
     _to_naive_utc,
+    due_artisan_reservations,
     process_expired_reservations,
 )
 from app.models.artisan import ArtisanReservation
@@ -52,8 +53,7 @@ def main() -> int:
                 db.query(ArtisanReservation.id)
                 .filter(
                     ArtisanReservation.reservation_status.in_(DEFAULT_ELIGIBLE_STATUSES),
-                    ArtisanReservation.expires_at.is_not(None),
-                    ArtisanReservation.expires_at <= curr_now,
+                    due_artisan_reservations(curr_now),
                 )
                 .count()
             )
@@ -87,4 +87,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -196,6 +196,3 @@ class AdminArtisanReviewModerationResponse(BaseModel):
     is_published: bool
     message: str
     moderated_at: datetime
-
-
-

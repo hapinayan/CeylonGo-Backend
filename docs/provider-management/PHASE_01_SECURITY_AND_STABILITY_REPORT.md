@@ -1,0 +1,43 @@
+# Module 11 Phase 01 Security and Stability Report
+
+**Branch:** `feature/provider-management` from synchronized `develop` at `16ecbc3`.
+**Baseline:** [Existing Provider Backend Audit](EXISTING_PROVIDER_BACKEND_AUDIT.md), especially sections 4–5 and 9. See the [requirement tracker](PROVIDER_DEVELOPMENT_TRACKER.md) for baseline and Phase 01 classifications.
+
+## Findings and fixes
+
+| Audit finding | Severity | Root cause and affected operations | Phase 01 change |
+| --- | --- | --- | --- |
+| Listing visibility and booking eligibility diverged from map discovery | High | Homestay detail/availability/price and booking intake, Rental vehicle list/detail and booking intake, and Artisan public listing/showcase/promotions used flags without the complete approval check. Eco discovery, detail and availability did not consistently gate on provider activation. | Shared SQL predicates require approved and active/published records and an active approved provider, with the existing approved legacy Homestay ownership path preserved. Artisan retains its verification requirement. Rental checks the owner and any assigned pickup, while advanced pickup geography remains a map-specific eligibility filter. Map and booking reads reuse or align with these predicates. Activity slots with an Eco link require the Eco listing to be public. Booking intake requires the traveler role. SQL Server booking eligibility reads hold listing and provider state until the transaction finishes. |
+| Eco gallery read paths exposed unpublished media | High | The gallery list checked existence only. Both image URLs served file names without checking their registered listing. | The list and both file paths resolve the registered image/experience and require public visibility or an approved owning Eco provider/admin preview. Cross-provider previews return 404. Private badge evidence remains separate. File responses carry private, non-cacheable headers. |
+| Homestay dashboard ratings could fail | High | Provider and admin dashboard code read nonexistent `reviews.moderation_status`. | The provider dashboard is Homestay-only and aggregates the published review count and mean for owned, provider-scoped references. Empty sets return zero. Admin counts use the mapped publication flag, retain the response fields, and count unpublished reviews in the rejected/unpublished bucket. The current two-state schema cannot identify a separate pending bucket. |
+| Activity Boolean predicates emitted invalid SQL Server syntax | High | Slot creation overlap, public slot and booking filters, and reservation capacity updates used `IS 1` after MSSQL SQLAlchemy compilation. | Boolean equality works on SQL Server. Public eligibility independently checks ownership/approval and excludes inactive slots. Nullable Eco association remains valid for standalone Activity. The atomic capacity update remains in the booking transaction. |
+| OTP, registration grants and review used ineffective SQL Server locks or stale ORM state | High | `with_for_update()` compiled without a lock hint, and registration consumed a grant through a loaded object. Admin decisions and activation could use state read before a competing request. | Transaction-owned, bounded `sp_getapplock` serializes supported onboarding operations per normalized email. Registration also serializes a matching document, retains existing unique indexes, and maps integrity conflicts to HTTP 409. OTP challenge and grant consumption compare the stored state in the write. Admin decisions condition on pending state and persist the action and actor in `admin_audit_logs`. Password setup rechecks the live grant, profile approval and inactive/password-free state before activation. Passport reviews retain the two-document rule and NIC reviews require a back image. |
+| Existing Module 09 review interleavings | Regression target | Activity, Homestay, Eco-Tourism, Artisan, Guide and Rental already protect relevant location approval paths. | Existing atomic location-update protection and management routes were retained. Historical booking reads were left unchanged. |
+| Homestay price-preview savings could be null or incorrect | Regression blocker | The helper returned two `discount_amount` entries. Fixed-promotion configuration overwrote applied savings for `GET /api/v1/homestays/{homestay_id}/price-preview`. | `discount_amount` now carries actual applied savings. `discount_fixed_amount` carries the configured amount for a winning fixed promotion and is null otherwise. The route keeps its existing JSON keys and numeric serialization. Promotion selection, original/final prices, booking totals and the publication gate are preserved. |
+
+Direct provider and administrator operations retain their category, role and ownership checks. Approved provider listing interfaces and management routes still serve private records. Guide has no independent public detail/booking endpoint in this baseline. Rental has no independent public date-range availability endpoint, and its existing booking service still checks overlaps under the vehicle lock.
+
+## Verification
+
+- Four opt-in tests passed on `CeylonGoDB_IntegrationTest` in 18.34 seconds. The harness verifies `SELECT DB_NAME()`, sets a bounded SQL lock timeout, and uses a rollback-only outer transaction with savepoints for code paths that commit. The lock contention test uses two verified connections, expects 409 while a lock is held, and confirms retry after release. Test cases exercised actual Activity slot/booking SQL with active/inactive slots and a null Eco foreign key, ownership denial, a suspended provider, OTP reuse, duplicate identity submission, conflicting admin decisions, refusal before approval and successful one-time activation.
+- Before the pricing fix, the price-preview suite reproduced **2 failed, 2 passed**. After the fix, the bounded pricing, promotions and booking run reported **54 passed** in 8.31 seconds. It included both original failures, a fixed-promotion preview/booking comparison and a fixed discount larger than the original price. The inspected local Angular and Flutter sources had no direct price-preview field consumer. Client builds were outside this verification.
+- The 120-second-bounded Phase 01 local rerun reported **248 passed, 0 failed and 3 warnings** in 42.68 seconds. It used isolated SQLite and mocked external providers where applicable, and included the Interactive Map coordinate-review regressions. The SQL Server results above are prior Phase 01 evidence. The pricing follow-up ran without connecting to SQL Server.
+- No connection to primary `CeylonGoDB` and no schema, model, or migration changes.
+
+## Remaining risks and boundaries
+
+- Login/session revocation, direct password changes, a shared dashboard/portal, legal KYC expiry and retention policy, and broader financial/reporting workflows remain outside Phase 01. Admin/owner legacy review visibility semantics should be confirmed before introducing a third moderation state.
+- Existing throttling still relies on trusted proxy handling of forwarded addresses and process-local counters. Payment/refund/payout concurrency and wider financial audit coverage require their own targeted review.
+- New endpoints, new tables and migration 033 were unnecessary for the corrected findings. The trackable Module 11 scope and deferred categories are recorded separately.
+
+## Files
+
+- New core files: `app/core/publication.py`, `app/core/provider_onboarding.py`.
+- Changed routers under `app/routers/`: `activity_bookings.py`, `activity_slots.py`, `admin_homestays.py`, `admin_providers.py`, `artisan_listings.py`, `auth.py`, `booking.py`, `eco_experiences.py`, `homestay.py`, `homestay_campaigns.py`, `homestay_reviews.py`, `promotion.py`, `promotions.py`, `provider_auth.py`, `provider_otp.py`, `provider_registration.py`, `rental_bookings.py`, `rental_vehicles.py`, `showcase_items.py`.
+- Changed services under `app/services/`: `activity_capacity.py`, `map_catalog.py`.
+- New tests under `tests/`: `test_provider_phase01.py`, `test_provider_phase01_sqlserver.py`.
+- Updated tests under `tests/`: `test_artisan_listings.py`, `test_booking.py`, `test_eco_experience_images_p05.py`, `test_price_preview.py`, `test_promotions.py`, `test_showcase_items.py`.
+- Final regression fix: `app/core/promotion_pricing.py` and the preview response in `app/routers/homestay.py`. Added or strengthened assertions in `tests/test_price_preview.py`, `tests/test_provider_phase01.py` and `tests/test_homestay_phase8_discounts_campaigns.py`.
+- New documents under `docs/provider-management/`: this report and `PROVIDER_DEVELOPMENT_TRACKER.md`.
+
+**Closure:** Phase 01 regression blockers are resolved. Phase 02 has not started.

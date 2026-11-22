@@ -12,7 +12,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan_listing import ArtisanListing
@@ -239,6 +240,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
 
     # Create active listings
     listing1 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Kandyan Brass and Woodcraft",
         craft_category="Woodcarving & Masks",
@@ -251,6 +253,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
         is_featured=True,
     )
     listing2 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile2.id,
         title="Galle Fort Handmade Batiks",
         craft_category="Batik & Textiles",
@@ -264,6 +267,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
     )
     # Inactive listing (should not appear in public lists)
     listing3 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Closed Wood Shop",
         craft_category="Woodcarving & Masks",
@@ -318,6 +322,7 @@ def test_list_and_filter_artisan_listings(client: TestClient, db_session, approv
 def test_get_craft_categories(client: TestClient, db_session, approved_artisan_user):
     _, profile = approved_artisan_user
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Mask Workshop",
         craft_category="Woodcarving & Masks",
@@ -341,6 +346,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
     _, profile2 = second_artisan_user
 
     listing1 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile1.id,
         title="Kandy Craft",
         craft_category="Woodcarving & Masks",
@@ -349,6 +355,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
         is_active=True,
     )
     listing2 = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile2.id,
         title="Galle Craft",
         craft_category="Batik & Textiles",
@@ -369,6 +376,7 @@ def test_get_active_districts(client: TestClient, db_session, approved_artisan_u
 def test_get_artisan_listing_details_public(client: TestClient, db_session, approved_artisan_user):
     _, profile = approved_artisan_user
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Kandy Woodcarving Workshop",
         craft_category="Woodcarving & Masks",
@@ -756,6 +764,17 @@ def test_sample_artisan_listing_end_to_end_flow(client: TestClient, traveler_use
     assert created["is_verified"] is False
     assert created["is_featured"] is False
     assert created["approval_status"] == "pending"
+
+    # A newly created shop stays out of public discovery until verification.
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
+    verified = client.patch(
+        f"/api/v1/artisan-listings/{listing_id}/status",
+        json={"is_verified": True},
+        headers=auth_header(admin_user),
+    )
+    assert verified.status_code == 200
+
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
 
     # 3. Admin approves the artisan listing
     approve_res = client.post(

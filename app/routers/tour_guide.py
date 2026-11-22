@@ -1,10 +1,24 @@
-from datetime import date
-import math
+from datetime import date, timedelta
+import mimetypes
+import os
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session, joinedload
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
 
+from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.models.tour_guide import (
@@ -12,254 +26,339 @@ from app.models.tour_guide import (
     TourGuideAvailability,
     TourGuideBooking,
     TourGuideCredential,
+    TourGuideImage,
     TourGuideLanguage,
     TourGuidePackage,
     TourGuideServiceArea,
+    TourGuideVerification,
 )
-from app.models.user import User
-from app.routers.auth import get_current_user
 from app.schemas.tour_guide import (
+    CredentialType,
+    GuideCategoriesUpdate,
+    GuideCategoryInfo,
+    TourGuideAvailabilityBulkBlockRequest,
     TourGuideAvailabilityCreate,
     TourGuideAvailabilityResponse,
-    TourGuideBookingProviderItem,
-    TourGuideBookingProviderListResponse,
-    TourGuideCredentialCreate,
+    TourGuideAvailabilityUpdate,
+    TourGuideContactResponse,
+    TourGuideContactUpdate,
+    TourGuideCreate,
     TourGuideCredentialResponse,
+    TourGuideCredentialUpdate,
+    TourGuideImageResponse,
+    TourGuideImageUpdate,
     TourGuideLanguageCreate,
     TourGuideLanguageResponse,
+    TourGuideLanguageUpdate,
     TourGuidePackageCreate,
     TourGuidePackageResponse,
     TourGuidePackageUpdate,
-    TourGuideProfileCreate,
-    TourGuideProfileResponse,
-    TourGuideProfileUpdate,
+    TourGuideResponse,
     TourGuideServiceAreaCreate,
     TourGuideServiceAreaResponse,
+    TourGuideServiceAreaUpdate,
+    TourGuideUpdate,
+    TourGuideVerificationRecordResponse,
+    TourGuideVerificationStatusResponse,
+)
+from app.services.tour_guide_sync import (
+    ALLOWED_CREDENTIAL_EXTENSIONS,
+    ALLOWED_IMAGE_EXTENSIONS,
+    GUIDE_CATEGORIES,
+    categories_to_specialties_string,
+    delete_local_credential_file,
+    delete_local_tour_guide_image,
+    find_conflicting_active_booking,
+    find_overlapping_availability_slot,
+    get_tour_guide_credentials_dir,
+    get_tour_guide_images_dir,
+    resolve_safe_storage_path,
+    save_tour_guide_credential_file,
+    save_tour_guide_image_file,
+    sync_tour_guide_listing_reference,
 )
 
+MAX_GALLERY_IMAGES_PER_GUIDE = 20
+
 router = APIRouter(
-    prefix="/api/v1/tour-guides",
+    prefix="/api/v1/provider/tour-guides",
+    tags=["Tour Guide Provider"],
+)
+
+public_router = APIRouter(
     tags=["Tour Guides"],
 )
 
 
-# ==========================================
-# AUTH / PROVIDER HELPERS
-# ==========================================
+def require_tour_guide_provider(
+    provider_profile: Annotated[
+        ProviderProfile,
+        Depends(require_approved_provider),
+    ],
+) -> ProviderProfile:
+    """
+    Allow only approved Tour Guide providers.
+    """
 
-def get_tour_guide_provider_and_profile(
-    db: Session,
-    current_user: User,
-) -> tuple[ProviderProfile, TourGuide]:
-    provider = (
-        db.query(ProviderProfile)
-        .filter(
-            ProviderProfile.user_id == current_user.id,
-            ProviderProfile.provider_type == "tour_guide",
-            ProviderProfile.approval_status == "approved",
-        )
-        .first()
-    )
-    if not provider:
+    if provider_profile.provider_type != "tour_guide":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Approved tour_guide provider profile required",
+            detail="Only approved Tour Guide providers can access this endpoint",
         )
 
-    guide = (
-        db.query(TourGuide)
-        .options(
-            joinedload(TourGuide.languages),
-            joinedload(TourGuide.service_areas),
-            joinedload(TourGuide.packages),
-        )
-        .filter(TourGuide.provider_profile_id == provider.id)
-        .first()
+    return provider_profile
+
+
+GuideProvider = Annotated[ProviderProfile, Depends(require_tour_guide_provider)]
+DatabaseSession = Annotated[Session, Depends(get_db)]
+
+
+def find_owned_guide(db: Session, provider_id: int) -> TourGuide | None:
+    return db.query(TourGuide).filter(TourGuide.provider_profile_id == provider_id).first()
+
+
+def require_owned_guide(provider: GuideProvider, db: DatabaseSession) -> TourGuide:
+    guide = find_owned_guide(db, provider.id)
+    if guide is None:
+        raise HTTPException(status_code=404, detail="Tour guide profile not found")
+    return guide
+
+
+OwnedGuide = Annotated[TourGuide, Depends(require_owned_guide)]
+
+
+def commit_changes(db: Session) -> None:
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def _serialize_credential(cred: TourGuideCredential) -> TourGuideCredentialResponse:
+    return TourGuideCredentialResponse(
+        id=cred.id,
+        tour_guide_id=cred.tour_guide_id,
+        credential_type=cred.credential_type,
+        title=cred.title,
+        issuing_authority=cred.issuing_authority,
+        certificate_number=cred.certificate_number,
+        issue_date=cred.issue_date,
+        expiry_date=cred.expiry_date,
+        is_confidential=cred.is_confidential,
+        verification_status=cred.verification_status,
+        has_document=bool(cred.file_reference),
+        created_at=cred.created_at,
+        updated_at=cred.updated_at,
     )
-    if not guide:
+
+
+def _stream_private_credential_file(cred: TourGuideCredential) -> FileResponse:
+    if not cred.file_reference:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide profile has not been created yet",
+            detail="Credential document not found",
         )
+    filename = os.path.basename(cred.file_reference)
+    file_path = resolve_safe_storage_path(get_tour_guide_credentials_dir(), filename)
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Credential document file not found on storage server",
+        )
+    ext = file_path.suffix.lower()
+    media_type = (
+        ALLOWED_CREDENTIAL_EXTENSIONS.get(ext)
+        or mimetypes.guess_type(str(file_path))[0]
+        or "application/octet-stream"
+    )
+    return FileResponse(
+        path=str(file_path),
+        media_type=media_type,
+        filename=f"credential_{cred.tour_guide_id}_{cred.id}{ext}",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
-    return provider, guide
+
+# =============================================================================
+# PUBLIC GALLERY IMAGE SERVING
+# =============================================================================
+
+@public_router.get(
+    "/api/v1/uploads/tour-guides/{filename}",
+    response_class=FileResponse,
+    summary="Serve a public tour guide gallery image",
+)
+def serve_tour_guide_image(filename: str):
+    file_path = resolve_safe_storage_path(get_tour_guide_images_dir(), filename)
+    ext = file_path.suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Image not found",
+        )
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Image not found",
+        )
+    return FileResponse(
+        path=str(file_path),
+        media_type=ALLOWED_IMAGE_EXTENSIONS[ext],
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
-# ==========================================
-# GUIDE PROFILE MANAGEMENT
-# ==========================================
+# =============================================================================
+# 1. CORE PROVIDER PROFILE CRUD (PRESERVED)
+# =============================================================================
 
 @router.post(
     "",
-    response_model=TourGuideProfileResponse,
+    response_model=TourGuideResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create tour guide profile",
+    summary="Create a draft tour guide profile",
 )
-def create_tour_guide_profile(
-    payload: TourGuideProfileCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    provider = (
-        db.query(ProviderProfile)
-        .filter(
-            ProviderProfile.user_id == current_user.id,
-            ProviderProfile.provider_type == "tour_guide",
-            ProviderProfile.approval_status == "approved",
-        )
-        .first()
-    )
-    if not provider:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Approved tour_guide provider profile required",
-        )
-
-    existing = (
-        db.query(TourGuide)
-        .filter(TourGuide.provider_profile_id == provider.id)
-        .first()
-    )
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Tour guide profile already exists for this provider",
-        )
+def create_tour_guide(payload: TourGuideCreate, provider: GuideProvider, db: DatabaseSession):
+    if find_owned_guide(db, provider.id) is not None:
+        raise HTTPException(status_code=409, detail="Tour guide profile already exists")
 
     guide = TourGuide(
+        **payload.model_dump(),
         provider_profile_id=provider.id,
-        bio=payload.bio,
-        years_of_experience=payload.years_of_experience,
-        specialties=payload.specialties,
-        license_number=payload.license_number,
-        license_type=payload.license_type,
-        license_expiry_date=payload.license_expiry_date,
-        hourly_rate=payload.hourly_rate,
-        daily_rate=payload.daily_rate,
-        currency=payload.currency,
-        base_city=payload.base_city,
-        base_district=payload.base_district,
-        base_latitude=payload.base_latitude,
-        base_longitude=payload.base_longitude,
-        max_group_size=payload.max_group_size,
-        cancellation_policy=payload.cancellation_policy,
-        free_cancellation_hours=payload.free_cancellation_hours,
-        is_available=payload.is_available,
-        is_active=False,
         approval_status="draft",
-        verification_status="unverified",
+        is_active=False,
     )
-
+    db.add(guide)
     try:
-        db.add(guide)
-        db.commit()
-        db.refresh(guide)
-    except Exception:
-        db.rollback()
+        commit_changes(db)
+    except IntegrityError as exc:
+        if find_owned_guide(db, provider.id) is not None:
+            raise HTTPException(status_code=409, detail="Tour guide profile already exists") from exc
         raise
-
     return guide
 
 
-@router.get(
-    "/me",
-    response_model=TourGuideProfileResponse,
-    summary="Get own tour guide profile",
-)
-def get_my_tour_guide_profile(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+@router.get("", response_model=TourGuideResponse, summary="Get your tour guide profile")
+def get_tour_guide(guide: OwnedGuide):
     return guide
 
+
+@router.patch("", response_model=TourGuideResponse, summary="Update your tour guide profile")
+def update_tour_guide(payload: TourGuideUpdate, guide: OwnedGuide, db: DatabaseSession):
+    changes = payload.model_dump(exclude_unset=True)
+    latitude = changes.get("base_latitude", guide.base_latitude)
+    longitude = changes.get("base_longitude", guide.base_longitude)
+    if (latitude is None) != (longitude is None):
+        raise HTTPException(status_code=422, detail="Latitude and longitude must be provided together")
+
+    location_fields = ("base_latitude", "base_longitude", "base_city", "base_district")
+    if any(key in changes and changes[key] != getattr(guide, key) for key in location_fields):
+        if guide.approval_status == "pending":
+            raise HTTPException(409, detail="Location is currently under review")
+        if guide.approval_status == "approved":
+            changes.update(
+                approval_status="draft", is_active=False, reviewed_by=None, reviewed_at=None,
+            )
+        try:
+            updated = (
+                db.query(TourGuide)
+                .filter(
+                    TourGuide.id == guide.id,
+                    TourGuide.base_latitude == guide.base_latitude,
+                    TourGuide.base_longitude == guide.base_longitude,
+                    TourGuide.base_city == guide.base_city,
+                    TourGuide.base_district == guide.base_district,
+                    TourGuide.approval_status == guide.approval_status,
+                )
+                .update(changes, synchronize_session=False)
+            )
+        except SQLAlchemyError:
+            db.rollback()
+            raise
+        if updated == 0:
+            db.rollback()
+            raise HTTPException(
+                status_code=409, detail="Tour guide coordinates changed. Retry the update.",
+            )
+        db.expire(guide)
+        sync_tour_guide_listing_reference(db, guide)
+        commit_changes(db)
+        db.expire(guide)
+        return guide
+
+    for field, value in changes.items():
+        setattr(guide, field, value)
+    sync_tour_guide_listing_reference(db, guide)
+    commit_changes(db)
+    return guide
+
+
+@router.post("/submit", response_model=TourGuideResponse)
+def submit_guide_for_location_review(guide: OwnedGuide, db: DatabaseSession):
+    if guide.base_latitude is None or guide.base_longitude is None:
+        raise HTTPException(422, detail="Provide a public base location before submission")
+    if guide.approval_status not in ("draft", "rejected"):
+        raise HTTPException(409, detail="Only draft or rejected profiles can be submitted")
+    updated = db.query(TourGuide).filter(
+        TourGuide.id == guide.id, TourGuide.approval_status == guide.approval_status,
+        TourGuide.base_latitude == guide.base_latitude,
+        TourGuide.base_longitude == guide.base_longitude,
+        TourGuide.base_city == guide.base_city, TourGuide.base_district == guide.base_district,
+    ).update(
+        {"approval_status": "pending", "is_active": False, "rejection_reason": None},
+        synchronize_session=False,
+    )
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(409, detail="Tour guide location or review status changed")
+    db.expire(guide)
+    sync_tour_guide_listing_reference(db, guide)
+    commit_changes(db)
+    db.expire(guide)
+    return guide
+
+
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT, summary="Deactivate your tour guide profile")
+def deactivate_tour_guide(guide: OwnedGuide, db: DatabaseSession):
+    guide.is_active = False
+    sync_tour_guide_listing_reference(db, guide)
+    commit_changes(db)
+
+
+# =============================================================================
+# 2. GUIDE CATEGORIES MANAGEMENT (PR-07)
+# =============================================================================
 
 @router.put(
-    "/me",
-    response_model=TourGuideProfileResponse,
-    summary="Update own tour guide profile",
+    "/categories",
+    response_model=TourGuideResponse,
+    summary="Set validated tour guide specialty categories",
 )
-def update_my_tour_guide_profile(
-    payload: TourGuideProfileUpdate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def set_tour_guide_categories(
+    payload: GuideCategoriesUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    update_dict = payload.model_dump(exclude_unset=True)
-    for field, val in update_dict.items():
-        setattr(guide, field, val)
-
-    try:
-        db.commit()
-        db.refresh(guide)
-    except Exception:
-        db.rollback()
-        raise
-
+    guide.specialties = categories_to_specialties_string(list(payload.categories))
+    commit_changes(db)
+    db.refresh(guide)
     return guide
 
 
-# ==========================================
-# LANGUAGES
-# ==========================================
-
-@router.post(
-    "/me/languages",
-    response_model=TourGuideLanguageResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Add spoken language",
-)
-def add_tour_guide_language(
-    payload: TourGuideLanguageCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    existing = (
-        db.query(TourGuideLanguage)
-        .filter(
-            TourGuideLanguage.tour_guide_id == guide.id,
-            TourGuideLanguage.language_code == payload.language_code.strip().lower(),
-        )
-        .first()
-    )
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Language code '{payload.language_code}' already registered for this guide",
-        )
-
-    lang = TourGuideLanguage(
-        tour_guide_id=guide.id,
-        language_code=payload.language_code.strip().lower(),
-        language_name=payload.language_name.strip(),
-        proficiency_level=payload.proficiency_level,
-        is_primary=payload.is_primary,
-    )
-
-    try:
-        db.add(lang)
-        db.commit()
-        db.refresh(lang)
-    except Exception:
-        db.rollback()
-        raise
-
-    return lang
-
+# =============================================================================
+# 3. LANGUAGES MANAGEMENT (PR-05)
+# =============================================================================
 
 @router.get(
-    "/me/languages",
+    "/languages",
     response_model=list[TourGuideLanguageResponse],
-    summary="List languages spoken by guide",
+    summary="List languages supported by your tour guide profile",
 )
-def list_tour_guide_languages(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+def list_guide_languages(guide: OwnedGuide, db: DatabaseSession):
     return (
         db.query(TourGuideLanguage)
         .filter(TourGuideLanguage.tour_guide_id == guide.id)
@@ -268,18 +367,65 @@ def list_tour_guide_languages(
     )
 
 
-@router.delete(
-    "/me/languages/{language_id}",
-    summary="Delete language from guide profile",
+@router.post(
+    "/languages",
+    response_model=TourGuideLanguageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a language to your tour guide profile",
 )
-def delete_tour_guide_language(
-    language_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def add_guide_language(
+    payload: TourGuideLanguageCreate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+    existing = (
+        db.query(TourGuideLanguage)
+        .filter(
+            TourGuideLanguage.tour_guide_id == guide.id,
+            TourGuideLanguage.language_code == payload.language_code,
+        )
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Language '{payload.language_code}' is already added to your profile",
+        )
 
-    lang = (
+    if payload.is_primary:
+        db.query(TourGuideLanguage).filter(
+            TourGuideLanguage.tour_guide_id == guide.id,
+            TourGuideLanguage.is_primary == True,
+        ).update({"is_primary": False}, synchronize_session=False)
+
+    language = TourGuideLanguage(
+        tour_guide_id=guide.id,
+        **payload.model_dump(),
+    )
+    db.add(language)
+    try:
+        commit_changes(db)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Language '{payload.language_code}' is already added to your profile",
+        ) from exc
+    db.refresh(language)
+    return language
+
+
+@router.patch(
+    "/languages/{language_id}",
+    response_model=TourGuideLanguageResponse,
+    summary="Update a language on your tour guide profile",
+)
+def update_guide_language(
+    language_id: Annotated[int, Path(gt=0)],
+    payload: TourGuideLanguageUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    language = (
         db.query(TourGuideLanguage)
         .filter(
             TourGuideLanguage.id == language_id,
@@ -287,97 +433,130 @@ def delete_tour_guide_language(
         )
         .first()
     )
-    if not lang:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Language not found on guide profile",
-        )
+    if language is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Language not found")
 
-    db.delete(lang)
-    db.commit()
-    return {"message": "Language deleted successfully", "id": language_id}
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("is_primary") is True:
+        db.query(TourGuideLanguage).filter(
+            TourGuideLanguage.tour_guide_id == guide.id,
+            TourGuideLanguage.id != language.id,
+            TourGuideLanguage.is_primary == True,
+        ).update({"is_primary": False}, synchronize_session=False)
+
+    for field, value in changes.items():
+        setattr(language, field, value)
+    commit_changes(db)
+    db.refresh(language)
+    return language
 
 
-# ==========================================
-# SERVICE AREAS
-# ==========================================
-
-@router.post(
-    "/me/service-areas",
-    response_model=TourGuideServiceAreaResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Add guide service area",
+@router.delete(
+    "/languages/{language_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a language from your tour guide profile",
 )
-def add_tour_guide_service_area(
-    payload: TourGuideServiceAreaCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def delete_guide_language(
+    language_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    existing = (
-        db.query(TourGuideServiceArea)
+    language = (
+        db.query(TourGuideLanguage)
         .filter(
-            TourGuideServiceArea.tour_guide_id == guide.id,
-            TourGuideServiceArea.district == payload.district.strip(),
-            TourGuideServiceArea.city == payload.city.strip(),
+            TourGuideLanguage.id == language_id,
+            TourGuideLanguage.tour_guide_id == guide.id,
         )
         .first()
     )
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Service area already registered for this guide",
-        )
+    if language is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Language not found")
 
-    area = TourGuideServiceArea(
-        tour_guide_id=guide.id,
-        province=payload.province.strip(),
-        district=payload.district.strip(),
-        city=payload.city.strip(),
-        is_primary=payload.is_primary,
-    )
+    db.delete(language)
+    commit_changes(db)
 
-    try:
-        db.add(area)
-        db.commit()
-        db.refresh(area)
-    except Exception:
-        db.rollback()
-        raise
 
-    return area
-
+# =============================================================================
+# 4. SERVICE AREAS MANAGEMENT (PR-06)
+# =============================================================================
 
 @router.get(
-    "/me/service-areas",
+    "/service-areas",
     response_model=list[TourGuideServiceAreaResponse],
-    summary="List guide service areas",
+    summary="List districts and destinations covered by your tour guide profile",
 )
-def list_tour_guide_service_areas(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+def list_guide_service_areas(guide: OwnedGuide, db: DatabaseSession):
     return (
         db.query(TourGuideServiceArea)
         .filter(TourGuideServiceArea.tour_guide_id == guide.id)
-        .order_by(TourGuideServiceArea.is_primary.desc(), TourGuideServiceArea.district.asc())
+        .order_by(
+            TourGuideServiceArea.is_primary.desc(),
+            TourGuideServiceArea.district.asc(),
+            TourGuideServiceArea.city.asc(),
+        )
         .all()
     )
 
 
-@router.delete(
-    "/me/service-areas/{area_id}",
-    summary="Delete service area from guide profile",
+@router.post(
+    "/service-areas",
+    response_model=TourGuideServiceAreaResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a covered district/destination service area",
 )
-def delete_tour_guide_service_area(
-    area_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def add_guide_service_area(
+    payload: TourGuideServiceAreaCreate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+    existing = (
+        db.query(TourGuideServiceArea)
+        .filter(
+            TourGuideServiceArea.tour_guide_id == guide.id,
+            TourGuideServiceArea.district == payload.district,
+            TourGuideServiceArea.city == payload.city,
+        )
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This service area (district and city) already exists on your profile",
+        )
 
+    if payload.is_primary:
+        db.query(TourGuideServiceArea).filter(
+            TourGuideServiceArea.tour_guide_id == guide.id,
+            TourGuideServiceArea.is_primary == True,
+        ).update({"is_primary": False}, synchronize_session=False)
+
+    area = TourGuideServiceArea(
+        tour_guide_id=guide.id,
+        **payload.model_dump(),
+    )
+    db.add(area)
+    try:
+        commit_changes(db)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This service area (district and city) already exists on your profile",
+        ) from exc
+    db.refresh(area)
+    return area
+
+
+@router.patch(
+    "/service-areas/{area_id}",
+    response_model=TourGuideServiceAreaResponse,
+    summary="Update a service area on your tour guide profile",
+)
+def update_guide_service_area(
+    area_id: Annotated[int, Path(gt=0)],
+    payload: TourGuideServiceAreaUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
     area = (
         db.query(TourGuideServiceArea)
         .filter(
@@ -386,222 +565,329 @@ def delete_tour_guide_service_area(
         )
         .first()
     )
-    if not area:
+    if area is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service area not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    new_district = changes.get("district", area.district)
+    new_city = changes.get("city", area.city)
+    duplicate = (
+        db.query(TourGuideServiceArea)
+        .filter(
+            TourGuideServiceArea.tour_guide_id == guide.id,
+            TourGuideServiceArea.id != area.id,
+            TourGuideServiceArea.district == new_district,
+            TourGuideServiceArea.city == new_city,
+        )
+        .first()
+    )
+    if duplicate is not None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Service area not found on guide profile",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another service area with the same district and city already exists",
         )
 
-    db.delete(area)
-    db.commit()
-    return {"message": "Service area deleted successfully", "id": area_id}
+    if changes.get("is_primary") is True:
+        db.query(TourGuideServiceArea).filter(
+            TourGuideServiceArea.tour_guide_id == guide.id,
+            TourGuideServiceArea.id != area.id,
+            TourGuideServiceArea.is_primary == True,
+        ).update({"is_primary": False}, synchronize_session=False)
+
+    for field, value in changes.items():
+        setattr(area, field, value)
+    commit_changes(db)
+    db.refresh(area)
+    return area
 
 
-# ==========================================
-# TOUR PACKAGES
-# ==========================================
-
-@router.post(
-    "/me/packages",
-    response_model=TourGuidePackageResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create tour package",
+@router.delete(
+    "/service-areas/{area_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a service area from your tour guide profile",
 )
-def create_tour_guide_package(
-    payload: TourGuidePackageCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def delete_guide_service_area(
+    area_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    pkg = TourGuidePackage(
-        tour_guide_id=guide.id,
-        title=payload.title.strip(),
-        description=payload.description.strip(),
-        itinerary=payload.itinerary,
-        duration_hours=payload.duration_hours,
-        pricing_type=payload.pricing_type,
-        price=payload.price,
-        currency=payload.currency,
-        max_people=payload.max_people,
-        included_services=payload.included_services,
-        excluded_services=payload.excluded_services,
-        meeting_point=payload.meeting_point.strip(),
-        meeting_latitude=payload.meeting_latitude,
-        meeting_longitude=payload.meeting_longitude,
-        is_active=payload.is_active,
+    area = (
+        db.query(TourGuideServiceArea)
+        .filter(
+            TourGuideServiceArea.id == area_id,
+            TourGuideServiceArea.tour_guide_id == guide.id,
+        )
+        .first()
     )
+    if area is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service area not found")
 
-    try:
-        db.add(pkg)
-        db.commit()
-        db.refresh(pkg)
-    except Exception:
-        db.rollback()
-        raise
+    db.delete(area)
+    commit_changes(db)
 
-    return pkg
 
+# =============================================================================
+# 5. PROFILE IMAGE GALLERY MANAGEMENT (PR-03)
+# =============================================================================
 
 @router.get(
-    "/me/packages",
-    response_model=list[TourGuidePackageResponse],
-    summary="List tour packages for current guide",
+    "/images",
+    response_model=list[TourGuideImageResponse],
+    summary="List your tour guide profile and gallery photos",
 )
-def list_my_tour_guide_packages(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+def list_guide_images(guide: OwnedGuide, db: DatabaseSession):
     return (
-        db.query(TourGuidePackage)
-        .filter(TourGuidePackage.tour_guide_id == guide.id)
-        .order_by(TourGuidePackage.created_at.desc())
+        db.query(TourGuideImage)
+        .filter(TourGuideImage.tour_guide_id == guide.id)
+        .order_by(
+            TourGuideImage.is_profile.desc(),
+            TourGuideImage.display_order.asc(),
+            TourGuideImage.id.asc(),
+        )
         .all()
     )
+
+
+@router.post(
+    "/images",
+    response_model=TourGuideImageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a profile or gallery photo for your tour guide profile",
+)
+async def upload_guide_image(
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    file: UploadFile = File(...),
+    caption: Annotated[str | None, Form(max_length=255)] = None,
+    display_order: Annotated[int, Form(ge=0, le=2147483647)] = 0,
+    is_profile: Annotated[bool, Form()] = False,
+):
+    current_count = (
+        db.query(TourGuideImage)
+        .filter(TourGuideImage.tour_guide_id == guide.id)
+        .count()
+    )
+    if current_count >= MAX_GALLERY_IMAGES_PER_GUIDE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum of {MAX_GALLERY_IMAGES_PER_GUIDE} gallery images allowed per guide",
+        )
+
+    image_url = await save_tour_guide_image_file(guide.id, file)
+
+    try:
+        if is_profile:
+            db.query(TourGuideImage).filter(
+                TourGuideImage.tour_guide_id == guide.id,
+                TourGuideImage.is_profile == True,
+            ).update({"is_profile": False}, synchronize_session=False)
+            db.flush()
+
+        image = TourGuideImage(
+            tour_guide_id=guide.id,
+            image_url=image_url,
+            caption=caption.strip() if caption else None,
+            display_order=display_order,
+            is_profile=is_profile,
+        )
+        db.add(image)
+        commit_changes(db)
+        db.refresh(image)
+        return image
+    except Exception:
+        delete_local_tour_guide_image(image_url)
+        raise
+
+
+@router.patch(
+    "/images/{image_id}",
+    response_model=TourGuideImageResponse,
+    summary="Update photo caption, order, or primary profile image status",
+)
+def update_guide_image(
+    image_id: Annotated[int, Path(gt=0)],
+    payload: TourGuideImageUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    image = (
+        db.query(TourGuideImage)
+        .filter(
+            TourGuideImage.id == image_id,
+            TourGuideImage.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if image is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("is_profile") is True and not image.is_profile:
+        db.query(TourGuideImage).filter(
+            TourGuideImage.tour_guide_id == guide.id,
+            TourGuideImage.id != image.id,
+            TourGuideImage.is_profile == True,
+        ).update({"is_profile": False}, synchronize_session=False)
+        db.flush()
+
+    for field, value in changes.items():
+        setattr(image, field, value)
+    commit_changes(db)
+    db.refresh(image)
+    return image
 
 
 @router.put(
-    "/me/packages/{package_id}",
-    response_model=TourGuidePackageResponse,
-    summary="Update tour package",
+    "/images/{image_id}/file",
+    response_model=TourGuideImageResponse,
+    summary="Replace an existing gallery photo file",
 )
-def update_tour_guide_package(
-    package_id: int,
-    payload: TourGuidePackageUpdate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+async def replace_guide_image_file(
+    image_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    file: UploadFile = File(...),
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    pkg = (
-        db.query(TourGuidePackage)
+    image = (
+        db.query(TourGuideImage)
         .filter(
-            TourGuidePackage.id == package_id,
-            TourGuidePackage.tour_guide_id == guide.id,
+            TourGuideImage.id == image_id,
+            TourGuideImage.tour_guide_id == guide.id,
         )
         .first()
     )
-    if not pkg:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour package not found or not owned by you",
-        )
+    if image is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
-    update_dict = payload.model_dump(exclude_unset=True)
-    for field, val in update_dict.items():
-        setattr(pkg, field, val)
-
+    old_url = image.image_url
+    new_url = await save_tour_guide_image_file(guide.id, file)
     try:
-        db.commit()
-        db.refresh(pkg)
+        image.image_url = new_url
+        commit_changes(db)
+        db.refresh(image)
     except Exception:
-        db.rollback()
+        delete_local_tour_guide_image(new_url)
         raise
 
-    return pkg
+    if old_url and old_url != new_url:
+        delete_local_tour_guide_image(old_url)
+    return image
 
 
 @router.delete(
-    "/me/packages/{package_id}",
-    summary="Delete tour package",
+    "/images/{image_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a photo from your tour guide gallery",
 )
-def delete_tour_guide_package(
-    package_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def delete_guide_image(
+    image_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    pkg = (
-        db.query(TourGuidePackage)
+    image = (
+        db.query(TourGuideImage)
         .filter(
-            TourGuidePackage.id == package_id,
-            TourGuidePackage.tour_guide_id == guide.id,
+            TourGuideImage.id == image_id,
+            TourGuideImage.tour_guide_id == guide.id,
         )
         .first()
     )
-    if not pkg:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour package not found or not owned by you",
-        )
+    if image is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
 
-    db.delete(pkg)
-    db.commit()
-    return {"message": "Tour package deleted successfully", "id": package_id}
+    old_url = image.image_url
+    db.delete(image)
+    commit_changes(db)
+    delete_local_tour_guide_image(old_url)
 
 
-# ==========================================
-# CREDENTIALS & SLTDA VERIFICATION (TG-03)
-# ==========================================
+# =============================================================================
+# 6. PRIVATE QUALIFICATIONS & CREDENTIALS MANAGEMENT (PR-04 / GS-02)
+# =============================================================================
+
+@router.get(
+    "/credentials",
+    response_model=list[TourGuideCredentialResponse],
+    summary="List your private qualification and license credentials",
+)
+def list_guide_credentials(guide: OwnedGuide, db: DatabaseSession):
+    rows = (
+        db.query(TourGuideCredential)
+        .filter(TourGuideCredential.tour_guide_id == guide.id)
+        .order_by(TourGuideCredential.created_at.desc(), TourGuideCredential.id.desc())
+        .all()
+    )
+    return [_serialize_credential(c) for c in rows]
+
 
 @router.post(
-    "/me/credentials",
+    "/credentials",
     response_model=TourGuideCredentialResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Add tour guide credential / SLTDA license",
+    summary="Upload a private qualification, license, or certificate document",
 )
-def create_tour_guide_credential(
-    payload: TourGuideCredentialCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+async def upload_guide_credential(
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    credential_type: Annotated[CredentialType, Form()],
+    title: Annotated[str, Form(min_length=2, max_length=150)],
+    issuing_authority: Annotated[str, Form(min_length=2, max_length=150)],
+    file: UploadFile = File(...),
+    certificate_number: Annotated[str | None, Form(max_length=100)] = None,
+    issue_date: Annotated[date | None, Form()] = None,
+    expiry_date: Annotated[date | None, Form()] = None,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+    if issue_date and expiry_date and expiry_date < issue_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="expiry_date must be on or after issue_date",
+        )
 
-    cred = TourGuideCredential(
-        tour_guide_id=guide.id,
-        credential_type=payload.credential_type,
-        title=payload.title,
-        issuing_authority=payload.issuing_authority,
-        certificate_number=payload.certificate_number,
-        issue_date=payload.issue_date,
-        expiry_date=payload.expiry_date,
-        file_reference=payload.file_reference,
-        is_confidential=payload.is_confidential,
-        verification_status="pending",
-    )
-    db.add(cred)
+    clean_title = title.strip()
+    clean_authority = issuing_authority.strip()
+    if len(clean_title) < 2 or len(clean_authority) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="title and issuing_authority must be at least 2 characters",
+        )
 
-    # Sync license details with guide profile if SLTDA license
-    if payload.credential_type == "sltda_license" and payload.certificate_number:
-        guide.license_number = payload.certificate_number
-        if payload.expiry_date:
-            guide.license_expiry_date = payload.expiry_date
+    file_ref = await save_tour_guide_credential_file(guide.id, file)
+    try:
+        cred = TourGuideCredential(
+            tour_guide_id=guide.id,
+            credential_type=credential_type,
+            title=clean_title,
+            issuing_authority=clean_authority,
+            certificate_number=certificate_number.strip() if certificate_number else None,
+            issue_date=issue_date,
+            expiry_date=expiry_date,
+            file_reference=file_ref,
+            is_confidential=True,
+            verification_status="pending",
+        )
+        db.add(cred)
 
-    db.commit()
-    db.refresh(cred)
-    return cred
+        if guide.verification_status in ("unverified", "rejected"):
+            guide.verification_status = "pending"
+
+        commit_changes(db)
+        db.refresh(cred)
+        return _serialize_credential(cred)
+    except Exception:
+        delete_local_credential_file(file_ref)
+        raise
 
 
 @router.get(
-    "/me/credentials",
-    response_model=list[TourGuideCredentialResponse],
-    summary="List tour guide credentials",
+    "/credentials/{credential_id}/document",
+    response_class=FileResponse,
+    summary="Securely view your own private credential document",
 )
-def list_tour_guide_credentials(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def view_own_credential_document(
+    credential_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-    return (
-        db.query(TourGuideCredential)
-        .filter(TourGuideCredential.tour_guide_id == guide.id)
-        .order_by(TourGuideCredential.created_at.desc())
-        .all()
-    )
-
-
-@router.delete(
-    "/me/credentials/{credential_id}",
-    summary="Delete tour guide credential",
-)
-def delete_tour_guide_credential(
-    credential_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
     cred = (
         db.query(TourGuideCredential)
         .filter(
@@ -610,391 +896,655 @@ def delete_tour_guide_credential(
         )
         .first()
     )
-    if not cred:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Credential not found or not owned by you",
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+    return _stream_private_credential_file(cred)
+
+
+@router.patch(
+    "/credentials/{credential_id}",
+    response_model=TourGuideCredentialResponse,
+    summary="Update credential metadata (resets credential to pending verification)",
+)
+def update_guide_credential(
+    credential_id: Annotated[int, Path(gt=0)],
+    payload: TourGuideCredentialUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    cred = (
+        db.query(TourGuideCredential)
+        .filter(
+            TourGuideCredential.id == credential_id,
+            TourGuideCredential.tour_guide_id == guide.id,
         )
+        .first()
+    )
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    effective_issue = changes.get("issue_date", cred.issue_date)
+    effective_expiry = changes.get("expiry_date", cred.expiry_date)
+    if effective_issue and effective_expiry and effective_expiry < effective_issue:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="expiry_date must be on or after issue_date",
+        )
+
+    if changes:
+        for field, value in changes.items():
+            setattr(cred, field, value)
+        cred.verification_status = "pending"
+        db.flush()
+        if guide.verification_status in ("unverified", "rejected"):
+            guide.verification_status = "pending"
+        elif guide.verification_status == "verified":
+            other_approved = (
+                db.query(TourGuideCredential.id)
+                .filter(
+                    TourGuideCredential.tour_guide_id == guide.id,
+                    TourGuideCredential.id != cred.id,
+                    TourGuideCredential.verification_status == "approved",
+                )
+                .first()
+            )
+            if other_approved is None:
+                guide.verification_status = "pending"
+        commit_changes(db)
+        db.refresh(cred)
+
+    return _serialize_credential(cred)
+
+
+@router.put(
+    "/credentials/{credential_id}/document",
+    response_model=TourGuideCredentialResponse,
+    summary="Replace a private credential document file (resets to pending verification)",
+)
+async def replace_guide_credential_document(
+    credential_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    file: UploadFile = File(...),
+):
+    cred = (
+        db.query(TourGuideCredential)
+        .filter(
+            TourGuideCredential.id == credential_id,
+            TourGuideCredential.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+
+    old_ref = cred.file_reference
+    new_ref = await save_tour_guide_credential_file(guide.id, file)
+    try:
+        cred.file_reference = new_ref
+        cred.is_confidential = True
+        cred.verification_status = "pending"
+        db.flush()
+        if guide.verification_status in ("unverified", "rejected"):
+            guide.verification_status = "pending"
+        elif guide.verification_status == "verified":
+            other_approved = (
+                db.query(TourGuideCredential.id)
+                .filter(
+                    TourGuideCredential.tour_guide_id == guide.id,
+                    TourGuideCredential.id != cred.id,
+                    TourGuideCredential.verification_status == "approved",
+                )
+                .first()
+            )
+            if other_approved is None:
+                guide.verification_status = "pending"
+        commit_changes(db)
+        db.refresh(cred)
+    except Exception:
+        delete_local_credential_file(new_ref)
+        raise
+
+    if old_ref and old_ref != new_ref:
+        delete_local_credential_file(old_ref)
+    return _serialize_credential(cred)
+
+
+@router.delete(
+    "/credentials/{credential_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an unreviewed credential from your profile",
+)
+def delete_guide_credential(
+    credential_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    cred = (
+        db.query(TourGuideCredential)
+        .filter(
+            TourGuideCredential.id == credential_id,
+            TourGuideCredential.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+
+    has_verifications = (
+        db.query(TourGuideVerification.id)
+        .filter(TourGuideVerification.credential_id == cred.id)
+        .first()
+        is not None
+    )
+    if has_verifications:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete a credential with verification review history; replace the document instead",
+        )
+
+    old_ref = cred.file_reference
     db.delete(cred)
-    db.commit()
-    return {"message": "Credential deleted successfully", "id": credential_id}
+    commit_changes(db)
+    delete_local_credential_file(old_ref)
 
 
-# ==========================================
-# AVAILABILITY SCHEDULE (TG-05)
-# ==========================================
+# =============================================================================
+# 7. TOUR PACKAGES MANAGEMENT (PR-08 / PR-09 / GS-03 / GS-04 / GS-05)
+# =============================================================================
+
+@router.get(
+    "/packages",
+    response_model=list[TourGuidePackageResponse],
+    summary="List your tour packages",
+)
+def list_guide_packages(
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    include_inactive: bool = True,
+):
+    query = db.query(TourGuidePackage).filter(
+        TourGuidePackage.tour_guide_id == guide.id
+    )
+    if not include_inactive:
+        query = query.filter(TourGuidePackage.is_active == True)
+    return query.order_by(TourGuidePackage.is_active.desc(), TourGuidePackage.id.asc()).all()
+
+
+@router.get(
+    "/packages/{package_id}",
+    response_model=TourGuidePackageResponse,
+    summary="Get details of one of your tour packages",
+)
+def get_guide_package(
+    package_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    pkg = (
+        db.query(TourGuidePackage)
+        .filter(
+            TourGuidePackage.id == package_id,
+            TourGuidePackage.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if pkg is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+    return pkg
+
 
 @router.post(
-    "/me/availability",
+    "/packages",
+    response_model=TourGuidePackageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new half-day, full-day, or custom tour package",
+)
+def create_guide_package(
+    payload: TourGuidePackageCreate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    pkg = TourGuidePackage(
+        tour_guide_id=guide.id,
+        **payload.model_dump(),
+    )
+    db.add(pkg)
+    commit_changes(db)
+    db.refresh(pkg)
+    return pkg
+
+
+@router.patch(
+    "/packages/{package_id}",
+    response_model=TourGuidePackageResponse,
+    summary="Update one of your tour packages",
+)
+def update_guide_package(
+    package_id: Annotated[int, Path(gt=0)],
+    payload: TourGuidePackageUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    pkg = (
+        db.query(TourGuidePackage)
+        .filter(
+            TourGuidePackage.id == package_id,
+            TourGuidePackage.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if pkg is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+
+    changes = payload.model_dump(exclude_unset=True)
+    lat = changes.get("meeting_latitude", pkg.meeting_latitude)
+    lon = changes.get("meeting_longitude", pkg.meeting_longitude)
+    if (lat is None) != (lon is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="meeting_latitude and meeting_longitude must be provided together",
+        )
+
+    for field, value in changes.items():
+        setattr(pkg, field, value)
+    commit_changes(db)
+    db.refresh(pkg)
+    return pkg
+
+
+@router.delete(
+    "/packages/{package_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete an unused package or deactivate a package with bookings",
+)
+def delete_guide_package(
+    package_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    pkg = (
+        db.query(TourGuidePackage)
+        .filter(
+            TourGuidePackage.id == package_id,
+            TourGuidePackage.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if pkg is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+
+    has_bookings = (
+        db.query(TourGuideBooking.id)
+        .filter(TourGuideBooking.package_id == pkg.id)
+        .first()
+        is not None
+    )
+    if has_bookings:
+        pkg.is_active = False
+    else:
+        db.delete(pkg)
+    commit_changes(db)
+
+
+# =============================================================================
+# 8. AVAILABILITY CALENDAR & OVERLAP VALIDATION (PR-10)
+# =============================================================================
+
+@router.get(
+    "/availability",
+    response_model=list[TourGuideAvailabilityResponse],
+    summary="List your open and blocked availability calendar slots",
+)
+def list_guide_availability(
+    guide: OwnedGuide,
+    db: DatabaseSession,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    is_available: bool | None = Query(default=None),
+):
+    if date_from and date_to and date_to < date_from:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="date_to must be on or after date_from",
+        )
+
+    query = db.query(TourGuideAvailability).filter(
+        TourGuideAvailability.tour_guide_id == guide.id
+    )
+    if date_from is not None:
+        query = query.filter(TourGuideAvailability.available_date >= date_from)
+    if date_to is not None:
+        query = query.filter(TourGuideAvailability.available_date <= date_to)
+    if is_available is not None:
+        query = query.filter(TourGuideAvailability.is_available == is_available)
+
+    return query.order_by(
+        TourGuideAvailability.available_date.asc(),
+        TourGuideAvailability.start_time.asc(),
+        TourGuideAvailability.id.asc(),
+    ).all()
+
+
+@router.post(
+    "/availability",
     response_model=TourGuideAvailabilityResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Set tour guide availability or blocked date",
+    summary="Add an open or blocked availability slot (rejects overlaps)",
 )
-def create_tour_guide_availability(
+def create_guide_availability(
     payload: TourGuideAvailabilityCreate,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    avail = TourGuideAvailability(
+    overlap = find_overlapping_availability_slot(
+        db,
         tour_guide_id=guide.id,
         available_date=payload.available_date,
         start_time=payload.start_time,
         end_time=payload.end_time,
-        is_available=payload.is_available,
-        reason=payload.reason,
     )
-    db.add(avail)
-    db.commit()
-    db.refresh(avail)
-    return avail
-
-
-@router.get(
-    "/me/availability",
-    response_model=list[TourGuideAvailabilityResponse],
-    summary="List tour guide availability entries",
-)
-def list_tour_guide_availability(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-    start_date: Annotated[date | None, Query(description="Filter from date")] = None,
-    end_date: Annotated[date | None, Query(description="Filter to date")] = None,
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-    query = db.query(TourGuideAvailability).filter(
-        TourGuideAvailability.tour_guide_id == guide.id
-    )
-    if start_date:
-        query = query.filter(TourGuideAvailability.available_date >= start_date)
-    if end_date:
-        query = query.filter(TourGuideAvailability.available_date <= end_date)
-
-    return (
-        query.order_by(
-            TourGuideAvailability.available_date.asc(),
-            TourGuideAvailability.start_time.asc(),
+    if overlap is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Availability slot overlaps with existing slot #{overlap.id} "
+                f"on {payload.available_date}"
+            ),
         )
-        .all()
+
+    if not payload.is_available:
+        conflict_booking = find_conflicting_active_booking(
+            db,
+            tour_guide_id=guide.id,
+            target_date=payload.available_date,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+        )
+        if conflict_booking is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot block {payload.available_date}: conflicts with active "
+                    f"booking #{conflict_booking.id}"
+                ),
+            )
+
+    slot = TourGuideAvailability(
+        tour_guide_id=guide.id,
+        **payload.model_dump(),
     )
+    db.add(slot)
+    try:
+        commit_changes(db)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate or conflicting availability slot",
+        ) from exc
+    db.refresh(slot)
+    return slot
 
 
-@router.delete(
-    "/me/availability/{availability_id}",
-    summary="Delete tour guide availability entry",
+@router.post(
+    "/availability/block-range",
+    response_model=list[TourGuideAvailabilityResponse],
+    status_code=status.HTTP_201_CREATED,
+    summary="Block a contiguous range of full days (atomic overlap & booking check)",
 )
-def delete_tour_guide_availability(
-    availability_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
+def block_guide_availability_range(
+    payload: TourGuideAvailabilityBulkBlockRequest,
+    guide: OwnedGuide,
+    db: DatabaseSession,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-    avail = (
+    days_count = (payload.end_date - payload.start_date).days + 1
+    dates = [payload.start_date + timedelta(days=offset) for offset in range(days_count)]
+
+    for target_date in dates:
+        overlap = find_overlapping_availability_slot(
+            db,
+            tour_guide_id=guide.id,
+            available_date=target_date,
+            start_time=None,
+            end_time=None,
+        )
+        if overlap is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Date {target_date} overlaps with existing availability slot #{overlap.id}",
+            )
+        conflict_booking = find_conflicting_active_booking(
+            db,
+            tour_guide_id=guide.id,
+            target_date=target_date,
+            start_time=None,
+            end_time=None,
+        )
+        if conflict_booking is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Date {target_date} conflicts with active booking #{conflict_booking.id}",
+            )
+
+    created_slots: list[TourGuideAvailability] = []
+    for target_date in dates:
+        slot = TourGuideAvailability(
+            tour_guide_id=guide.id,
+            available_date=target_date,
+            start_time=None,
+            end_time=None,
+            is_available=False,
+            reason=payload.reason,
+        )
+        db.add(slot)
+        created_slots.append(slot)
+
+    commit_changes(db)
+    for slot in created_slots:
+        db.refresh(slot)
+    return created_slots
+
+
+@router.patch(
+    "/availability/{slot_id}",
+    response_model=TourGuideAvailabilityResponse,
+    summary="Update an availability slot with overlap and booking conflict checks",
+)
+def update_guide_availability(
+    slot_id: Annotated[int, Path(gt=0)],
+    payload: TourGuideAvailabilityUpdate,
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    slot = (
         db.query(TourGuideAvailability)
         .filter(
-            TourGuideAvailability.id == availability_id,
+            TourGuideAvailability.id == slot_id,
             TourGuideAvailability.tour_guide_id == guide.id,
         )
         .first()
     )
-    if not avail:
+    if slot is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Availability entry not found or not owned by you",
+            detail="Availability slot not found",
         )
-    db.delete(avail)
-    db.commit()
-    return {"message": "Availability entry deleted successfully", "id": availability_id}
+
+    changes = payload.model_dump(exclude_unset=True)
+    new_date = changes.get("available_date", slot.available_date)
+    new_start = changes.get("start_time", slot.start_time)
+    new_end = changes.get("end_time", slot.end_time)
+    new_is_available = changes.get("is_available", slot.is_available)
+
+    if (new_start is None) != (new_end is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="start_time and end_time must both be provided or both be null",
+        )
+    if new_start is not None and new_end is not None and new_end <= new_start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="end_time must be strictly after start_time",
+        )
+
+    overlap = find_overlapping_availability_slot(
+        db,
+        tour_guide_id=guide.id,
+        available_date=new_date,
+        start_time=new_start,
+        end_time=new_end,
+        exclude_slot_id=slot.id,
+    )
+    if overlap is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Updated slot overlaps with existing slot #{overlap.id} on {new_date}",
+        )
+
+    if not new_is_available:
+        conflict_booking = find_conflicting_active_booking(
+            db,
+            tour_guide_id=guide.id,
+            target_date=new_date,
+            start_time=new_start,
+            end_time=new_end,
+        )
+        if conflict_booking is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot block {new_date}: conflicts with active booking #{conflict_booking.id}",
+            )
+
+    for field, value in changes.items():
+        setattr(slot, field, value)
+    commit_changes(db)
+    db.refresh(slot)
+    return slot
 
 
-# ==========================================
-# PROVIDER BOOKING WORKSPACE FOR TOUR GUIDES
-# ==========================================
+@router.delete(
+    "/availability/{slot_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove an availability calendar slot",
+)
+def delete_guide_availability(
+    slot_id: Annotated[int, Path(gt=0)],
+    guide: OwnedGuide,
+    db: DatabaseSession,
+):
+    slot = (
+        db.query(TourGuideAvailability)
+        .filter(
+            TourGuideAvailability.id == slot_id,
+            TourGuideAvailability.tour_guide_id == guide.id,
+        )
+        .first()
+    )
+    if slot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Availability slot not found",
+        )
+
+    db.delete(slot)
+    commit_changes(db)
+
+
+# =============================================================================
+# 9. PROVIDER CONTACT & VERIFICATION STATUS (PR-17 / PR-18)
+# =============================================================================
 
 @router.get(
-    "/me/bookings",
-    response_model=TourGuideBookingProviderListResponse,
-    summary="Provider view of guide bookings",
+    "/contact",
+    response_model=TourGuideContactResponse,
+    summary="View permitted contact details for your tour guide profile",
 )
-def list_my_tour_guide_bookings(
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-    page: Annotated[int, Query(ge=1)] = 1,
-    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-    booking_status: Annotated[str | None, Query()] = None,
+def get_guide_contact(
+    guide: OwnedGuide,
+    provider: GuideProvider,
 ):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
+    return TourGuideContactResponse(
+        tour_guide_id=guide.id,
+        provider_profile_id=provider.id,
+        business_name=provider.business_name,
+        email=provider.user.email,
+        phone=provider.phone,
+        secondary_phone=provider.secondary_phone,
+        base_city=guide.base_city,
+        base_district=guide.base_district,
+    )
 
-    query = db.query(TourGuideBooking).filter(TourGuideBooking.tour_guide_id == guide.id)
 
-    if booking_status and booking_status.strip():
-        clean_status = booking_status.strip().lower()
-        query = query.filter(TourGuideBooking.booking_status == clean_status)
+@router.patch(
+    "/contact",
+    response_model=TourGuideContactResponse,
+    summary="Update permitted phone contact details for your tour guide profile",
+)
+def update_guide_contact(
+    payload: TourGuideContactUpdate,
+    guide: OwnedGuide,
+    provider: GuideProvider,
+    db: DatabaseSession,
+):
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(provider, field, value)
+    commit_changes(db)
+    db.refresh(provider)
+    return TourGuideContactResponse(
+        tour_guide_id=guide.id,
+        provider_profile_id=provider.id,
+        business_name=provider.business_name,
+        email=provider.user.email,
+        phone=provider.phone,
+        secondary_phone=provider.secondary_phone,
+        base_city=guide.base_city,
+        base_district=guide.base_district,
+    )
 
-    total = query.count()
-    total_pages = max(1, math.ceil(total / page_size))
 
-    bookings = (
-        query.order_by(TourGuideBooking.start_datetime.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
+@router.get(
+    "/verification-status",
+    response_model=TourGuideVerificationStatusResponse,
+    summary="View approval status, verification badge state, credentials, and review history",
+)
+def get_guide_verification_status(
+    guide: OwnedGuide,
+    provider: GuideProvider,
+    db: DatabaseSession,
+):
+    credentials = (
+        db.query(TourGuideCredential)
+        .filter(TourGuideCredential.tour_guide_id == guide.id)
+        .order_by(TourGuideCredential.created_at.desc(), TourGuideCredential.id.desc())
         .all()
     )
-
-    items = []
-    for b in bookings:
-        traveler = db.get(User, b.traveler_id)
-        pkg = db.get(TourGuidePackage, b.package_id) if b.package_id else None
-
-        items.append(
-            TourGuideBookingProviderItem(
-                id=b.id,
-                tour_guide_id=b.tour_guide_id,
-                traveler_id=b.traveler_id,
-                package_id=b.package_id,
-                booking_date=b.booking_date,
-                start_datetime=b.start_datetime,
-                end_datetime=b.end_datetime,
-                number_of_people=b.number_of_people,
-                pickup_location=b.pickup_location,
-                special_requests=b.special_requests,
-                total_price=b.total_price,
-                currency=b.currency,
-                booking_status=b.booking_status,
-                payment_method=b.payment_method,
-                payment_status=b.payment_status,
-                package_title=pkg.title if pkg else None,
-                traveler_name=traveler.full_name if traveler else None,
-                traveler_email=traveler.email if traveler else None,
-            )
-        )
-
-    return TourGuideBookingProviderListResponse(
-        items=items,
-        total=total,
-        page=page,
-        page_size=page_size,
-        total_pages=total_pages,
+    verifications = (
+        db.query(TourGuideVerification)
+        .filter(TourGuideVerification.tour_guide_id == guide.id)
+        .order_by(TourGuideVerification.verified_at.desc(), TourGuideVerification.id.desc())
+        .all()
     )
+    summary = {"pending": 0, "approved": 0, "rejected": 0}
+    for cred in credentials:
+        if cred.verification_status in summary:
+            summary[cred.verification_status] += 1
 
-
-@router.post(
-    "/me/bookings/{booking_id}/confirm",
-    response_model=TourGuideBookingProviderItem,
-    summary="Guide confirms pending booking",
-)
-def confirm_tour_guide_booking(
-    booking_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    booking = (
-        db.query(TourGuideBooking)
-        .filter(
-            TourGuideBooking.id == booking_id,
-            TourGuideBooking.tour_guide_id == guide.id,
-        )
-        .first()
+    return TourGuideVerificationStatusResponse(
+        tour_guide_id=guide.id,
+        provider_approval_status=provider.approval_status,
+        guide_approval_status=guide.approval_status,
+        verification_status=guide.verification_status,
+        is_verified_badge=guide.verification_status == "verified",
+        is_active=guide.is_active,
+        reviewed_at=guide.reviewed_at,
+        rejection_reason=guide.rejection_reason,
+        years_of_experience=guide.years_of_experience,
+        experience_verified=guide.verification_status == "verified" and summary["approved"] > 0,
+        credentials_summary=summary,
+        credentials=[_serialize_credential(c) for c in credentials],
+        verification_history=[
+            TourGuideVerificationRecordResponse.model_validate(v) for v in verifications
+        ],
     )
-    if not booking:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide booking not found or not owned by you",
-        )
-
-    if booking.booking_status != "pending":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot confirm booking with status '{booking.booking_status}'. Must be 'pending'",
-        )
-
-    booking.booking_status = "confirmed"
-    db.commit()
-    db.refresh(booking)
-
-    traveler = db.get(User, booking.traveler_id)
-    pkg = db.get(TourGuidePackage, booking.package_id) if booking.package_id else None
-
-    return TourGuideBookingProviderItem(
-        id=booking.id,
-        tour_guide_id=booking.tour_guide_id,
-        traveler_id=booking.traveler_id,
-        package_id=booking.package_id,
-        booking_date=booking.booking_date,
-        start_datetime=booking.start_datetime,
-        end_datetime=booking.end_datetime,
-        number_of_people=booking.number_of_people,
-        pickup_location=booking.pickup_location,
-        special_requests=booking.special_requests,
-        total_price=booking.total_price,
-        currency=booking.currency,
-        booking_status=booking.booking_status,
-        payment_method=booking.payment_method,
-        payment_status=booking.payment_status,
-        package_title=pkg.title if pkg else None,
-        traveler_name=traveler.full_name if traveler else None,
-        traveler_email=traveler.email if traveler else None,
-    )
-
-
-@router.post(
-    "/me/bookings/{booking_id}/reject",
-    response_model=TourGuideBookingProviderItem,
-    summary="Guide rejects pending booking",
-)
-def reject_tour_guide_booking(
-    booking_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    booking = (
-        db.query(TourGuideBooking)
-        .filter(
-            TourGuideBooking.id == booking_id,
-            TourGuideBooking.tour_guide_id == guide.id,
-        )
-        .first()
-    )
-    if not booking:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide booking not found or not owned by you",
-        )
-
-    if booking.booking_status != "pending":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot reject booking with status '{booking.booking_status}'. Must be 'pending'",
-        )
-
-    booking.booking_status = "rejected"
-    db.commit()
-    db.refresh(booking)
-
-    traveler = db.get(User, booking.traveler_id)
-    pkg = db.get(TourGuidePackage, booking.package_id) if booking.package_id else None
-
-    return TourGuideBookingProviderItem(
-        id=booking.id,
-        tour_guide_id=booking.tour_guide_id,
-        traveler_id=booking.traveler_id,
-        package_id=booking.package_id,
-        booking_date=booking.booking_date,
-        start_datetime=booking.start_datetime,
-        end_datetime=booking.end_datetime,
-        number_of_people=booking.number_of_people,
-        pickup_location=booking.pickup_location,
-        special_requests=booking.special_requests,
-        total_price=booking.total_price,
-        currency=booking.currency,
-        booking_status=booking.booking_status,
-        payment_method=booking.payment_method,
-        payment_status=booking.payment_status,
-        package_title=pkg.title if pkg else None,
-        traveler_name=traveler.full_name if traveler else None,
-        traveler_email=traveler.email if traveler else None,
-    )
-
-
-@router.post(
-    "/me/bookings/{booking_id}/complete",
-    response_model=TourGuideBookingProviderItem,
-    summary="Guide marks booking as completed",
-)
-def complete_tour_guide_booking(
-    booking_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
-):
-    _, guide = get_tour_guide_provider_and_profile(db, current_user)
-
-    booking = (
-        db.query(TourGuideBooking)
-        .filter(
-            TourGuideBooking.id == booking_id,
-            TourGuideBooking.tour_guide_id == guide.id,
-        )
-        .first()
-    )
-    if not booking:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide booking not found or not owned by you",
-        )
-
-    if booking.booking_status not in ("confirmed", "in_progress"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot complete booking with status '{booking.booking_status}'. Must be 'confirmed' or 'in_progress'",
-        )
-
-    booking.booking_status = "completed"
-    db.commit()
-    db.refresh(booking)
-
-    traveler = db.get(User, booking.traveler_id)
-    pkg = db.get(TourGuidePackage, booking.package_id) if booking.package_id else None
-
-    return TourGuideBookingProviderItem(
-        id=booking.id,
-        tour_guide_id=booking.tour_guide_id,
-        traveler_id=booking.traveler_id,
-        package_id=booking.package_id,
-        booking_date=booking.booking_date,
-        start_datetime=booking.start_datetime,
-        end_datetime=booking.end_datetime,
-        number_of_people=booking.number_of_people,
-        pickup_location=booking.pickup_location,
-        special_requests=booking.special_requests,
-        total_price=booking.total_price,
-        currency=booking.currency,
-        booking_status=booking.booking_status,
-        payment_method=booking.payment_method,
-        payment_status=booking.payment_status,
-        package_title=pkg.title if pkg else None,
-        traveler_name=traveler.full_name if traveler else None,
-        traveler_email=traveler.email if traveler else None,
-    )
-
-
-# ==========================================
-# PUBLIC TOUR GUIDE PROFILE VIEW
-# ==========================================
-
-@router.get(
-    "/{guide_id}",
-    response_model=TourGuideProfileResponse,
-    summary="Get public tour guide profile",
-)
-def get_public_tour_guide_profile(
-    guide_id: int,
-    db: Annotated[Session, Depends(get_db)],
-):
-    guide = (
-        db.query(TourGuide)
-        .options(
-            joinedload(TourGuide.languages),
-            joinedload(TourGuide.service_areas),
-            joinedload(TourGuide.packages),
-        )
-        .filter(
-            TourGuide.id == guide_id,
-            TourGuide.approval_status == "approved",
-            TourGuide.is_active.is_(True),
-        )
-        .first()
-    )
-    if not guide:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tour guide profile not found or not currently active",
-        )
-
-    return guide
-
-

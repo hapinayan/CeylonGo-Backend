@@ -412,3 +412,60 @@ class TestRunnerSafetyAndTransactions:
         cfg = DatabaseConfig(server=".\\SQLEXPRESS", database="CeylonGoDB")
         with pytest.raises(ChecksumMismatchError):
             cmd_validate(cfg, tmp_path, check_db=True)
+
+
+@pytest.mark.parametrize(
+    ("table", "prefix", "constraint", "error_number"),
+    (
+        ("tour_guides", "base", "CK_tour_guides_coords", 50301),
+        ("tour_guide_packages", "meeting", "CK_tour_guide_packages_coords", 50302),
+    ),
+)
+def test_tour_guide_coordinate_migration_preflights_and_rechecks(
+    table, prefix, constraint, error_number,
+):
+    import re
+    import sqlite3
+    from contextlib import closing
+
+    migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+    migration = migrations_dir / "032_enforce_tour_guide_coordinate_pairs.sql"
+    batches = split_sql_batches(migration.read_text(encoding="utf-8"))
+    assert len(batches) == 1
+    sql = batches[0]
+    preflight = re.search(
+        rf"FROM dbo\.{table}\s+WHERE (?P<predicate>.*?)\s*\)\s+THROW {error_number},",
+        sql,
+        re.DOTALL,
+    )
+    assert preflight is not None
+
+    drop = f"ALTER TABLE dbo.{table} DROP CONSTRAINT {constraint};"
+    assert preflight.end() < sql.index("ALTER TABLE")
+    add = re.search(
+        rf"ALTER TABLE dbo\.{table} WITH CHECK ADD CONSTRAINT {constraint}\s+"
+        r"CHECK \((?P<predicate>.*?)\);",
+        sql,
+        re.DOTALL,
+    )
+    assert add is not None
+    assert sql.index(drop) < add.start()
+
+    # Evaluate only the predicates offline, including SQL's UNKNOWN result for NULL.
+    with closing(sqlite3.connect(":memory:")) as connection:
+        for latitude, longitude, valid in (
+            (None, None, True),
+            (-90, 180, True),
+            (90, -180, True),
+            (None, 80, False),
+            (7, None, False),
+            (91, 80, False),
+            (7, -181, False),
+        ):
+            invalid, accepted = connection.execute(
+                f"SELECT CASE WHEN {preflight['predicate']} THEN 1 ELSE 0 END,"
+                f" ({add['predicate']})"
+                f" FROM (SELECT ? AS {prefix}_latitude, ? AS {prefix}_longitude)",
+                (latitude, longitude),
+            ).fetchone()
+            assert (invalid, accepted) == (int(not valid), int(valid))

@@ -126,7 +126,10 @@ def test_guard_verify_safe_integration_target_with_opt_in():
         opt_in="1",
     ) is True
 
-    # Missing opt-in
+    with pytest.raises(DatabaseSafetyError, match="INTEGRATION OPT-IN REQUIRED"):
+        verify_safe_integration_target(r".\SQLEXPRESS01", "CeylonGoDB_IntegrationTest")
+
+    # Disabled opt-in
     with pytest.raises(DatabaseSafetyError) as exc_info:
         verify_safe_integration_target(
             r"DESKTOP-JL1BGSI\SQLEXPRESS01",
@@ -169,6 +172,10 @@ def test_verify_connected_server_identity_with_mock():
     assert ident["current_db"] == "ceylongodb_integrationtest"
     assert ident["instance_name"] == "SQLEXPRESS01"
 
+    mock_conn.execute.return_value.fetchone.return_value = None
+    with pytest.raises(DatabaseSafetyError, match="identity is unavailable"):
+        verify_connected_server_identity(mock_engine)
+
     # Connected to CeylonGoDB -> raises
     mock_conn.execute.return_value.fetchone.return_value = (
         "CeylonGoDB",
@@ -190,6 +197,79 @@ def test_verify_connected_server_identity_with_mock():
     with pytest.raises(DatabaseSafetyError) as exc_info:
         verify_connected_server_identity(mock_engine)
     assert "live identity safety violation" in str(exc_info.value).lower()
+
+
+@pytest.mark.parametrize(
+    "alias", [r"localhost\SQLEXPRESS", r".\SQLEXPRESS01"]
+)
+def test_guard_rejects_live_database_on_both_instances(alias):
+    with pytest.raises(DatabaseSafetyError, match="LIVE DATABASE SAFETY VIOLATION"):
+        verify_safe_integration_target(alias, "CeylonGoDB", opt_in="1")
+
+
+def test_guard_authorizes_only_the_correct_artisan_alias_and_database():
+    alias = r"localhost\SQLEXPRESS"
+    assert verify_safe_integration_target(alias, "CeylonGoDB_IntegrationTest", "1")
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(alias, "CeylonGoDB_Artisan_Test", "1")
+    with pytest.raises(DatabaseSafetyError):
+        verify_safe_integration_target(r"127.0.0.1\SQLEXPRESS", "CeylonGoDB_IntegrationTest", "1")
+
+
+@pytest.mark.parametrize(
+    ("database", "server", "machine", "instance"),
+    [
+        ("CeylonGoDB", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS"),
+        ("CeylonGoDB", r"DESKTOP-JL1BGSI\SQLEXPRESS01", "DESKTOP-JL1BGSI", "SQLEXPRESS01"),
+        ("OtherTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"OTHER\SQLEXPRESS", "OTHER", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "OTHER", "SQLEXPRESS"),
+        ("CeylonGoDB_IntegrationTest", r"VISHNUGA-KAJARASH\SQLEXPRESS", "VISHNUGA-KAJARASH", "SQLEXPRESS01"),
+    ],
+)
+def test_failed_artisan_identity_prevents_migration_mutation(
+    monkeypatch, tmp_path, database, server, machine, instance,
+):
+    from unittest.mock import MagicMock
+
+    from scripts import migrate
+
+    # Raw ODBC connection limit the fake to methods on that interface.
+    connection = MagicMock(spec=["cursor", "commit", "rollback", "close"])
+    cursor = connection.cursor.return_value
+    row = (database, server, machine, instance)
+    cursor.fetchone.return_value = row
+    cursor.execute.return_value.fetchone.return_value = row
+    monkeypatch.setattr(migrate, "get_connection", lambda config: connection)
+    lock = MagicMock()
+    monkeypatch.setattr(migrate, "migration_lock", lock)
+    cfg = migrate.DatabaseConfig(
+        server=r"localhost\SQLEXPRESS",
+        database="CeylonGoDB_IntegrationTest",
+        integration_opt_in="1",
+    )
+    with pytest.raises((DatabaseSafetyError, migrate.TargetDatabaseMismatchError)):
+        migrate.cmd_upgrade(cfg, tmp_path, target_version="038", confirmed=True)
+    lock.assert_not_called()
+    connection.commit.assert_not_called()
+    connection.close.assert_called_once()
+    assert all(call.args[0].lstrip().startswith("SELECT ") for call in cursor.execute.call_args_list)
+
+
+def test_guard_accepts_exact_connected_artisan_identity():
+    from unittest.mock import MagicMock
+
+    connection = MagicMock(spec=["cursor"])
+    connection.cursor.return_value.execute.return_value.fetchone.return_value = (
+        "CeylonGoDB_IntegrationTest",
+        r"VISHNUGA-KAJARASH\SQLEXPRESS",
+        "VISHNUGA-KAJARASH",
+        "SQLEXPRESS",
+    )
+    identity = verify_connected_server_identity(
+        connection, server_alias=r"localhost\SQLEXPRESS"
+    )
+    assert identity["server_name"] == r"VISHNUGA-KAJARASH\SQLEXPRESS"
 
 
 # ==============================================================================

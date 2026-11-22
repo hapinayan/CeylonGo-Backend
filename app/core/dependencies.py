@@ -15,6 +15,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.admin_roles import ADMIN_ROLES, APPROVED_ADMIN_ROLES, LEGACY_ADMIN_ROLE, is_admin_role, resolve_canonical_admin_role
 from app.core.otp import hash_authorization_token
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
@@ -29,8 +30,6 @@ registration_security_scheme = HTTPBearer(
     description="Provider Registration Authorization Token (Bearer <token>)",
     auto_error=False,
 )
-
-
 
 def require_provider(
     current_user: Annotated[User, Depends(get_current_user)],
@@ -114,16 +113,70 @@ def require_admin(
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> User:
     """
-    Ensure the authenticated caller has the 'admin' role and is active.
+    Ensure the authenticated caller has an authorized admin role
+    (legacy 'admin' or one of the five approved admin roles) and is active.
 
-    Rejects travelers and providers with 403 Forbidden.
+    Rejects travelers, providers, and unrecognized roles with 403 Forbidden.
     """
-    if current_user.role != "admin":
+    if not is_admin_role(current_user.role):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access forbidden: admin role required",
         )
     return current_user
+
+
+def require_admin_roles(*allowed_roles: str):
+    """
+    Dependency factory for deny-by-default Role-Based Access Control (RBAC).
+
+    - Always verifies the caller is an authenticated, active administrator.
+    - Maps legacy 'admin' to 'super_admin' via resolve_canonical_admin_role().
+    - Always grants access to 'super_admin' (and legacy 'admin').
+    - Grants access if the caller's canonical admin role is in allowed_roles.
+    - Denies access with HTTP 403 Forbidden otherwise.
+    """
+    normalized_allowed = frozenset(
+        r.strip().lower() for r in allowed_roles if r and isinstance(r, str)
+    )
+    invalid_roles = normalized_allowed - APPROVED_ADMIN_ROLES
+    if invalid_roles:
+        raise ValueError(f"Unrecognized admin roles in RBAC dependency: {sorted(invalid_roles)}")
+
+    effective_allowed = normalized_allowed | {"super_admin"}
+
+    def _dependency(
+        current_user: Annotated[User, Depends(require_admin)],
+    ) -> User:
+        canonical_role = resolve_canonical_admin_role(current_user.role)
+        if canonical_role not in effective_allowed:
+            allowed_display = ", ".join(sorted(effective_allowed))
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access forbidden: requires one of [{allowed_display}] (current role: '{canonical_role}')",
+            )
+        return current_user
+
+    return _dependency
+
+
+# Reusable centralized role-permission dependencies (P1 Stage 2 RBAC Matrix)
+require_super_admin = require_admin_roles("super_admin")
+require_operations_admin = require_admin_roles("operations_admin")
+require_finance_admin = require_admin_roles("finance_admin")
+require_content_moderator = require_admin_roles("content_moderator")
+require_support_admin = require_admin_roles("support_admin")
+
+# Cross-role read / operational boundaries defined by the Admin Management Specification:
+# - Support Admin has read-only access to travelers/eligibility, bookings, incidents, and refunds
+require_operations_or_support_read = require_admin_roles("operations_admin", "support_admin")
+require_finance_or_support_read = require_admin_roles("finance_admin", "support_admin")
+# - Support Admin and Operations Admin can manage incident / dispute tickets
+require_support_or_operations_admin = require_admin_roles("support_admin", "operations_admin")
+# - Operations Admin and Finance Admin both access promotion packages/campaigns and cross-domain operational/revenue reports
+require_operations_or_finance_admin = require_admin_roles("operations_admin", "finance_admin")
+# - Operations Admin and Content Moderator can toggle featured listing flags or map location reviews
+require_operations_or_content_moderator = require_admin_roles("operations_admin", "content_moderator")
 
 
 def require_traveler(
@@ -229,7 +282,7 @@ def require_registration_authorization(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="This email is registered as a traveler account.",
             )
-        if user.role == "admin":
+        if is_admin_role(user.role):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin accounts cannot register as providers.",

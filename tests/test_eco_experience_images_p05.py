@@ -29,7 +29,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.models.eco_experience import (
     EcoExperience,
@@ -712,6 +713,16 @@ def test_public_listing_image_visibility_and_streaming(
     # 2. While draft -> Public detail endpoint returns 404
     res_pub_draft = client.get(f"/api/v1/eco-experiences/{exp.id}")
     assert res_pub_draft.status_code == 404
+    gallery = f"/api/v1/eco-experiences/{exp.id}/images"
+    assert client.get(gallery).status_code == 404
+    assert client.get(uploaded_url).status_code == 404
+    assert client.get(f"/api/v1/eco-experiences/images/{filename}").status_code == 404
+    assert client.get(gallery, headers=auth_header(provider_1)).status_code == 200
+    assert client.get(uploaded_url, headers=auth_header(provider_1)).status_code == 200
+    assert client.get(uploaded_url, headers=auth_header(admin)).status_code == 200
+    assert client.get(
+        uploaded_url, headers=auth_header(users_and_profiles["eco_user_2"]),
+    ).status_code == 404
 
     # 3. Provider submits -> Admin approves -> Provider publishes
     client.post(f"/api/v1/eco-experiences/{exp.id}/submit", headers=auth_header(provider_1))
@@ -746,6 +757,11 @@ def test_public_listing_image_visibility_and_streaming(
     res_router_stream = client.get(f"/api/v1/eco-experiences/images/{filename}")
     assert res_router_stream.status_code == 200
     assert res_router_stream.headers["content-type"] == "image/jpeg"
+
+    db_session.refresh(exp)
+    exp.is_published = False
+    db_session.commit()
+    assert client.get(uploaded_url).status_code == 404
 
     # 8. Path traversal attempt returns 404
     res_traversal = client.get("/api/v1/eco-experiences/images/../../private_eco_evidence/secret.pdf")

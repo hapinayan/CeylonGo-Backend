@@ -1,0 +1,26 @@
+diff --git a/app/routers/payments.py b/app/routers/payments.py
+--- a/app/routers/payments.py
++++ b/app/routers/payments.py
+@@ -51,6 +51,9 @@ from app.schemas.payment import (
+ )
+ from app.schemas.tour_guide import TourGuidePaymentPrepareResponse
+ from app.services.booking_expiration import expire_single_booking
++from app.services.tour_guide_phase5 import (
++    handle_tour_guide_advertising_payment_callback,
++)
+ from app.services.tour_guide_payment import (
+     PAID_TRANSACTION_STATUSES,
+     get_tour_guide_online_earnings_components,
+@@ -640,6 +643,12 @@ def handle_payhere_callback(form_data: dict, db: Session):
+         )
+ 
+     # 1b. Route advertising payment callbacks separately from booking callbacks
++    if order_id.startswith("AD-TG-"):
++        return handle_tour_guide_advertising_payment_callback(
++            db=db,
++            form_data=dict(form_data),
++        )
++
+     if order_id.startswith("AD-"):
+         return handle_advertising_payment_callback(
+             db=db,

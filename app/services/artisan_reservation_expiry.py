@@ -18,19 +18,33 @@ from datetime import datetime, timezone
 import logging
 from typing import Sequence
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import CAPTURED
+from app.core.notification_service import create_notification
 from app.models.artisan import ArtisanReservation
-from app.models.showcase_item import ShowcaseItem
-from app.routers.artisan_reservations import acquire_product_lock
-from app.services.artisan_shared_reference import sync_artisan_booking_reference
+from app.models.shared import BookingReference, PaymentTransaction
+from app.services.artisan_shared_reference import (
+    get_artisan_booking_reference,
+    sync_artisan_booking_reference,
+)
+
+from app.services.provider_reservations import (
+    ARTISAN,
+    ARTISAN_ACTIVE_STATES,
+    LOCAL,
+    artisan_capture_exists,
+    artisan_reservation_expiry,
+    lock_artisan_product,
+    restore_artisan_stock,
+)
 
 logger = logging.getLogger("artisan_reservation_expiry")
 
 # Allowed active statuses eligible for auto-expiry if expires_at has passed.
-# 'completed', 'cancelled', and 'expired' are terminal states and strictly excluded.
-DEFAULT_ELIGIBLE_STATUSES: tuple[str, ...] = ("pending", "confirmed", "ready_for_pickup")
+# Completed, cancelled, expired, and rejected reservations are terminal.
+DEFAULT_ELIGIBLE_STATUSES = ARTISAN_ACTIVE_STATES
 
 
 def _to_naive_utc(dt: datetime | None) -> datetime | None:
@@ -75,10 +89,10 @@ def expire_single_reservation(
 
     Guarantees:
     - Verifies expires_at has passed relative to UTC now.
-    - Locks the product inventory via acquire_product_lock.
+    - Locks the product inventory via lock_artisan_product.
     - Restores reserved quantity to showcase_items.stock_quantity exactly once.
     - Transitions reservation_status to 'expired'.
-    - Terminal states ('completed', 'cancelled', 'expired') are strictly skipped without stock modification.
+    - Terminal states ('completed', 'cancelled', 'expired', 'rejected') are strictly skipped without stock modification.
 
     Returns:
         (success: bool, message: str, restored_quantity: int)
@@ -101,52 +115,97 @@ def expire_single_reservation(
     if reservation.reservation_status == "expired":
         return False, "Reservation is already expired; duplicate stock restoration prevented", 0
 
+    if reservation.reservation_status == "rejected":
+        return False, "Rejected reservations cannot be expired", 0
+
     # 4. Eligible status check
     if reservation.reservation_status not in eligible_statuses:
         return False, f"Reservation status '{reservation.reservation_status}' is not eligible for auto-expiry", 0
 
-    # 5. Expiration timestamp check
-    if reservation.expires_at is None:
-        return False, "Reservation has no expires_at timestamp; cannot auto-expire", 0
+    expiry = artisan_reservation_expiry(reservation)
+    if expiry is None:
+        return False, "Reservation has no expires_at timestamp or pickup date", 0
+    if expiry > curr_now:
+        return False, "Reservation is not yet past due", 0
 
-    exp_time = _to_naive_utc(reservation.expires_at)
-    if exp_time > curr_now:
-        return False, f"Reservation is not yet past due (expires_at={exp_time}, now={curr_now})", 0
-
-    # 6. Acquire product stock concurrency lock
-    acquire_product_lock(db, reservation.showcase_item_id)
-
-    # 7. Re-check reservation state after acquiring lock (guards against race conditions)
+    lock_artisan_product(db, reservation.showcase_item_id)
     db.refresh(reservation)
-    if reservation.reservation_status in ("completed", "cancelled", "expired"):
-        return False, f"Reservation status changed to '{reservation.reservation_status}' during lock acquisition", 0
-
-    if reservation.reservation_status not in eligible_statuses:
-        return False, f"Reservation status changed to '{reservation.reservation_status}'; skipping", 0
-
-    # 8. Restore allocated stock back to showcase product inventory
-    item = db.query(ShowcaseItem).filter(ShowcaseItem.id == reservation.showcase_item_id).first()
-    restored_qty = reservation.quantity
-    if item:
-        item.stock_quantity += restored_qty
-        item.updated_at = func.sysutcdatetime()
-
-    # 9. Transition reservation to 'expired'
     prev_status = reservation.reservation_status
-    reservation.reservation_status = "expired"
-    reservation.updated_at = func.sysutcdatetime()
+    expiry = artisan_reservation_expiry(reservation)
+    if (
+        prev_status not in ARTISAN_ACTIVE_STATES
+        or prev_status not in eligible_statuses
+        or expiry is None
+        or expiry > curr_now
+    ):
+        db.rollback()
+        return False, "Reservation is no longer eligible for expiry", 0
 
-    sync_artisan_booking_reference(
-        db,
-        reservation,
-        changed_by=None,
-        change_reason=f"Auto-expired from '{prev_status}' past pickup deadline",
-    )
+    ref = get_artisan_booking_reference(db, reservation.id)
+    if ref and (
+        ref.payment_status != "unpaid"
+        or artisan_capture_exists(db, ref.id)
+        or ref.booking_status != prev_status
+        or ref.user_id != reservation.traveler_id
+        or ref.provider_profile_id != reservation.artisan_listing.provider_profile_id
+    ):
+        db.rollback()
+        return False, "Reservation payment or booking state prevents expiry", 0
 
-    db.commit()
-    db.refresh(reservation)
+    try:
+        changed = db.execute(update(ArtisanReservation).where(
+            ArtisanReservation.id == reservation.id,
+            ArtisanReservation.reservation_status == prev_status,
+        ).values(
+            reservation_status="expired",
+            updated_at=func.sysutcdatetime(),
+        ).execution_options(synchronize_session=False))
+        if changed.rowcount != 1:
+            db.rollback()
+            return False, "Reservation status changed during expiry", 0
+        restore_artisan_stock(db, reservation)
+        restored_qty = reservation.quantity
+        db.refresh(reservation)
+
+        ref = sync_artisan_booking_reference(
+            db,
+            reservation,
+            changed_by=None,
+            change_reason=f"Auto-expired from '{prev_status}' past pickup deadline",
+        )
+
+        create_notification(
+            db, reservation.traveler_id, f"Reservation {ref.booking_reference} expired",
+            "Your Artisan pickup reservation expired.", "artisan_reservation_expired",
+        )
+        db.commit()
+        db.refresh(reservation)
+
+    except Exception:
+        db.rollback()
+        raise
 
     return True, f"Successfully expired reservation {reservation.id} from '{prev_status}' and restored {restored_qty} stock", restored_qty
+
+
+def due_artisan_reservations(now):
+    """Select persisted deadlines and earlier pickup-day cutoffs, including older rows."""
+    local_today = now.replace(tzinfo=timezone.utc).astimezone(LOCAL).date()
+    payment_prevents_expiry = select(1).where(
+        BookingReference.module_type == ARTISAN,
+        BookingReference.target_booking_id == ArtisanReservation.id,
+        or_(
+            BookingReference.payment_status != "unpaid",
+            select(1).where(
+                PaymentTransaction.booking_reference_id == BookingReference.id,
+                PaymentTransaction.payment_status.in_((*CAPTURED, "refunded")),
+            ).exists(),
+        ),
+    ).exists()
+    return (
+        or_(ArtisanReservation.expires_at <= now, ArtisanReservation.pickup_date < local_today)
+        & ~payment_prevents_expiry
+    )
 
 
 def process_expired_reservations(
@@ -175,8 +234,7 @@ def process_expired_reservations(
         db.query(ArtisanReservation.id)
         .filter(
             ArtisanReservation.reservation_status.in_(eligible_statuses),
-            ArtisanReservation.expires_at.is_not(None),
-            ArtisanReservation.expires_at <= curr_now,
+            due_artisan_reservations(curr_now),
         )
         .order_by(ArtisanReservation.expires_at.asc())
         .limit(batch_size)
@@ -196,7 +254,7 @@ def process_expired_reservations(
             prev_status = res_record.reservation_status
             item_id = res_record.showcase_item_id
             listing_id = res_record.artisan_listing_id
-            exp_time = res_record.expires_at
+            exp_time = artisan_reservation_expiry(res_record)
 
             success, reason, restored = expire_single_reservation(
                 db=db,
@@ -229,4 +287,3 @@ def process_expired_reservations(
             logger.error(f"Error expiring reservation {res_id}: {e}", exc_info=True)
 
     return result
-

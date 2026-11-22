@@ -156,4 +156,3 @@ class ArtisanReviewPaginationResponse(BaseModel):
     total_pages: int = 0
     average_rating: float = 0.0
     total_reviews: int = 0
-

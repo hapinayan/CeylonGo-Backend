@@ -39,6 +39,7 @@ from app.models.artisan_listing import ArtisanListing
 from app.models.showcase_item import ShowcaseItem
 from app.models.artisan import (
     ArtisanBusinessImage,
+    ArtisanProductFavorite,
     ArtisanProductImage,
     ArtisanReservation,
     ArtisanBusinessHours,
@@ -52,6 +53,7 @@ from app.models.activity_booking import (
     ActivityBooking,
     ActivityBookingParticipant,
 )
+from app.models.eco_reservation import EcoAvailabilitySlot, EcoReservation
 from app.models.eco_experience import (
     EcoEvidence,
     EcoExperience,
@@ -89,6 +91,7 @@ from app.models.shared import (
     ListingReference,
     BookingReference,
     PaymentTransaction,
+    AdvertisingPayment,
     PaymentRefund,
     ProviderSettlement,
     Notification,
@@ -112,6 +115,7 @@ from app.models.community import (
     CommunityReport,
     CommunityHashtag,
     CommunityPostHashtag,
+    CommunityUserProfile,
 )
 
 # AI Smart Travel Planner Module
@@ -161,6 +165,7 @@ __all__ = [
     "ArtisanListing",
     "ShowcaseItem",
     "ArtisanBusinessImage",
+    "ArtisanProductFavorite",
     "ArtisanProductImage",
     "ArtisanReservation",
     "ArtisanBusinessHours",
@@ -172,6 +177,8 @@ __all__ = [
     "ActivityBooking",
     "ActivityBookingParticipant",
     "EcoEvidence",
+    "EcoAvailabilitySlot",
+    "EcoReservation",
     "EcoExperience",
     "EcoExperienceImage",
     "EcoPractice",
@@ -201,6 +208,7 @@ __all__ = [
     "ListingReference",
     "BookingReference",
     "PaymentTransaction",
+    "AdvertisingPayment",
     "PaymentRefund",
     "ProviderSettlement",
     "Notification",
@@ -222,6 +230,7 @@ __all__ = [
     "CommunityReport",
     "CommunityHashtag",
     "CommunityPostHashtag",
+    "CommunityUserProfile",
 
     # AI Travel Planner
     "AIChatSession",

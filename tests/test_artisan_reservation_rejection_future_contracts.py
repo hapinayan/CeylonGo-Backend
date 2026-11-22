@@ -1,146 +1,197 @@
-"""
-Future Acceptance Specifications & Contract Tests: Artisan Reservation Rejection (Phase P3 Step 6).
+"""API and transaction coverage for provider rejection."""
 
-Documents and validates the contract boundaries required for Feature P-12 (Provider Reservation Management - Rejection).
-Strict Safety Notice:
-- Tests targeting the future rejection endpoint (POST /api/v1/artisan-reservations/{id}/reject) are marked as
-  SKIPPED with an explicit label 'FUTURE ACCEPTANCE SPECIFICATION' to prevent faking passing coverage
-  before Database Coordinator approval of Proposal A (CK_artisan_reservations_status 'rejected' value).
-- Executable contract tests validate schema validation, stock restoration math, and authorization logic offline.
-"""
-
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from datetime import date, timedelta
 
 import pytest
-from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.models.artisan import ArtisanReservation
-from app.models.artisan_listing import ArtisanListing
-from app.models.provider_profile import ProviderProfile
-from app.models.showcase_item import ShowcaseItem
-from app.models.user import User
-from app.schemas.artisan_reservation import ArtisanReservationCancelRequest
-
-
-# ==============================================================================
-# 1. Schema & Validation Contract Tests (Executable Offline)
-# ==============================================================================
-
-def test_rejection_reason_mandatory_validation():
-    """
-    Contract Rule: When rejecting a reservation, the provider MUST provide a non-empty reason.
-    Validates trimming and rejection of empty/whitespace-only reasons.
-    """
-    from pydantic import BaseModel, Field, field_validator
-
-    class MockArtisanReservationRejectRequest(BaseModel):
-        rejection_reason: str = Field(..., min_length=3, max_length=1000)
-
-        @field_validator("rejection_reason")
-        @classmethod
-        def sanitize_reason(cls, v: str) -> str:
-            trimmed = v.strip()
-            if not trimmed:
-                raise ValueError("Rejection reason cannot be empty or whitespace only")
-            return trimmed
-
-    # Valid reason succeeds
-    req = MockArtisanReservationRejectRequest(rejection_reason="  Workshop under renovation  ")
-    assert req.rejection_reason == "Workshop under renovation"
-
-    # Empty or whitespace reason fails validation
-    with pytest.raises(ValidationError):
-        MockArtisanReservationRejectRequest(rejection_reason="   ")
-
-    # Too short reason fails validation
-    with pytest.raises(ValidationError):
-        MockArtisanReservationRejectRequest(rejection_reason="no")
-
-
-def test_stock_restoration_math_invariant():
-    """
-    Contract Rule: Rejecting a reservation must restore the exact reserved quantity to product stock.
-    Stock restoration must execute exactly once.
-    """
-    initial_stock = 10
-    reserved_qty = 3
-    current_stock = initial_stock - reserved_qty  # 7
-
-    def restore_stock_exactly_once(stock: int, qty: int, status: str) -> tuple[int, str]:
-        if status in ("cancelled", "rejected", "expired"):
-            raise ValueError(f"Cannot restore stock: reservation is already {status}")
-        return stock + qty, "rejected"
-
-    # First rejection restores stock
-    restored_stock, new_status = restore_stock_exactly_once(current_stock, reserved_qty, "pending")
-    assert restored_stock == 10
-    assert new_status == "rejected"
-
-    # Second rejection attempt fails and prevents duplicate stock restoration
-    with pytest.raises(ValueError) as exc:
-        restore_stock_exactly_once(restored_stock, reserved_qty, new_status)
-    assert "already rejected" in str(exc.value)
-    assert restored_stock == 10
-
-
-def test_terminal_state_rejection_prevention():
-    """
-    Contract Rule: Completed or already cancelled reservations CANNOT be rejected.
-    """
-    valid_rejection_preconditions = {"pending"}
-
-    def can_reject(current_status: str) -> bool:
-        return current_status in valid_rejection_preconditions
-
-    assert can_reject("pending") is True
-    assert can_reject("confirmed") is False  # Confirmed bookings require cancellation flow
-    assert can_reject("ready_for_pickup") is False
-    assert can_reject("completed") is False
-    assert can_reject("cancelled") is False
-    assert can_reject("expired") is False
-
-
-# ==============================================================================
-# 2. Future Acceptance Specifications (Gated on DBA Proposal A Approval)
-# ==============================================================================
-
-@pytest.mark.skip(
-    reason="FUTURE ACCEPTANCE SPECIFICATION: Blocked on DBA Proposal A approval (CK_artisan_reservations_status 'rejected' constraint)"
+from app.models.shared import (
+    BookingReference,
+    BookingStatusHistory,
+    Notification,
+    PaymentTransaction,
 )
-def test_future_provider_rejects_pending_reservation_success():
-    """
-    FUTURE SPEC:
-    1. Authenticated artisan provider calls POST /api/v1/artisan-reservations/{id}/reject
-    2. Response status is 200 OK
-    3. reservation_status transitions from 'pending' to 'rejected'
-    4. Product stock_quantity increments by reservation.quantity
-    5. Booking reference status in dbo.booking_references syncs to 'rejected'
-    6. Entry recorded in dbo.booking_status_history
-    """
-    pass
-
-
-@pytest.mark.skip(
-    reason="FUTURE ACCEPTANCE SPECIFICATION: Blocked on DBA Proposal A approval (CK_artisan_reservations_status 'rejected' constraint)"
+from tests.test_artisan_reservations import (
+    approved_artisan_user,
+    auth_header,
+    client,
+    db_session,
+    reservable_product,
+    second_artisan_user,
+    setup_test_db,
+    traveler_user,
 )
-def test_future_cross_provider_rejection_blocked():
-    """
-    FUTURE SPEC:
-    Provider B receives 403 Forbidden when attempting to reject a reservation
-    belonging to Provider A's artisan listing.
-    """
-    pass
 
 
-@pytest.mark.skip(
-    reason="FUTURE ACCEPTANCE SPECIFICATION: Blocked on DBA Proposal A approval (CK_artisan_reservations_status 'rejected' constraint)"
-)
-def test_future_rejection_traveler_notification_dispatched():
-    """
-    FUTURE SPEC:
-    Upon successful rejection, a notification record (notification_type='artisan_reservation_rejected')
-    is created in dbo.notifications with the provider's rejection reason.
-    """
-    pass
+@pytest.fixture
+def pending_reservation(client, traveler_user, reservable_product):
+    response = client.post(
+        "/api/v1/artisan-reservations",
+        headers=auth_header(traveler_user),
+        json={
+            "showcase_item_id": reservable_product.id,
+            "quantity": 3,
+            "pickup_date": (date.today() + timedelta(days=1)).isoformat(),
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
 
+
+def test_provider_rejection_restores_stock_and_notifies_once(
+    client, db_session, approved_artisan_user, traveler_user,
+    reservable_product, pending_reservation,
+):
+    owner, _, _ = approved_artisan_user
+    url = f"/api/v1/artisan-reservations/{pending_reservation}/reject"
+    headers = auth_header(owner)
+    response = client.post(url, headers=headers, json={"rejection_reason": "  Closed today  "})
+    assert response.status_code == 200, response.text
+    assert response.json()["reservation_status"] == "rejected"
+    assert response.json()["rejected_by"] == owner.id
+    assert response.json()["rejected_at"]
+    assert response.json()["rejection_reason"] == "Closed today"
+    assert response.json()["cancelled_by"] is None
+    assert client.post(url, headers=headers, json={"rejection_reason": "Repeated"}).status_code == 409
+    from app.services.artisan_reservation_expiry import expire_single_reservation
+
+    assert not expire_single_reservation(
+        db_session, pending_reservation, eligible_statuses=("rejected",)
+    )[0]
+    db_session.refresh(reservable_product)
+    assert reservable_product.stock_quantity == 10
+    ref = db_session.scalar(
+        select(BookingReference).where(BookingReference.target_booking_id == pending_reservation)
+    )
+    assert ref.booking_status == "rejected"
+    history = db_session.scalars(
+        select(BookingStatusHistory).where(
+            BookingStatusHistory.booking_reference_id == ref.id,
+            BookingStatusHistory.to_status == "rejected",
+        )
+    ).one()
+    assert history.changed_by == owner.id
+    notification = db_session.scalars(
+        select(Notification).where(
+            Notification.notification_type == "artisan_reservation_rejected",
+        )
+    ).one()
+    assert notification.user_id == traveler_user.id
+    assert notification.message == "Closed today"
+
+
+def test_rejection_requires_owner_reason_and_unpaid_pending_booking(
+    client, db_session, approved_artisan_user, second_artisan_user, traveler_user,
+    pending_reservation,
+):
+    owner, _, _ = approved_artisan_user
+    outsider, _, _ = second_artisan_user
+    url = f"/api/v1/artisan-reservations/{pending_reservation}/reject"
+    reason = {"rejection_reason": "Workshop closed"}
+    assert client.post(url, headers=auth_header(outsider), json=reason).status_code == 403
+    assert client.post(url, headers=auth_header(traveler_user), json=reason).status_code == 403
+    assert client.post(
+        url, headers=auth_header(owner), json={"rejection_reason": "   "}
+    ).status_code == 422
+    ref = db_session.scalar(
+        select(BookingReference).where(BookingReference.target_booking_id == pending_reservation)
+    )
+    ref.payment_status = "paid"
+    db_session.commit()
+    assert client.post(url, headers=auth_header(owner), json=reason).status_code == 409
+    assert db_session.get(ArtisanReservation, pending_reservation).reservation_status == "pending"
+    ref.payment_status = "unpaid"
+    db_session.add(
+        PaymentTransaction(
+            booking_reference_id=ref.id, user_id=traveler_user.id, amount=ref.total_price,
+            payment_status="completed", payment_method="cash",
+        )
+    )
+    db_session.commit()
+    assert client.post(url, headers=auth_header(owner), json=reason).status_code == 409
+
+
+def test_rejection_rolls_back_after_notification_error(
+    client, db_session, monkeypatch, approved_artisan_user,
+    reservable_product, pending_reservation,
+):
+    owner, provider, _ = approved_artisan_user
+    from app.services import provider_reservations
+
+    def fail_notification(db, *args):
+        db.flush()
+        raise RuntimeError("Notification write failed")
+
+    monkeypatch.setattr(provider_reservations, "create_notification", fail_notification)
+    with pytest.raises(RuntimeError, match="Notification write failed"):
+        provider_reservations.reject_artisan_reservation(
+            db_session, pending_reservation, provider, "Workshop closed"
+        )
+    db_session.expire_all()
+    assert db_session.get(ArtisanReservation, pending_reservation).reservation_status == "pending"
+    assert reservable_product.stock_quantity == 7
+    ref = db_session.scalar(
+        select(BookingReference).where(BookingReference.target_booking_id == pending_reservation)
+    )
+    assert ref.booking_status == "pending"
+    assert not db_session.scalars(
+        select(BookingStatusHistory).where(BookingStatusHistory.to_status == "rejected")
+    ).all()
+
+
+def test_concurrent_rejection_restores_stock_once(
+    db_session, approved_artisan_user, reservable_product, pending_reservation,
+    tmp_path,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from fastapi import HTTPException
+    from sqlalchemy import create_engine, event, func
+    from sqlalchemy.orm import Session
+
+    from app.models.provider_profile import ProviderProfile
+    from app.models.showcase_item import ShowcaseItem
+    from app.services import provider_reservations
+    from tests.test_artisan_reservations import configure_sqlite_connection
+
+    _, provider, _ = approved_artisan_user
+    provider_id, product_id = provider.id, reservable_product.id
+    engine = create_engine(f"sqlite:///{tmp_path / 'rejection.sqlite'}")
+    event.listen(engine, "connect", configure_sqlite_connection)
+    db_session.rollback()
+    with engine.connect() as target:
+        source = db_session.connection().connection.driver_connection
+        source.backup(target.connection.driver_connection)
+    both_read_pending = Barrier(2)
+    # Synchronize immediately before both workers attempt their status update.
+    @event.listens_for(engine, "before_cursor_execute")
+    def interleave(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE artisan_reservations"):
+            both_read_pending.wait(timeout=10)
+
+    def reject():
+        with Session(engine) as db:
+            actor = db.get(ProviderProfile, provider_id)
+            try:
+                provider_reservations.reject_artisan_reservation(
+                    db, pending_reservation, actor, "Workshop closed"
+                )
+            except HTTPException as exc:
+                return exc.status_code
+            return 200
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(reject) for _ in range(2)]
+            assert sorted(result.result(timeout=20) for result in results) == [200, 409]
+        with Session(engine) as db:
+            assert db.get(ShowcaseItem, product_id).stock_quantity == 10
+            assert db.scalar(
+                select(func.count()).select_from(Notification).where(
+                    Notification.notification_type == "artisan_reservation_rejected"
+                )
+            ) == 1
+    finally:
+        engine.dispose()

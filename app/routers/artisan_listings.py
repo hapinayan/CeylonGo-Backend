@@ -1,13 +1,22 @@
 import math
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_admin_audit_log
+from app.core.publication import public_artisan
 from app.core.dependencies import (
     require_admin,
     require_approved_provider,
+    require_operations_admin,
+)
+from app.core.location_validation import (
+    ARTISAN_LOCATION_FIELDS,
+    ARTISAN_REVIEW_STATE,
+    validate_coordinate_pair,
+    write_review_snapshot,
 )
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -43,15 +52,7 @@ def list_artisan_listings(
     Public discovery endpoint.
     Retrieves active and approved artisan listings under approved providers with search, category, district, and featured filters.
     """
-    query = (
-        db.query(ArtisanListing)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
-    )
+    query = db.query(ArtisanListing).filter(public_artisan())
 
     if search and search.strip():
         search_pattern = f"%{search.strip().lower()}%"
@@ -98,12 +99,7 @@ def get_craft_categories(db: Annotated[Session, Depends(get_db)]):
     """
     db_categories = (
         db.query(ArtisanListing.craft_category)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
+        .filter(public_artisan())
         .distinct()
         .all()
     )
@@ -119,12 +115,7 @@ def get_active_districts(db: Annotated[Session, Depends(get_db)]):
     """
     results = (
         db.query(ArtisanListing.district)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
+        .filter(public_artisan())
         .distinct()
         .order_by(ArtisanListing.district)
         .all()
@@ -234,11 +225,8 @@ def list_nearby_artisan_listings(
     """
     query = (
         db.query(ArtisanListing)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
         .filter(
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
+            public_artisan(),
             ArtisanListing.latitude.isnot(None),
             ArtisanListing.longitude.isnot(None),
         )
@@ -313,13 +301,7 @@ def get_artisan_listing(
     """
     listing = (
         db.query(ArtisanListing)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.id == id,
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
+        .filter(ArtisanListing.id == id, public_artisan())
         .first()
     )
     if not listing:
@@ -327,7 +309,7 @@ def get_artisan_listing(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Artisan listing not found",
         )
-    
+
     # Calculate review metrics from shared Review infrastructure
     listing_ref = (
         db.query(ListingReference)
@@ -376,6 +358,7 @@ def create_artisan_listing(
             detail="Access forbidden: only artisan service providers can create artisan listings",
         )
 
+    validate_coordinate_pair(payload.latitude, payload.longitude)
     new_listing = ArtisanListing(
         provider_profile_id=provider_profile.id,
         title=payload.title,
@@ -443,8 +426,20 @@ def update_artisan_listing(
     ):
         update_data.pop(field, None)
 
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    if {"latitude", "longitude"} & update_data.keys():
+        validate_coordinate_pair(
+            update_data.get("latitude", listing.latitude),
+            update_data.get("longitude", listing.longitude),
+        )
+    if any(
+        field in update_data and update_data[field] != getattr(listing, field)
+        for field in ARTISAN_LOCATION_FIELDS
+    ):
+        update_data["is_verified"] = False
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
 
     sync_artisan_listing_reference(db, listing)
     db.commit()
@@ -489,7 +484,8 @@ def delete_artisan_listing(
 def update_listing_status(
     id: int,
     payload: ArtisanListingStatusUpdate,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -504,14 +500,15 @@ def update_listing_status(
 
     update_data = payload.model_dump(exclude_unset=True)
     if "approval_status" in update_data:
-        listing.reviewed_by = admin_user.id
-        listing.reviewed_at = func.sysutcdatetime()
+        update_data["reviewed_by"] = admin_user.id
+        update_data["reviewed_at"] = func.sysutcdatetime()
         if update_data["approval_status"] == "approved":
-            listing.rejection_reason = None
-            listing.is_active = True
+            update_data["rejection_reason"] = None
+            update_data.setdefault("is_active", True)
         elif update_data["approval_status"] in ("rejected", "suspended"):
-            listing.is_active = False
-            listing.is_featured = False
+            update_data["is_active"] = False
+            if update_data.get("is_featured") is not True:
+                update_data["is_featured"] = False
 
     if update_data.get("is_featured") is True:
         target_approval = update_data.get("approval_status", listing.approval_status)
@@ -522,10 +519,27 @@ def update_listing_status(
                 detail="Cannot feature an artisan business that is not approved and active",
             )
 
-    for key, value in update_data.items():
-        setattr(listing, key, value)
+    if {"is_verified", "approval_status", "is_featured"} & update_data.keys():
+        write_review_snapshot(db, listing, ARTISAN_REVIEW_STATE, update_data)
+    else:
+        for key, value in update_data.items():
+            setattr(listing, key, value)
 
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_status_updated",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={
+            "approval_status": listing.approval_status,
+            "is_verified": listing.is_verified,
+            "is_featured": listing.is_featured,
+            "is_active": listing.is_active,
+        },
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
     return ArtisanListingResponse.model_validate(listing)

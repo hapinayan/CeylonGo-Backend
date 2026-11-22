@@ -28,7 +28,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.models.eco_experience import (
     VALID_ECO_CATEGORIES,
@@ -522,11 +523,18 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
     data_p = resp_p.json()
     allowed_p_keys = {
         "total", "draft", "pending_approval", "approved", "rejected",
-        "deactivated", "published", "verified_badges", "pending_badges"
+        "deactivated", "published", "verified_badges", "pending_badges",
+        "total_bookings", "pending_bookings", "confirmed_bookings",
+        "completed_bookings", "cancelled_bookings", "rejected_bookings",
+        "total_revenue", "pending_cash_revenue", "refunded_amount", "native_financials",
     }
     assert set(data_p.keys()) == allowed_p_keys
+    assert data_p.pop("native_financials") == []
     for k, v in data_p.items():
-        assert isinstance(v, int)
+        if k in {"total_revenue", "pending_cash_revenue", "refunded_amount"}:
+            assert isinstance(v, (int, float, str))
+        else:
+            assert isinstance(v, int)
 
     # Admin overview response keys check
     resp_a = client.get("/api/v1/admin/eco-experiences/overview", headers=auth_header(admin_user))
@@ -534,9 +542,11 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
     allowed_a_keys = {
         "total_listings", "published_listings", "verified_badges",
         "pending_badges", "total_active_providers", "by_status",
-        "by_category", "by_district"
+        "by_category", "by_district", "booking_metrics", "financial_metrics",
+        "native_financials",
     }
     assert set(data_a.keys()) == allowed_a_keys
+    assert data_a.pop("native_financials") == []
 
 
 def test_active_provider_filtering(client: TestClient, db_session: Session):

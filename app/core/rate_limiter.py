@@ -40,7 +40,15 @@ class SlidingWindowRateLimiter:
         Record the request and verify if the client has exceeded the rate limit.
         Raises HTTPException(429) if limit is exceeded.
         """
-        client_id = self.get_client_identifier(request)
+        self.check_identifier(self.get_client_identifier(request))
+
+    def check_peer(self, request: Request, scope: str) -> None:
+        """Use the ASGI client address and the server's trusted proxy configuration."""
+        peer = request.client.host if request.client else "unknown"
+        self.check_identifier(f"{scope}:{peer}")
+
+    def check_identifier(self, client_id: str) -> None:
+        """Apply the same window to an explicitly scoped quota."""
         now = time.time()
 
         with self._lock:
@@ -160,6 +168,16 @@ def get_default_provider_login_limiter() -> SlidingWindowRateLimiter:
     )
 
 
+def get_default_admin_login_limiter() -> SlidingWindowRateLimiter:
+    max_requests = int(os.getenv("ADMIN_LOGIN_RATE_LIMIT", "5"))
+    window_seconds = int(os.getenv("ADMIN_LOGIN_RATE_WINDOW_SECONDS", "60"))
+    return SlidingWindowRateLimiter(
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+        error_message="Too many authentication attempts. Please try again later.",
+    )
+
+
 # Global instances for auth endpoints
 check_email_limiter = get_default_check_email_rate_limiter()
 forgot_password_limiter = get_default_forgot_password_rate_limiter()
@@ -170,6 +188,12 @@ provider_identity_upload_limiter = get_default_provider_identity_upload_limiter(
 provider_submit_limiter = get_default_provider_submit_limiter()
 provider_password_setup_limiter = get_default_provider_password_setup_limiter()
 provider_login_limiter = get_default_provider_login_limiter()
+admin_login_limiter = get_default_admin_login_limiter()
+shared_auth_limiter = SlidingWindowRateLimiter(
+    max_requests=int(os.getenv("SHARED_AUTH_RATE_LIMIT", "30")),
+    window_seconds=int(os.getenv("SHARED_AUTH_RATE_WINDOW_SECONDS", "60")),
+    error_message="Too many authentication attempts. Please try again later.",
+)
 
 
 def reset_all_limiters() -> None:
@@ -182,3 +206,5 @@ def reset_all_limiters() -> None:
     provider_submit_limiter.reset()
     provider_password_setup_limiter.reset()
     provider_login_limiter.reset()
+    admin_login_limiter.reset()
+    shared_auth_limiter.reset()

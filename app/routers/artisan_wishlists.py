@@ -12,8 +12,7 @@ Contract Guarantees:
    - Businesses that become unapproved/inactive after being saved are marked is_available=False with listing=None.
 5. Duplicate Prevention: Unique constraint UQ_wishlists_user_listing prevents duplicate saves (HTTP 409 Conflict).
 6. Deletion Guard: Travelers can only delete items from their own wishlist (HTTP 404 Not Found otherwise).
-7. Product-Level Favorite Compatibility:
-   - Explicitly documents and rejects individual product favorites due to CK_listing_references_type constraints.
+7. Product favorites use dedicated storage introduced by migration 038.
 """
 
 from __future__ import annotations
@@ -21,20 +20,24 @@ from __future__ import annotations
 import math
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from sqlalchemy import delete, func, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_traveler
+from app.core.publication import public_artisan
 from app.database.connection import get_db
+from app.models.artisan import ArtisanProductFavorite
 from app.models.artisan_listing import ArtisanListing
 from app.models.shared import (
     ListingReference,
     Review,
     Wishlist,
 )
+from app.models.showcase_item import ShowcaseItem
 from app.models.user import User
+from app.schemas.artisan_favorites import ArtisanFavoritePage, ArtisanFavoriteResponse
 from app.schemas.artisan_wishlist import (
     ArtisanProductFavoriteCompatibilityResponse,
     ArtisanWishlistCheckResponse,
@@ -43,6 +46,7 @@ from app.schemas.artisan_wishlist import (
     ArtisanWishlistPagination,
     ArtisanWishlistSavedListingSummary,
 )
+from app.schemas.showcase_item import ShowcaseItemSummary
 from app.services.artisan_shared_reference import (
     ARTISAN_MODULE_TYPE,
     sync_artisan_listing_reference,
@@ -425,62 +429,112 @@ def list_my_artisan_wishlist(
 
 
 # ==============================================================================
-# 5. Product-Level Favorites Compatibility & Limitation Documentation
+# 5. Product favorites
 # ==============================================================================
+
+FavoriteTraveler = Annotated[User, Depends(require_traveler)]
+FavoriteDB = Annotated[Session, Depends(get_db)]
+ProductID = Annotated[int, Path(gt=0, le=2147483647)]
+
+
+def public_products():
+    return (
+        select(ShowcaseItem)
+        .join(ArtisanListing, ArtisanListing.id == ShowcaseItem.artisan_listing_id)
+        .where(
+            public_artisan(),
+            ShowcaseItem.is_active == true(),
+            ShowcaseItem.approval_status == "approved",
+            ShowcaseItem.item_type == "product",
+        )
+    )
+
+
+def favorite_response(favorite, product):
+    return ArtisanFavoriteResponse(
+        product_id=favorite.product_id,
+        created_at=favorite.created_at,
+        product=ShowcaseItemSummary.model_validate(product),
+    )
+
 
 @router.get(
     "/api/v1/artisan-wishlists/product-favorites-compatibility",
     response_model=ArtisanProductFavoriteCompatibilityResponse,
-    summary="Documentation of product-level favorites schema compatibility",
 )
 def get_product_favorites_compatibility():
-    """
-    Documents architectural limitation:
-    In CeylonGo Migration 027, dbo.wishlists strictly foreign-keys dbo.listing_references(id).
-    The check constraint CK_listing_references_type restricts module_type to
-    ('homestay', 'tour_guide', 'activity', 'eco_experience', 'artisan', 'rental_vehicle').
-    Individual showcase products cannot be saved directly into dbo.wishlists without
-    unauthorized migration schema changes.
-    """
     return ArtisanProductFavoriteCompatibilityResponse(
-        supported=False,
-        reason=(
-            "The shared dbo.wishlists infrastructure references dbo.listing_references(id). "
-            "Database constraint CK_listing_references_type restricts module_type to "
-            "('homestay', 'tour_guide', 'activity', 'eco_experience', 'artisan', 'rental_vehicle'). "
-            "Individual showcase products are not an allowed listing reference type without "
-            "a database migration altering CK_listing_references_type or creating dbo.product_favorites."
-        ),
-        recommended_alternative=(
-            "Travelers can add the parent Artisan Business to their wishlist. "
-            "All products under that business remain accessible via the catalog."
-        ),
+        supported=True,
+        reason="Product favorites use dedicated storage introduced by migration 038.",
+        recommended_alternative="Business wishlists remain available for saving shops.",
     )
 
 
-@router.post(
-    "/api/v1/artisan-products/{product_id}/favorite",
-    summary="Attempt product-level favorite (documents architecture rejection)",
-)
-@router.post(
-    "/api/v1/wishlists/artisan/products/{product_id}",
-    summary="Attempt product-level favorite (alternate path)",
-    include_in_schema=False,
-)
-def add_product_to_favorites_blocked(
-    product_id: int,
-    current_user: Annotated[User, Depends(require_traveler)],
-):
-    """
-    Rejected endpoint documenting that product favorites require future database migrations.
-    """
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=(
-            "Product-level favorites are not supported by the shared database schema. "
-            "In accordance with CeylonGo architecture Migration 027, wishlists operate at "
-            "the business/listing level (module_type='artisan'). Please add the parent "
-            "Artisan Business to your wishlist instead."
-        ),
+@router.put("/api/v1/artisan-product-favorites/{product_id}")
+@router.post("/api/v1/artisan-products/{product_id}/favorite", include_in_schema=False)
+@router.post("/api/v1/wishlists/artisan/products/{product_id}", include_in_schema=False)
+def add_product_favorite(
+    product_id: ProductID, current_user: FavoriteTraveler, db: FavoriteDB
+) -> ArtisanFavoriteResponse:
+    product = db.scalar(public_products().where(ShowcaseItem.id == product_id))
+    if product is None:
+        raise HTTPException(404, "Public artisan product not found")
+    lookup = select(ArtisanProductFavorite).where(
+        ArtisanProductFavorite.user_id == current_user.id,
+        ArtisanProductFavorite.product_id == product_id,
     )
+    favorite = db.scalar(lookup)
+    if favorite is None:
+        favorite = ArtisanProductFavorite(user_id=current_user.id, product_id=product_id)
+        db.add(favorite)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            favorite = db.scalar(lookup)
+            if favorite is None:
+                raise
+            product = db.scalar(public_products().where(ShowcaseItem.id == product_id))
+            if product is None:
+                raise HTTPException(404, "Public artisan product not found")
+    return favorite_response(favorite, product)
 
+
+@router.delete("/api/v1/artisan-product-favorites/{product_id}", status_code=204)
+def remove_product_favorite(
+    product_id: ProductID, current_user: FavoriteTraveler, db: FavoriteDB
+) -> None:
+    db.execute(
+        delete(ArtisanProductFavorite).where(
+            ArtisanProductFavorite.user_id == current_user.id,
+            ArtisanProductFavorite.product_id == product_id,
+        )
+    )
+    db.commit()
+
+
+@router.get("/api/v1/artisan-product-favorites")
+def list_product_favorites(
+    current_user: FavoriteTraveler,
+    db: FavoriteDB,
+    page: Annotated[int, Query(ge=1, le=10000)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> ArtisanFavoritePage:
+    query = (
+        public_products()
+        .add_columns(ArtisanProductFavorite)
+        .join(ArtisanProductFavorite, ArtisanProductFavorite.product_id == ShowcaseItem.id)
+        .where(ArtisanProductFavorite.user_id == current_user.id)
+    )
+    total = db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = db.execute(
+        query.order_by(ArtisanProductFavorite.created_at.desc(), ArtisanProductFavorite.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return ArtisanFavoritePage(
+        items=[favorite_response(favorite, product) for product, favorite in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )

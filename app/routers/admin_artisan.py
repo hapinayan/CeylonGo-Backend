@@ -13,12 +13,20 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin
+from app.core.audit import record_admin_audit_log
+from app.core.dependencies import (
+    require_admin,
+    require_content_moderator,
+    require_operations_admin,
+    require_operations_or_content_moderator,
+    require_operations_or_finance_admin,
+)
 from app.database.connection import get_db
+from app.services.review_moderation import apply_review_moderation, lock_review_moderation, scoped_reviews
 from app.models.artisan import ArtisanReservation
 from app.models.artisan_listing import ArtisanListing
 from app.models.promotion import Promotion
@@ -62,6 +70,7 @@ router = APIRouter(
     "/listings",
     response_model=list[AdminArtisanListingItemResponse],
     summary="List artisan listings for admin review with filtering",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_artisan_listings_for_review(
     db: Annotated[Session, Depends(get_db)],
@@ -106,6 +115,7 @@ def list_artisan_listings_for_review(
     "/listings/{id}",
     response_model=ArtisanListingResponse,
     summary="View full details of an artisan listing for review",
+    dependencies=[Depends(require_operations_admin)],
 )
 def get_artisan_listing_for_review(
     id: int,
@@ -130,7 +140,8 @@ def get_artisan_listing_for_review(
 )
 def approve_artisan_listing(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -156,6 +167,15 @@ def approve_artisan_listing(
     listing.rejection_reason = None
 
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_approved",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={"title": listing.title, "approval_status": "approved"},
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
 
@@ -178,7 +198,8 @@ def approve_artisan_listing(
 def reject_artisan_listing(
     id: int,
     payload: ArtisanRejectionRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -200,6 +221,15 @@ def reject_artisan_listing(
     listing.reviewed_at = func.sysutcdatetime()
 
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_rejected",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={"title": listing.title, "reason": payload.reason},
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
 
@@ -221,7 +251,8 @@ def reject_artisan_listing(
 )
 def suspend_artisan_listing(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     payload: ArtisanSuspendRequest | None = None,
 ):
@@ -244,6 +275,15 @@ def suspend_artisan_listing(
     listing.reviewed_at = func.sysutcdatetime()
 
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_suspended",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={"title": listing.title, "reason": reason},
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
 
@@ -265,7 +305,8 @@ def suspend_artisan_listing(
 )
 def feature_artisan_listing(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_or_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -287,6 +328,15 @@ def feature_artisan_listing(
 
     listing.is_featured = True
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_featured",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={"title": listing.title, "is_featured": True},
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
 
@@ -307,7 +357,8 @@ def feature_artisan_listing(
 )
 def unfeature_artisan_listing(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_or_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -322,6 +373,15 @@ def unfeature_artisan_listing(
 
     listing.is_featured = False
     sync_artisan_listing_reference(db, listing)
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_listing_unfeatured",
+        entity_name="artisan_listings",
+        entity_id=listing.id,
+        details={"title": listing.title, "is_featured": False},
+        request=request,
+    )
     db.commit()
     db.refresh(listing)
 
@@ -343,6 +403,7 @@ def unfeature_artisan_listing(
     "/products",
     response_model=list[AdminArtisanProductItemResponse],
     summary="List showcase items for admin review with filtering",
+    dependencies=[Depends(require_operations_admin)],
 )
 def list_showcase_products_for_review(
     db: Annotated[Session, Depends(get_db)],
@@ -378,7 +439,8 @@ def list_showcase_products_for_review(
 )
 def approve_showcase_product(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -401,6 +463,15 @@ def approve_showcase_product(
     item.is_active = True
     item.updated_at = func.sysutcdatetime()
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_product_approved",
+        entity_name="showcase_items",
+        entity_id=item.id,
+        details={"title": item.title, "artisan_listing_id": item.artisan_listing_id},
+        request=request,
+    )
     db.commit()
     db.refresh(item)
 
@@ -421,7 +492,8 @@ def approve_showcase_product(
 )
 def reject_showcase_product(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     payload: ArtisanRejectionRequest | None = None,
 ):
@@ -440,6 +512,15 @@ def reject_showcase_product(
     item.is_active = False
     item.updated_at = func.sysutcdatetime()
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_product_rejected",
+        entity_name="showcase_items",
+        entity_id=item.id,
+        details={"title": item.title, "reason": reason},
+        request=request,
+    )
     db.commit()
     db.refresh(item)
 
@@ -461,7 +542,8 @@ def reject_showcase_product(
 )
 def hide_showcase_product(
     id: int,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -477,6 +559,15 @@ def hide_showcase_product(
     item.is_active = False
     item.updated_at = func.sysutcdatetime()
 
+    record_admin_audit_log(
+        db,
+        admin_user_id=admin_user.id,
+        action="artisan_product_hidden",
+        entity_name="showcase_items",
+        entity_id=item.id,
+        details={"title": item.title, "is_active": False},
+        request=request,
+    )
     db.commit()
     db.refresh(item)
 
@@ -500,7 +591,7 @@ def hide_showcase_product(
     summary="Batch-expire past-due artisan reservations and restore stock",
 )
 def admin_process_expired_reservations(
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
     db: Annotated[Session, Depends(get_db)],
     batch_size: int = Query(default=100, ge=1, le=1000, description="Max reservations to expire"),
 ):
@@ -540,7 +631,7 @@ def safe_csv_cell(value: object) -> str:
     summary="Admin summary reports across businesses, products, reservations, and promotions",
 )
 def get_admin_reports_summary(
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
@@ -642,7 +733,7 @@ def get_admin_reports_summary(
 )
 def export_admin_report_csv(
     report_type: str,
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_operations_or_finance_admin)],
     db: Annotated[Session, Depends(get_db)],
     status_filter: str | None = Query(default=None, alias="status", description="Filter by status"),
     start_date: date | None = Query(default=None, description="Start date filter"),
@@ -833,7 +924,7 @@ def export_admin_report_csv(
     summary="List customer reviews for artisan listings with moderation status",
 )
 def list_artisan_reviews_for_moderation(
-    admin_user: Annotated[User, Depends(require_admin)],
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
     is_published: bool | None = Query(default=None, description="Filter by publication visibility"),
     listing_id: int | None = Query(default=None, description="Filter by artisan listing ID"),
@@ -906,33 +997,23 @@ def list_artisan_reviews_for_moderation(
 def moderate_artisan_review(
     id: int,
     payload: AdminArtisanReviewModerationRequest,
-    admin_user: Annotated[User, Depends(require_admin)],
+    request: Request,
+    admin_user: Annotated[User, Depends(require_content_moderator)],
     db: Annotated[Session, Depends(get_db)],
 ):
     """
     Admin endpoint: Toggle is_published for an artisan review.
     When is_published=False, the review is strictly excluded from public lists and rating averages.
     """
-    review = (
-        db.query(Review)
-        .join(ListingReference, Review.listing_reference_id == ListingReference.id)
-        .filter(
-            Review.id == id,
-            ListingReference.module_type == "artisan",
-        )
-        .first()
+    lock_review_moderation(db, f"review_moderation_{id}")
+    review = scoped_reviews(db, "artisan").filter(Review.id == id).populate_existing().first()
+    if review is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Artisan review not found")
+
+    apply_review_moderation(
+        db, review=review, module="artisan", admin_id=admin_user.id, published=payload.is_published, reason=payload.moderation_reason, request=request,
     )
-    if not review:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Artisan review not found",
-        )
-
-    review.is_published = payload.is_published
-    review.updated_at = func.sysutcdatetime()
-
-    db.commit()
-    db.refresh(review)
 
     status_str = "published" if review.is_published else "hidden"
     return AdminArtisanReviewModerationResponse(
@@ -942,6 +1023,3 @@ def moderate_artisan_review(
         message=f"Review #{review.id} successfully {status_str}.",
         moderated_at=review.updated_at,
     )
-
-
-

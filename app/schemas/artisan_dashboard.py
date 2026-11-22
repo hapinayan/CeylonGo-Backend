@@ -127,4 +127,3 @@ class ArtisanDashboardResponse(BaseModel):
     recent_products: list[ArtisanDashboardRecentProduct] = Field(default_factory=list)
     pending_approval: ArtisanPendingApprovalSummary
     promotions_overview: ArtisanPromotionOverview
-

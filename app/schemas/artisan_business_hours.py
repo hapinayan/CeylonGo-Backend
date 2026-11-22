@@ -89,4 +89,3 @@ class ArtisanWeeklyBusinessHoursRequest(BaseModel):
     hours: list[ArtisanBusinessHoursCreate] = Field(
         ..., min_length=1, max_length=7, description="Weekly business hours schedule"
     )
-

@@ -11,6 +11,16 @@ from pydantic import (
 )
 
 
+def validate_provider_password_strength(password: str) -> str:
+    if not password.strip():
+        raise ValueError("Password cannot be blank or whitespace only.")
+    if len(password) < 12:
+        raise ValueError("Provider password must be at least 12 characters long.")
+    if len(password) > 128:
+        raise ValueError("Password cannot exceed 128 characters.")
+    return password
+
+
 class ProviderPasswordSetupRequest(BaseModel):
     password: str = Field(..., min_length=12, max_length=128, description="Strong password (at least 12 characters)")
     confirm_password: str = Field(..., min_length=12, max_length=128, description="Password confirmation")
@@ -18,13 +28,7 @@ class ProviderPasswordSetupRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def validate_password_strength(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("Password cannot be blank or whitespace only.")
-        if len(v) < 12:
-            raise ValueError("Provider password must be at least 12 characters long.")
-        if len(v) > 128:
-            raise ValueError("Password cannot exceed 128 characters.")
-        return v
+        return validate_provider_password_strength(v)
 
     @model_validator(mode="after")
     def passwords_match(self) -> Self:

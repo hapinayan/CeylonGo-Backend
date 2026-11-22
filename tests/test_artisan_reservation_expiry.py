@@ -22,7 +22,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
@@ -601,4 +602,3 @@ def test_admin_process_expired_endpoint(client: TestClient, db_session):
 
     db_session.refresh(item)
     assert item.stock_quantity == 10
-

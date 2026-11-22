@@ -1038,8 +1038,8 @@ def test_other_owner_cannot_update_promotion_via_api():
         engine.dispose()
 
 def test_active_promotions_filter_by_homestay_id():
-    from datetime import date
-    from unittest.mock import MagicMock
+    from datetime import UTC, datetime
+    from decimal import Decimal
 
     from app.routers.promotion import list_active_promotions
 
@@ -1051,18 +1051,18 @@ def test_active_promotions_filter_by_homestay_id():
 
     query.count.return_value = 1
 
-    promotion = MagicMock()
-    promotion.id = 1
-    promotion.homestay_id = 5
-    promotion.title = "Test Promotion"
-    promotion.description = None
-    promotion.discount_percent = "20.00"
-    promotion.start_date = date.today()
-    promotion.end_date = date.today()
-    promotion.is_active = True
-    promotion.created_at = __import__(
-        "datetime"
-    ).datetime.now()
+    promotion = HomestayPromotion(
+        id=1,
+        homestay_id=5,
+        title="Test Promotion",
+        discount_type="percentage",
+        discount_percent=Decimal("20.00"),
+        discount_amount=None,
+        start_date=date.today(),
+        end_date=date.today(),
+        is_active=True,
+        created_at=datetime.now(UTC),
+    )
 
     query.order_by.return_value.offset.return_value.limit.return_value.all.return_value = [
         promotion
@@ -1078,9 +1078,14 @@ def test_active_promotions_filter_by_homestay_id():
     assert result.total == 1
     assert len(result.items) == 1
     assert result.items[0].homestay_id == 5
+    assert result.items[0].discount_type == "percentage"
+    assert result.items[0].discount_percent == Decimal("20.00")
+    assert result.items[0].discount_amount is None
 
     # Verify the optional homestay filter was applied.
-    assert query.filter.called
+    query.filter.assert_called_once()
+    (predicate,) = query.filter.call_args.args
+    assert predicate.compare(HomestayPromotion.homestay_id == 5)
 
 
 def test_owner_promotion_complete_flow():

@@ -84,4 +84,3 @@ class ArtisanProductFavoriteCompatibilityResponse(BaseModel):
     supported: bool = False
     reason: str
     recommended_alternative: str
-

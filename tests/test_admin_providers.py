@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.rate_limiter import reset_all_limiters
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.provider_profile import ProviderProfile
@@ -304,10 +305,16 @@ def test_get_provider_application_details(client: TestClient, db_session: Sessio
     assert "C:\\" not in res.text
 
 
-def test_secure_identity_document_viewing(client: TestClient, db_session: Session):
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+def test_secure_identity_document_viewing(client: TestClient, db_session: Session, provider_type):
     admin = create_user(db_session, "admin_doc@ceylongo.com", role="admin")
     user = create_user(db_session, "prov_doc@ceylongo.com", role="provider")
-    profile = create_provider_profile(db_session, user)
+    profile = create_provider_profile(db_session, user, provider_type=provider_type)
+    denied = client.get(
+        f"/api/v1/admin/providers/{profile.id}/documents/selfie",
+        headers=auth_headers_for(user),
+    )
+    assert denied.status_code == 403
 
     # Valid document viewing
     res = client.get(
@@ -351,10 +358,11 @@ def test_secure_identity_document_viewing(client: TestClient, db_session: Sessio
 # ==============================================================================
 
 
-def test_approve_provider_success(client: TestClient, db_session: Session, mock_smtp):
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+def test_approve_provider_success(client: TestClient, db_session: Session, mock_smtp, provider_type):
     admin = create_user(db_session, "admin_app@ceylongo.com", role="admin", full_name="Super Admin")
     user = create_user(db_session, "prov_app@ceylongo.com", role="provider", full_name="Kamal Silva")
-    profile = create_provider_profile(db_session, user, business_name="Kamal Homestay")
+    profile = create_provider_profile(db_session, user, provider_type=provider_type)
 
     res = client.post(
         f"/api/v1/admin/providers/{profile.id}/approve",
@@ -425,10 +433,11 @@ def test_approve_provider_missing_documents_blocked(client: TestClient, db_sessi
 # ==============================================================================
 
 
-def test_reject_provider_success(client: TestClient, db_session: Session, mock_smtp):
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+def test_reject_provider_success(client: TestClient, db_session: Session, mock_smtp, provider_type):
     admin = create_user(db_session, "admin_rej@ceylongo.com", role="admin")
     user = create_user(db_session, "prov_rej@ceylongo.com", role="provider", full_name="Saman Perera")
-    profile = create_provider_profile(db_session, user, business_name="Saman Village")
+    profile = create_provider_profile(db_session, user, provider_type=provider_type)
 
     reason = "The uploaded NIC images are blurry. Please provide clear scans."
     res = client.post(

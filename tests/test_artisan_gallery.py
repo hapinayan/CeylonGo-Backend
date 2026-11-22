@@ -27,7 +27,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanBusinessImage, ArtisanProductImage
@@ -99,7 +100,9 @@ def client(db_session):
 
 
 def auth_header(user: User) -> dict[str, str]:
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=user.credential_version
+    )
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -475,6 +478,7 @@ def test_public_gallery_visibility_filtering(
         city="Colombo 03",
         is_active=True,
         approval_status="pending",
+        is_verified=True,
     )
     db_session.add(pending_listing)
     db_session.commit()
@@ -500,6 +504,16 @@ def test_public_gallery_visibility_filtering(
     )
     assert res_owner.status_code == 200
     assert len(res_owner.json()) == 1
+
+    stale_headers = auth_header(user)
+    user.credential_version += 1
+    db_session.commit()
+    assert client.get(
+        f"/api/v1/artisan-listings/{pending_listing.id}/images", headers=stale_headers
+    ).status_code == 404
+    assert client.get(
+        f"/api/v1/artisan-listings/{pending_listing.id}/images", headers=auth_header(user)
+    ).status_code == 200
 
     # Admin approves listing
     admin_res = client.post(

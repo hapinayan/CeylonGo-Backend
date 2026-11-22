@@ -23,7 +23,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan_listing import ArtisanListing
@@ -122,6 +123,7 @@ def make_provider_bundle(
         district="Kandy",
         city="Pilimathalawa",
         approval_status=listing_status,
+        is_verified=True,
         is_active=listing_active,
     )
     db_session.add(listing)
@@ -562,4 +564,3 @@ def test_provider_update_cannot_link_to_unapproved_target(client: TestClient, db
     )
     assert res.status_code == 400
     assert "inactive or unapproved showcase product" in res.json()["detail"].lower()
-

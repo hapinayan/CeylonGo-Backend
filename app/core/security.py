@@ -7,10 +7,12 @@ from typing import Any
 import jwt
 from dotenv import load_dotenv
 from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
 
 load_dotenv()
 
 password_hash = PasswordHash.recommended()
+ADMIN_AUTH_METHOD = "admin_password"
 
 
 def hash_password(password: str) -> str:
@@ -21,6 +23,17 @@ def verify_password(password: str, hashed_password: str | None) -> bool:
     if not hashed_password:
         return False
     return password_hash.verify(password, hashed_password)
+
+
+def verify_admin_password(password: str, hashed_password: str | None) -> bool:
+    # Put missing accounts and accounts without passwords through the same KDF.
+    if hashed_password:
+        try:
+            return verify_password(password, hashed_password)
+        except UnknownHashError:
+            pass
+    password_hash.hash(password)
+    return False
 
 
 def get_jwt_secret_key() -> str:
@@ -47,7 +60,10 @@ def get_jwt_access_token_expire_minutes() -> int:
 
 
 def create_access_token(
-    data: dict[str, Any], expires_delta: timedelta | None = None
+    data: dict[str, Any],
+    expires_delta: timedelta | None = None,
+    *,
+    credential_version: int = 0,
 ) -> str:
     to_encode = data.copy()
     if expires_delta is not None:
@@ -57,7 +73,7 @@ def create_access_token(
             minutes=get_jwt_access_token_expire_minutes()
         )
 
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "credential_version": credential_version})
     secret_key = get_jwt_secret_key()
     algorithm = get_jwt_algorithm()
 
@@ -68,6 +84,23 @@ def decode_access_token(token: str) -> dict[str, Any]:
     secret_key = get_jwt_secret_key()
     algorithm = get_jwt_algorithm()
     return jwt.decode(token, secret_key, algorithms=[algorithm])
+
+
+def get_access_token_credential_version(payload: dict[str, Any]) -> int:
+    if "credential_version" in payload:
+        version = payload["credential_version"]
+        if type(version) is int and version >= 0:
+            return version
+        raise jwt.InvalidTokenError("Invalid credential version")
+
+    # Legacy JWTs are accepted only until an explicitly configured UTC deadline.
+    try:
+        deadline = int(os.getenv("JWT_LEGACY_CREDENTIAL_VERSION_UNTIL", "0"))
+    except ValueError:
+        deadline = 0
+    if datetime.now(UTC).timestamp() < deadline:
+        return 0
+    raise jwt.InvalidTokenError("Missing credential version")
 
 
 def generate_password_reset_token() -> str:

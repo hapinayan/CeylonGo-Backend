@@ -169,7 +169,8 @@ def sync_artisan_booking_reference(
 
         ref.booking_status = new_status
         ref.total_price = reservation.total_price
-        ref.payment_status = payment_status
+        if new_status == "completed":
+            ref.payment_status = payment_status
         if provider_profile_id:
             ref.provider_profile_id = provider_profile_id
 
@@ -248,4 +249,3 @@ def get_artisan_booking_reference(
         )
         .first()
     )
-

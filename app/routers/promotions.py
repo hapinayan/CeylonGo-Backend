@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
+from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -53,15 +54,12 @@ def list_promotions(
     query = (
         db.query(Promotion)
         .join(ArtisanListing, Promotion.artisan_listing_id == ArtisanListing.id)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
         .outerjoin(ShowcaseItem, Promotion.showcase_item_id == ShowcaseItem.id)
         .filter(
             Promotion.is_active == True,
             Promotion.start_date <= now,
             Promotion.end_date >= now,
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
+            public_artisan(),
             or_(
                 Promotion.showcase_item_id == None,
                 and_(ShowcaseItem.is_active == True, ShowcaseItem.approval_status == "approved"),
@@ -163,16 +161,13 @@ def get_promotion(
     promo = (
         db.query(Promotion)
         .join(ArtisanListing, Promotion.artisan_listing_id == ArtisanListing.id)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
         .outerjoin(ShowcaseItem, Promotion.showcase_item_id == ShowcaseItem.id)
         .filter(
             Promotion.id == id,
             Promotion.is_active == True,
             Promotion.start_date <= now,
             Promotion.end_date >= now,
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
+            public_artisan(),
             or_(
                 Promotion.showcase_item_id == None,
                 and_(ShowcaseItem.is_active == True, ShowcaseItem.approval_status == "approved"),
@@ -204,13 +199,7 @@ def get_listing_promotions(
     """
     listing = (
         db.query(ArtisanListing)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.id == listing_id,
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
+        .filter(ArtisanListing.id == listing_id, public_artisan())
         .first()
     )
     if not listing:

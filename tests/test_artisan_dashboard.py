@@ -23,7 +23,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
@@ -681,4 +682,3 @@ def test_unauthorized_and_forbidden_access(
     res_homestay = client.get("/api/v1/artisan/dashboard", headers=auth_header(homestay_user))
     assert res_homestay.status_code == 403
     assert "only artisan service providers" in res_homestay.json()["detail"]
-

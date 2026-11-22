@@ -734,3 +734,323 @@ def test_tour_guide_verification_and_cross_guide_credential_protection(
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
+
+@pytest.fixture
+def guide_api(db_session):
+    from fastapi.testclient import TestClient
+
+    from app.database.connection import get_db
+    from app.main import app
+
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db)
+
+
+GUIDE_PATH = "/api/v1/provider/tour-guides"
+GUIDE_PAYLOAD = {
+    "bio": "Licensed local guide based in Kandy.",
+    "daily_rate": "9000.00",
+    "base_city": "Kandy",
+    "base_district": "Kandy",
+}
+
+
+def bearer(user):
+    from tests.access_tokens import create_fixture_access_token as create_access_token
+
+    return {"Authorization": f"Bearer {create_access_token({'sub': str(user.id)})}"}
+
+
+def test_provider_guide_crud(
+    guide_api, db_session, sample_guide_user, sample_provider_profile,
+    sample_traveler_user,
+):
+    headers = bearer(sample_guide_user)
+    assert guide_api.get(GUIDE_PATH, headers=headers).status_code == 404
+    response = guide_api.post(GUIDE_PATH, json=GUIDE_PAYLOAD, headers=headers)
+    assert response.status_code == 201, response.text
+    assert response.json()["approval_status"] == "draft"
+    assert guide_api.post(GUIDE_PATH, json=GUIDE_PAYLOAD, headers=headers).status_code == 409
+    assert guide_api.get(GUIDE_PATH, headers=headers).json()["id"] == response.json()["id"]
+
+    sample_traveler_user.role = "provider"
+    db_session.add(ProviderProfile(
+        user_id=sample_traveler_user.id, business_name="Another guide",
+        provider_type="tour_guide", phone="+94771234568", district="Kandy",
+        approval_status="approved",
+    ))
+    db_session.commit()
+    for method in ("GET", "PATCH", "DELETE"):
+        options = {"json": {"base_city": "Galle"}} if method == "PATCH" else {}
+        result = guide_api.request(
+            method, GUIDE_PATH, headers=bearer(sample_traveler_user), **options,
+        )
+        assert result.status_code == 404
+
+    for invalid in (
+        {"daily_rate": None},
+        {"daily_rate": "1.123"},
+        {"base_latitude": "7.29"},
+        {"approval_status": "approved"},
+    ):
+        assert guide_api.patch(GUIDE_PATH, json=invalid, headers=headers).status_code == 422
+    response = guide_api.patch(
+        GUIDE_PATH, json={"base_latitude": "7.29", "base_longitude": "80.63"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert guide_api.patch(
+        GUIDE_PATH, json={"base_latitude": None, "base_longitude": None}, headers=headers,
+    ).json()["base_latitude"] is None
+
+    guide = db_session.get(TourGuide, response.json()["id"])
+    guide.is_active = True
+    db_session.commit()
+    assert guide_api.delete(GUIDE_PATH, headers=headers).status_code == 204
+    assert guide_api.get(GUIDE_PATH, headers=headers).json()["is_active"] is False
+
+
+def test_guide_authentication_and_openapi(
+    guide_api, db_session, sample_guide_user, sample_traveler_user, sample_provider_profile,
+):
+    assert guide_api.get(GUIDE_PATH).status_code in (401, 403)
+    assert guide_api.get(
+        GUIDE_PATH, headers={"Authorization": "Bearer invalid"},
+    ).status_code == 401
+    assert guide_api.get(GUIDE_PATH, headers=bearer(sample_traveler_user)).status_code == 403
+    headers = bearer(sample_guide_user)
+    sample_provider_profile.approval_status = "pending"
+    db_session.commit()
+    assert guide_api.get(GUIDE_PATH, headers=headers).status_code == 403
+    sample_provider_profile.approval_status = "approved"
+    sample_provider_profile.provider_type = "eco_tourism"
+    db_session.commit()
+    assert guide_api.get(GUIDE_PATH, headers=headers).status_code == 403
+
+    operations = guide_api.get("/openapi.json").json()["paths"][GUIDE_PATH]
+    assert set(operations) == {"get", "post", "patch", "delete"}
+    for operation in operations.values():
+        assert {"HTTPBearer": []} in operation["security"]
+
+
+@pytest.mark.parametrize("field", ("bio", "daily_rate", "base_city", "base_district"))
+def test_create_guide_requires_fields(guide_api, sample_guide_user, sample_provider_profile, field):
+    payload = GUIDE_PAYLOAD.copy()
+    del payload[field]
+
+    response = guide_api.post(GUIDE_PATH, json=payload, headers=bearer(sample_guide_user))
+
+    assert response.status_code == 422
+    assert any(error["loc"] == ["body", field] for error in response.json()["detail"])
+
+
+@pytest.mark.parametrize("method", ("POST", "PATCH"))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("daily_rate", "-0.01"),
+        ("hourly_rate", "-0.01"),
+        ("license_type", "invalid"),
+        ("base_latitude", "90.000001"),
+        ("base_latitude", "-90.000001"),
+        ("base_longitude", "180.000001"),
+        ("base_longitude", "-180.000001"),
+    ),
+)
+def test_guide_rejects_invalid_field(
+    guide_api, sample_guide_user, sample_tour_guide, method, field, value,
+):
+    payload = {**GUIDE_PAYLOAD, "base_latitude": "7.29", "base_longitude": "80.63"}
+    payload[field] = value
+
+    response = guide_api.request(
+        method, GUIDE_PATH, json=payload, headers=bearer(sample_guide_user),
+    )
+
+    assert response.status_code == 422
+    assert any(error["loc"] == ["body", field] for error in response.json()["detail"])
+
+
+@pytest.mark.parametrize("method", ("POST", "PATCH", "DELETE"))
+@pytest.mark.parametrize(
+    ("caller", "expected_status"),
+    (
+        ("anonymous", 401),
+        ("invalid_token", 401),
+        ("traveler", 403),
+        ("inactive", 403),
+        ("rejected", 403),
+    ),
+)
+def test_guide_writes_require_authorized_provider(
+    guide_api, db_session, sample_guide_user, sample_provider_profile,
+    sample_traveler_user, sample_tour_guide, method, caller, expected_status,
+):
+    guide = sample_tour_guide
+    guide.is_active = True
+    original_city = guide.base_city
+    headers = bearer(sample_guide_user)
+    if caller == "anonymous":
+        headers = {}
+    elif caller == "invalid_token":
+        headers = {"Authorization": "Bearer invalid"}
+    elif caller == "traveler":
+        headers = bearer(sample_traveler_user)
+    elif caller == "inactive":
+        sample_guide_user.is_active = False
+    elif caller == "rejected":
+        sample_provider_profile.approval_status = "rejected"
+    db_session.commit()
+
+    options = {"json": {**GUIDE_PAYLOAD, "base_city": "Galle"}} if method != "DELETE" else {}
+    response = guide_api.request(method, GUIDE_PATH, headers=headers, **options)
+
+    assert response.status_code == expected_status
+    db_session.refresh(guide)
+    assert guide.is_active is True
+    assert guide.base_city == original_city
+    assert db_session.query(TourGuide).count() == 1
+
+
+def test_repeated_guide_delete_preserves_profile_and_language(
+    guide_api, db_session, sample_guide_user, sample_tour_guide,
+):
+    guide = sample_tour_guide
+    guide.is_active = True
+    language = TourGuideLanguage(
+        tour_guide_id=guide.id, language_code="en", language_name="English",
+        proficiency_level="fluent",
+    )
+    db_session.add(language)
+    db_session.commit()
+    headers = bearer(sample_guide_user)
+
+    for _ in range(2):
+        response = guide_api.delete(GUIDE_PATH, headers=headers)
+        assert response.status_code == 204
+        assert response.content == b""
+        db_session.refresh(guide)
+        db_session.refresh(language)
+        assert guide.is_active is False
+        assert language.tour_guide_id == guide.id
+
+    profile = guide_api.get(GUIDE_PATH, headers=headers)
+    assert profile.status_code == 200
+    assert profile.json()["id"] == guide.id
+    assert profile.json()["is_active"] is False
+
+
+@pytest.mark.parametrize("missing", ("latitude", "longitude"))
+def test_guide_coordinate_constraint_rejects_single_null(db_session, sample_tour_guide, missing):
+    setattr(sample_tour_guide, f"base_{missing}", None)
+    with pytest.raises(IntegrityError, match="CK_tour_guides_coords"):
+        db_session.commit()
+    db_session.rollback()
+
+
+@pytest.mark.parametrize("missing", ("latitude", "longitude"))
+def test_package_coordinate_constraint_rejects_single_null(db_session, sample_tour_guide, missing):
+    package = TourGuidePackage(
+        tour_guide_id=sample_tour_guide.id,
+        title="Kandy walking tour",
+        meeting_point="Kandy City Centre",
+        description="Guided walk through Kandy",
+        duration_hours=Decimal("2.00"),
+        price=Decimal("1500.00"),
+        meeting_latitude=Decimal("7.29"),
+        meeting_longitude=Decimal("80.63"),
+    )
+    setattr(package, f"meeting_{missing}", None)
+    db_session.add(package)
+    with pytest.raises(IntegrityError, match="CK_tour_guide_packages_coords"):
+        db_session.commit()
+    db_session.rollback()
+
+
+def test_coordinate_patch_rejects_update_after_concurrent_clear(
+    guide_api, db_session, sample_guide_user, sample_tour_guide, monkeypatch,
+):
+    from app.routers import tour_guide
+
+    find_owned_guide = tour_guide.find_owned_guide
+
+    def clear_after_read(session, provider_id):
+        guide = find_owned_guide(session, provider_id)
+        guide_id = guide.id
+        session.commit()
+        # Interleave a second committed write after PATCH reads the old pair.
+        with TestingSessionLocal() as other_session:
+            current_guide = other_session.get(TourGuide, guide_id)
+            current_guide.base_latitude = None
+            current_guide.base_longitude = None
+            other_session.commit()
+        return guide
+
+    monkeypatch.setattr(tour_guide, "find_owned_guide", clear_after_read)
+    headers = bearer(sample_guide_user)
+    response = guide_api.patch(
+        GUIDE_PATH, headers=headers, json={"base_latitude": "8", "base_city": "Galle"},
+    )
+
+    assert response.status_code == 409, response.text
+    db_session.refresh(sample_tour_guide)
+    assert sample_tour_guide.base_latitude is None
+    assert sample_tour_guide.base_longitude is None
+    assert sample_tour_guide.base_city == "Kandy"
+
+
+def test_coordinate_patch_can_update_one_value_when_pair_exists(
+    guide_api, sample_guide_user, sample_tour_guide,
+):
+    response = guide_api.patch(
+        GUIDE_PATH, headers=bearer(sample_guide_user), json={"base_latitude": "8"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert Decimal(payload["base_latitude"]) == Decimal("8")
+    assert Decimal(payload["base_longitude"]) == Decimal("80.633728")
+
+
+def test_create_guide_rejects_unknown_field(
+    guide_api, db_session, sample_guide_user, sample_provider_profile,
+):
+    response = guide_api.post(
+        GUIDE_PATH,
+        json={**GUIDE_PAYLOAD, "approval_status": "approved"},
+        headers=bearer(sample_guide_user),
+    )
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "approval_status"] and error["type"] == "extra_forbidden"
+        for error in response.json()["detail"]
+    )
+    assert db_session.query(TourGuide).count() == 0
+
+
+def test_create_guide_rejects_expired_jwt(guide_api, sample_guide_user, sample_provider_profile):
+    from tests.access_tokens import create_fixture_access_token as create_access_token
+
+    token = create_access_token(
+        {"sub": str(sample_guide_user.id)}, expires_delta=timedelta(minutes=-1),
+    )
+    response = guide_api.post(
+        GUIDE_PATH, json=GUIDE_PAYLOAD, headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Token has expired"
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_create_guide_requires_provider_profile(guide_api, sample_guide_user):
+    response = guide_api.post(
+        GUIDE_PATH, json=GUIDE_PAYLOAD, headers=bearer(sample_guide_user),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Provider profile not found"

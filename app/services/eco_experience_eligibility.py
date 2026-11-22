@@ -24,7 +24,7 @@ Confirmed Error Codes:
 """
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from typing import Any
 
@@ -111,6 +111,8 @@ def validate_eco_booking_eligibility(
     participants: int | None,
     slot_start: datetime,
     slot_end: datetime,
+    *,
+    calendar_timezone: tzinfo | None = None,
 ) -> EcoEligibilityResult:
     """
     Shared eligibility service invoked by Module 03 (Activity Scheduling & Booking)
@@ -221,8 +223,10 @@ def validate_eco_booking_eligibility(
             )
 
     # 6. Validate seasonal restrictions across slot date window
-    slot_start_date = start_utc.date()
-    slot_end_date = end_utc.date()
+    slot_start_date, slot_end_date = start_utc.date(), end_utc.date()
+    if calendar_timezone is not None:
+        slot_start_date = start_utc.astimezone(calendar_timezone).date()
+        slot_end_date = (end_utc - timedelta(microseconds=1)).astimezone(calendar_timezone).date()
 
     for restriction in experience.season_restrictions:
         if restriction.is_active:

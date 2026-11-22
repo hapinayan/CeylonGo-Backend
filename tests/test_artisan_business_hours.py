@@ -22,7 +22,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanBusinessHours
@@ -188,6 +189,7 @@ def active_artisan_listing(db_session, approved_artisan_user) -> ArtisanListing:
         opening_hours="Mon - Sat: 9:00 AM - 6:00 PM, Sun: Closed",
         is_active=True,
         approval_status="approved",
+        is_verified=True,
         verification_status="verified",
     )
     db_session.add(listing)
@@ -450,6 +452,7 @@ def test_public_business_hours_visibility(
         city="Ratnapura",
         is_active=True,
         approval_status="pending",
+        is_verified=True,
     )
     db_session.add(pending_listing)
     db_session.commit()
@@ -562,4 +565,3 @@ def test_backward_compatibility_with_text_opening_hours(
     assert data["opening_hours"] == "Mon - Sat: 9:00 AM - 6:00 PM, Sun: Closed"
     assert "business_hours" in data
     assert isinstance(data["business_hours"], list)
-

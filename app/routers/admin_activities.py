@@ -2,10 +2,12 @@
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_admin
+from app.core.audit import record_admin_audit_log
+from app.core.dependencies import require_admin, require_operations_admin
+from app.core.location_validation import ACTIVITY_REVIEW_STATE, write_review_snapshot
 from app.database.connection import get_db
 from app.models.activity import Activity
 from app.models.user import User
@@ -19,6 +21,7 @@ from app.schemas.activity_admin import (
 router = APIRouter(
     prefix="/api/v1/admin/activities",
     tags=["Admin Activities"],
+    dependencies=[Depends(require_admin), Depends(require_operations_admin)],
 )
 
 
@@ -81,6 +84,7 @@ def get_activity_review_details(
 def approve_activity(
     activity_id: int,
     payload: ActivityApprovalRequest,
+    request: Request,
     admin: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -92,15 +96,23 @@ def approve_activity(
             detail="Only pending activities can be approved",
         )
 
-    activity.approval_status = "approved"
-    activity.is_active = True
-    activity.reviewed_by = admin.id
-    activity.reviewed_at = datetime.now(timezone.utc).replace(
-        tzinfo=None
-    )
-    activity.rejection_reason = None
-
     try:
+        write_review_snapshot(db, activity, ACTIVITY_REVIEW_STATE, {
+            "approval_status": "approved",
+            "is_active": True,
+            "reviewed_by": admin.id,
+            "reviewed_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            "rejection_reason": None,
+        })
+        record_admin_audit_log(
+            db,
+            admin_user_id=admin.id,
+            action="activity_approved",
+            entity_name="activities",
+            entity_id=activity.id,
+            details={"title": activity.title, "approval_status": "approved"},
+            request=request,
+        )
         db.commit()
         db.refresh(activity)
     except Exception:
@@ -118,6 +130,7 @@ def approve_activity(
 def reject_activity(
     activity_id: int,
     payload: ActivityRejectionRequest,
+    request: Request,
     admin: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
 ):
@@ -138,6 +151,19 @@ def reject_activity(
     activity.rejection_reason = payload.reason
 
     try:
+        record_admin_audit_log(
+            db,
+            admin_user_id=admin.id,
+            action="activity_rejected",
+            entity_name="activities",
+            entity_id=activity.id,
+            details={
+                "title": activity.title,
+                "approval_status": "rejected",
+                "reason": payload.reason,
+            },
+            request=request,
+        )
         db.commit()
         db.refresh(activity)
     except Exception:

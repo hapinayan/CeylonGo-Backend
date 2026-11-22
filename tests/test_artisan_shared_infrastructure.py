@@ -23,7 +23,9 @@ from sqlalchemy.dialects import mssql, sqlite
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.services.provider_reservations import LOCAL
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan import ArtisanReservation
@@ -172,6 +174,7 @@ def approved_listing_and_product(db_session, artisan_provider_user):
         longitude=Decimal("80.216800"),
         is_active=True,
         approval_status="approved",
+        is_verified=True,
     )
     db_session.add(listing)
     db_session.commit()
@@ -439,7 +442,7 @@ def test_artisan_reservation_lifecycle_status_synchronization(
     listing, product = approved_listing_and_product
     provider_user, profile = artisan_provider_user
 
-    pickup_date = (date.today() + timedelta(days=1)).isoformat()
+    pickup_date = (datetime.now(LOCAL).date()).isoformat()
     create_res = client.post(
         "/api/v1/artisan-reservations",
         json={"showcase_item_id": product.id, "quantity": 1, "pickup_date": pickup_date},

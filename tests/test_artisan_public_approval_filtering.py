@@ -20,7 +20,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan_listing import ArtisanListing
@@ -122,6 +123,7 @@ def approved_artisan(db_session) -> tuple[User, ProviderProfile, ArtisanListing]
         district="Kandy",
         city="Pilimathalawa",
         approval_status="approved",
+        is_verified=True,
         is_active=True,
     )
     db_session.add(listing)
@@ -206,6 +208,7 @@ def unapproved_provider_artisan(db_session) -> tuple[User, ProviderProfile, Arti
         district="Jaffna",
         city="Jaffna",
         approval_status="approved",
+        is_verified=True,
         is_active=True,
     )
     db_session.add(listing)
@@ -439,4 +442,3 @@ def test_cannot_reserve_unapproved_product(client: TestClient, db_session, appro
     )
     assert res.status_code == 400
     assert "not approved for reservation" in res.json()["detail"].lower()
-

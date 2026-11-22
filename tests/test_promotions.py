@@ -15,7 +15,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan_listing import ArtisanListing
@@ -124,6 +125,7 @@ def approved_artisan_user(db_session) -> tuple[User, ProviderProfile, ArtisanLis
     db_session.refresh(profile)
 
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Sunil Kandy Mask Workshop",
         craft_category="Woodcarving & Masks",
@@ -176,6 +178,7 @@ def second_artisan_user(db_session) -> tuple[User, ProviderProfile, ArtisanListi
     db_session.refresh(profile)
 
     listing = ArtisanListing(
+        is_verified=True,
         provider_profile_id=profile.id,
         title="Galle Fort Batik Studio",
         craft_category="Batik & Textiles",

@@ -24,18 +24,18 @@ class ArtisanReservationBase(BaseModel):
             return trimmed if trimmed else None
         return None
 
-    @field_validator("pickup_date")
-    @classmethod
-    def validate_pickup_date(cls, value: date) -> date:
-        today = date.today()
-        if value < today:
-            raise ValueError("Pickup date cannot be in the past")
-        return value
-
 
 class ArtisanReservationCreate(ArtisanReservationBase):
     """Payload for creating a new product reservation."""
-    showcase_item_id: int = Field(..., description="ID of the showcase product to reserve")
+    model_config = ConfigDict(extra="forbid")
+
+    showcase_item_id: int = Field(gt=0, le=2147483647, description="ID of the showcase product to reserve")
+
+
+class ArtisanReservationRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    rejection_reason: str = Field(min_length=3, max_length=1000)
 
 
 class ArtisanReservationCancelRequest(BaseModel):
@@ -71,11 +71,15 @@ class ArtisanReservationResponse(BaseModel):
     total_price: Decimal
     currency: str
     reservation_status: str
+    payment_status: str | None = None
     pickup_date: date | None = None
     special_notes: str | None = None
     expires_at: datetime | None = None
     cancelled_by: int | None = None
     cancellation_reason: str | None = None
+    rejected_by: int | None = None
+    rejected_at: datetime | None = None
+    rejection_reason: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -86,4 +90,3 @@ class ArtisanReservationResponse(BaseModel):
     provider_business_name: str | None = None
     traveler_name: str | None = None
     traveler_email: str | None = None
-

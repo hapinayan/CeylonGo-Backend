@@ -21,7 +21,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import hash_password
+from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
 from app.models.artisan_listing import ArtisanListing
@@ -222,7 +223,14 @@ def test_admin_approve_artisan_listing(client: TestClient, db_session, approved_
     assert db_item.reviewed_by == admin_user.id
     assert db_item.reviewed_at is not None
 
-    # Public discovery now exposes the approved listing
+    assert client.get(f"/api/v1/artisan-listings/{listing_id}").status_code == 404
+    verified = client.patch(
+        f"/api/v1/artisan-listings/{listing_id}/status",
+        json={"is_verified": True},
+        headers=auth_header(admin_user),
+    )
+    assert verified.status_code == 200
+
     res_public = client.get(f"/api/v1/artisan-listings/{listing_id}")
     assert res_public.status_code == 200
     assert res_public.json()["title"] == "Pending Mask Workshop"
@@ -381,6 +389,13 @@ def test_admin_approve_and_reject_showcase_product(client: TestClient, approved_
     listing_id = res_listing.json()["id"]
     client.post(f"/api/v1/admin/artisan/listings/{listing_id}/approve", headers=auth_header(admin_user))
 
+    verified = client.patch(
+        f"/api/v1/artisan-listings/{listing_id}/status",
+        json={"is_verified": True},
+        headers=auth_header(admin_user),
+    )
+    assert verified.status_code == 200
+
     # Provider creates 2 products
     res1 = client.post(
         "/api/v1/showcase-items",
@@ -489,4 +504,3 @@ def test_reservation_creation_blocked_for_pending_product(client: TestClient, ap
     )
     assert res_res.status_code == 400
     assert "not approved for reservation" in res_res.json()["detail"].lower()
-

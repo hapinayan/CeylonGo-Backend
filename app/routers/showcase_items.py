@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import lock_booking_resource
+from app.core.publication import public_artisan
 from app.core.dependencies import require_approved_provider
 from app.database.connection import get_db
 from app.models.artisan_listing import ArtisanListing
@@ -46,13 +48,10 @@ def list_showcase_items(
     query = (
         db.query(ShowcaseItem)
         .join(ArtisanListing, ShowcaseItem.artisan_listing_id == ArtisanListing.id)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
         .filter(
             ShowcaseItem.is_active == True,
+            public_artisan(),
             ShowcaseItem.approval_status == "approved",
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
         )
     )
 
@@ -132,14 +131,11 @@ def get_showcase_item(
     item = (
         db.query(ShowcaseItem)
         .join(ArtisanListing, ShowcaseItem.artisan_listing_id == ArtisanListing.id)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
         .filter(
             ShowcaseItem.id == id,
             ShowcaseItem.is_active == True,
+            public_artisan(),
             ShowcaseItem.approval_status == "approved",
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
         )
         .first()
     )
@@ -169,13 +165,7 @@ def get_listing_showcase_items(
     """
     listing = (
         db.query(ArtisanListing)
-        .join(ProviderProfile, ArtisanListing.provider_profile_id == ProviderProfile.id)
-        .filter(
-            ArtisanListing.id == listing_id,
-            ArtisanListing.is_active == True,
-            ArtisanListing.approval_status == "approved",
-            ProviderProfile.approval_status == "approved",
-        )
+        .filter(ArtisanListing.id == listing_id, public_artisan())
         .first()
     )
     if not listing:
@@ -309,6 +299,11 @@ def update_showcase_item(
     update_data = payload.model_dump(exclude_unset=True)
     # Providers cannot self-modify approval_status
     update_data.pop("approval_status", None)
+    if "stock_quantity" in update_data:
+        lock_booking_resource(db, f"artisan_stock_{item.id}")
+        db.refresh(item)
+        if item.artisan_listing.provider_profile_id != provider_profile.id:
+            raise HTTPException(403, "You do not own this showcase item")
 
     for key, value in update_data.items():
         setattr(item, key, value)

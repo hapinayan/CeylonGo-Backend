@@ -9,9 +9,11 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, require_approved_provider
+from app.core.publication import public_activity, public_eco
 from app.database.connection import get_db
 
 from app.models.activity import Activity
+from app.models.eco_experience import EcoExperience
 from app.models.activity_booking import ActivityBooking
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
@@ -32,6 +34,8 @@ from app.services.activity_capacity import (
     release_activity_capacity,
 )
 
+
+from app.services.provider_reservations import record_native_event
 
 router = APIRouter(
     prefix="/api/v1/activity-bookings",
@@ -90,7 +94,7 @@ def create_activity_booking(
         db.query(ActivitySlot)
         .filter(
             ActivitySlot.id == payload.activity_slot_id,
-            ActivitySlot.is_active.is_(True),
+            ActivitySlot.is_active == True,
             ActivitySlot.starts_at > now,
         )
         .first()
@@ -105,14 +109,14 @@ def create_activity_booking(
     # Only approved activities from approved providers.
     activity = (
         db.query(Activity)
+        .with_hint(Activity, "WITH (HOLDLOCK)", "mssql")
         .join(
             ProviderProfile,
             Activity.provider_profile_id == ProviderProfile.id,
         )
         .filter(
             Activity.id == slot.activity_id,
-            Activity.approval_status == "approved",
-            Activity.is_active.is_(True),
+            public_activity(hold=True),
             ProviderProfile.approval_status == "approved",
             ProviderProfile.provider_type == "activity",
         )
@@ -124,6 +128,14 @@ def create_activity_booking(
             status_code=404,
             detail="Approved activity not found",
         )
+
+    if slot.eco_experience_id is not None and not (
+        db.query(EcoExperience.id)
+        .with_hint(EcoExperience, "WITH (HOLDLOCK)", "mssql")
+        .filter(EcoExperience.id == slot.eco_experience_id, public_eco(hold=True))
+        .first()
+    ):
+        raise HTTPException(404, detail="Approved Eco-Tourism experience not found")
 
     if payload.participants > slot.capacity:
         raise HTTPException(
@@ -173,6 +185,12 @@ def create_activity_booking(
         )
 
         db.add(booking)
+        db.flush()
+        provider = db.get(ProviderProfile, activity.provider_profile_id)
+        record_native_event(
+            db, booking, "activity", provider.id, None, "confirmed",
+            current_user.id, provider.user_id,
+        )
         db.commit()
         db.refresh(booking)
 
@@ -527,6 +545,12 @@ def cancel_activity_booking(
                 detail="Unable to release reserved capacity",
             )
 
+        activity = db.get(Activity, slot.activity_id)
+        provider = db.get(ProviderProfile, activity.provider_profile_id)
+        record_native_event(
+            db, booking, "activity", provider.id, booking.booking_status,
+            "cancelled", current_user.id, provider.user_id,
+        )
         db.commit()
         db.expire_all()
 

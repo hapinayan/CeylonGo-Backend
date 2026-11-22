@@ -2,6 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -26,6 +27,18 @@ class RentalVehicle(Base):
         CheckConstraint(
             "price_per_day >= 0",
             name="CK_rental_vehicle_price",
+        ),
+        CheckConstraint(
+            "helmet_count IS NULL OR helmet_count >= 0",
+            name="CK_rental_vehicles_helmet_count",
+        ),
+        CheckConstraint(
+            "security_deposit IS NULL OR security_deposit >= 0",
+            name="CK_rental_vehicles_security_deposit",
+        ),
+        CheckConstraint(
+            "fuel_policy IS NULL OR fuel_policy IN ('same_to_same', 'full_to_full', 'not_applicable')",
+            name="CK_rental_vehicles_fuel_policy",
         ),
     )
 
@@ -77,6 +90,13 @@ class RentalVehicle(Base):
     cancellation_policy: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
     free_cancellation_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=False)
 
+    # Phase 6B additions (AR-03, AR-04, AR-05)
+    helmet_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    helmets_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    helmet_sizes: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    security_deposit: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    fuel_policy: Mapped[str | None] = mapped_column(Unicode(30), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.sysutcdatetime(),
@@ -88,3 +108,11 @@ class RentalVehicle(Base):
         onupdate=func.sysutcdatetime(),
         nullable=False,
     )
+
+    provider = relationship("ProviderProfile", foreign_keys=[provider_id])
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+    location = relationship("RentalLocation", back_populates="vehicles")
+    rate_plans = relationship("RentalRatePlan", back_populates="vehicle", cascade="all, delete-orphan")
+    images = relationship("RentalVehicleImage", back_populates="vehicle", cascade="all, delete-orphan")
+    documents = relationship("RentalVehicleDocument", back_populates="vehicle", cascade="all, delete-orphan")
+    availability_blocks = relationship("RentalAvailabilityBlock", back_populates="vehicle", cascade="all, delete-orphan")

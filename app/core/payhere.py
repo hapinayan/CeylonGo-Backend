@@ -1,5 +1,6 @@
 from decimal import Decimal
 import hashlib
+import hmac
 import os
 
 
@@ -15,11 +16,42 @@ class PayHereService:
             "http://localhost:8000/api/v1/payments/payhere/notify",
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"PayHereService(mode={self.mode!r}, "
+            f"merchant_id={self.merchant_id!r}, "
+            "merchant_secret='***')"
+        )
+
     @property
     def checkout_url(self) -> str:
         if self.mode == "production":
             return "https://www.payhere.lk/pay/checkout"
         return "https://sandbox.payhere.lk/pay/checkout"
+
+    def validate_config(self) -> dict:
+        """
+        Validate PayHere configuration environment.
+        Identifies whether sandbox or production credentials are real vs mock/placeholder.
+        Never reveals the merchant_secret.
+        """
+        is_mock_id = (
+            not self.merchant_id
+            or self.merchant_id in ("TEST_MERCHANT_ID", "dummy_merchant", "sandbox_test")
+        )
+        is_mock_secret = (
+            not self.merchant_secret
+            or self.merchant_secret in ("TEST_MERCHANT_SECRET", "dummy_secret", "sandbox_secret")
+        )
+        is_mock = is_mock_id or is_mock_secret
+        return {
+            "mode": self.mode,
+            "merchant_id": self.merchant_id,
+            "is_production": self.mode == "production",
+            "is_sandbox": self.mode == "sandbox",
+            "is_mock_or_test": is_mock,
+            "has_credentials": bool(self.merchant_id and self.merchant_secret),
+        }
 
     def generate_checkout_hash(
         self,
@@ -45,15 +77,17 @@ class PayHereService:
         received_signature: str,
     ) -> bool:
         """
-        Verify incoming Instant Payment Notification (IPN) signature.
+        Verify incoming Instant Payment Notification (IPN) signature using constant-time comparison.
         Formula: strtoupper(md5(merchant_id + order_id + payhere_amount + payhere_currency + status_code + strtoupper(md5(merchant_secret))))
         """
+        if not received_signature:
+            return False
         secret_hash = hashlib.md5(self.merchant_secret.encode("utf-8")).hexdigest().upper()
         raw_string = (
             f"{self.merchant_id}{order_id}{payhere_amount}{payhere_currency}{status_code}{secret_hash}"
         )
         calculated_sig = hashlib.md5(raw_string.encode("utf-8")).hexdigest().upper()
-        return calculated_sig == received_signature.upper()
+        return hmac.compare_digest(calculated_sig, received_signature.upper())
 
 
 payhere_service = PayHereService()

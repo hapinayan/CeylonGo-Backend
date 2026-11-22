@@ -62,6 +62,12 @@ from app.services.payhere_bookings import capture_amount, checkout_response, loc
 from app.services.tour_guide_phase5 import (
     handle_tour_guide_advertising_payment_callback,
 )
+from app.services.activity_payments import (
+    get_activity_payment_status,
+    get_activity_provider_earnings_components,
+    handle_activity_payhere_callback,
+    prepare_activity_online_payment,
+)
 from app.services.tour_guide_payment import (
     get_tour_guide_online_earnings_components,
     handle_tour_guide_payhere_callback,
@@ -575,6 +581,27 @@ def initiate_tour_guide_booking_payment(
 
 
 # ==========================================
+# 1D. PAYHERE ONLINE PAYMENT INITIATION FOR ACTIVITIES (A09)
+# ==========================================
+
+@router.post(
+    "/activities/bookings/{booking_id}/initiate",
+    response_model=PaymentInitiateResponse,
+    summary="Initiate PayHere online payment for an activity booking (A09)",
+)
+def initiate_activity_booking_payment(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return prepare_activity_online_payment(
+        db=db,
+        booking_id=booking_id,
+        current_user=current_user,
+    )
+
+
+# ==========================================
 # 2. PAYHERE WEBHOOK / NOTIFICATION LISTENER
 # ==========================================
 
@@ -726,6 +753,12 @@ def handle_payhere_callback(form_data: dict, db: Session):
             )
         return handle_guide_callback(
             db, booking_ref, payment_id, payhere_amount, payhere_currency, status_code,
+        )
+    if booking_ref.module_type == "activity":
+        return handle_activity_payhere_callback(
+            db=db,
+            form_data=dict(form_data),
+            booking_ref=booking_ref,
         )
     if booking_ref.module_type != "homestay":
         raise HTTPException(400, "Unsupported booking reference module type")
@@ -1044,6 +1077,23 @@ def get_booking_payment_status(
         currency=booking.currency or "LKR",
         paid_at=tx.paid_at if tx else None,
         transaction_id=tx.id if tx else None,
+    )
+
+
+@router.get(
+    "/activities/bookings/{booking_id}/status",
+    response_model=PaymentStatusResponse,
+    summary="Get payment and transaction status for an activity booking (A09)",
+)
+def get_activity_booking_payment_status(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return get_activity_payment_status(
+        db=db,
+        booking_id=booking_id,
+        current_user=current_user,
     )
 
 
@@ -1470,6 +1520,23 @@ def calculate_provider_earnings_balances(
     commission_reversal += tg["commission_reversal"]
     provider_refund_reduction += tg["provider_refund_reduction"]
     paid_count += tg["paid_count"]
+
+    # Additive Activity online earnings contribution (excludes direct cash bookings)
+    act = get_activity_provider_earnings_components(
+        db,
+        provider_profile_id=provider_profile_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    total_gross += act["total_gross"]
+    completed_gross += act["completed_gross"]
+    completed_commission += act["completed_commission"]
+    completed_provider_payable += act["completed_provider_payable"]
+    pending_earnings += act["pending_earnings"]
+    verified_refunds += act["verified_refunds"]
+    commission_reversal += act["commission_reversal"]
+    provider_refund_reduction += act["provider_refund_reduction"]
+    paid_count += act["paid_count"]
 
     provider_net_earnings = max(
         Decimal("0.00"), completed_provider_payable - provider_refund_reduction

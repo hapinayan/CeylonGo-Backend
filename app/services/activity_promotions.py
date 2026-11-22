@@ -386,15 +386,6 @@ def get_provider_discount(
     Retrieve single discount detail owned by the authenticated provider (B15).
     Enforces strict tenant isolation.
     """
-    if payload.activity_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
-                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations."
-            ),
-        )
-
     discount = (
         db.query(PromotionPackage)
         .filter(
@@ -484,15 +475,6 @@ def deactivate_provider_discount(
     """
     Deactivate an existing provider discount offer (B15).
     """
-    if payload.activity_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
-                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations."
-            ),
-        )
-
     discount = (
         db.query(PromotionPackage)
         .filter(

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.publication import public_activity, public_eco
 from app.core.dependencies import get_current_user
+from app.core.listing_sync import sync_activity_booking_reference
 from app.database.connection import get_db
 
 from app.models.activity import Activity
@@ -16,12 +17,18 @@ from app.models.eco_experience import EcoExperience
 from app.models.activity_booking import ActivityBooking, ActivityBookingParticipant
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
+from app.models.shared import BookingReference, PaymentRefund, PaymentTransaction
 from app.models.user import User
 
 from app.schemas.activity_booking import (
     ActivityBookingCreate,
     ActivityBookingResponse,
     ActivityBookingCancellation,
+)
+from app.schemas.payment import PaymentInitiateResponse, PaymentStatusResponse
+from app.services.activity_payments import (
+    get_activity_payment_status,
+    prepare_activity_online_payment,
 )
 
 from app.services.activity_capacity import (
@@ -60,11 +67,10 @@ def create_activity_booking(
             detail="Only travelers can create activity bookings",
         )
 
-    # Online payment is not enabled yet.
-    if payload.payment_method != "pay_at_location":
+    if payload.payment_method not in ("pay_at_location", "online"):
         raise HTTPException(
             status_code=422,
-            detail="Only pay-at-location is currently supported",
+            detail="Invalid payment method. Allowed: 'pay_at_location', 'online'",
         )
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -213,7 +219,7 @@ def create_activity_booking(
             participants=payload.participants,
             total_price=total_price,
             currency=activity.currency,
-            payment_method="pay_at_location",
+            payment_method=payload.payment_method,
             payment_status="unpaid",
             booking_status="pending",
         )
@@ -234,6 +240,9 @@ def create_activity_booking(
                 )
                 db.add(participant_record)
             db.flush()
+
+        # Synchronize central booking reference for payment and audit tracking
+        sync_activity_booking_reference(db, booking, activity)
 
         provider = db.get(ProviderProfile, activity.provider_profile_id)
         record_native_event(
@@ -332,12 +341,20 @@ def cancel_activity_booking(
             detail="This booking cannot be cancelled",
         )
 
-    # Only unpaid pay-at-location bookings
-    # are eligible under the temporary policy.
-    if (
-        booking.payment_method != "pay_at_location"
-        or booking.payment_status != "unpaid"
-    ):
+    # Cancellation policy validation
+    if booking.payment_method == "pay_at_location":
+        if booking.payment_status != "unpaid":
+            raise HTTPException(
+                status_code=409,
+                detail="This booking requires a separate cancellation policy",
+            )
+    elif booking.payment_method == "online":
+        if booking.payment_status in ("refund_pending", "refunded"):
+            raise HTTPException(
+                status_code=409,
+                detail="Booking payment has already been refunded or is pending refund",
+            )
+    else:
         raise HTTPException(
             status_code=409,
             detail="This booking requires a separate cancellation policy",
@@ -369,6 +386,11 @@ def cancel_activity_booking(
         )
 
     try:
+        is_paid_online = (
+            booking.payment_method == "online" and booking.payment_status == "paid"
+        )
+        new_payment_status = "refund_pending" if is_paid_online else booking.payment_status
+
         # Conditional update prevents a booking
         # from being cancelled twice.
         statement = (
@@ -379,11 +401,13 @@ def cancel_activity_booking(
                 ActivityBooking.booking_status.in_(
                     ["pending", "confirmed"]
                 ),
-                ActivityBooking.payment_method == "pay_at_location",
-                ActivityBooking.payment_status == "unpaid",
+                ActivityBooking.payment_status.in_(
+                    ["unpaid", "pending", "paid", "failed"]
+                ),
             )
             .values(
                 booking_status="cancelled",
+                payment_status=new_payment_status,
                 cancellation_reason=payload.reason,
                 cancelled_at=now,
                 updated_at=now,
@@ -414,6 +438,41 @@ def cancel_activity_booking(
 
         activity = db.get(Activity, slot.activity_id)
         provider = db.get(ProviderProfile, activity.provider_profile_id)
+
+        # Synchronize BookingReference
+        ref = (
+            db.query(BookingReference)
+            .filter(
+                BookingReference.module_type == "activity",
+                BookingReference.target_booking_id == booking.id,
+            )
+            .first()
+        )
+        if ref:
+            ref.booking_status = "cancelled"
+            ref.payment_status = new_payment_status
+
+        # If booking was paid online, queue refund
+        if is_paid_online:
+            tx = (
+                db.query(PaymentTransaction)
+                .filter(
+                    PaymentTransaction.booking_reference_id == (ref.id if ref else 0),
+                    PaymentTransaction.user_id == booking.user_id,
+                )
+                .order_by(PaymentTransaction.id.desc())
+                .first()
+            )
+            if tx:
+                refund = PaymentRefund(
+                    payment_transaction_id=tx.id,
+                    amount=booking.total_price,
+                    currency=booking.currency or "LKR",
+                    refund_reason=f"Traveler cancellation: {payload.reason}",
+                    refund_status="pending",
+                )
+                db.add(refund)
+
         record_native_event(
             db, booking, "activity", provider.id, booking.booking_status,
             "cancelled", current_user.id, provider.user_id,
@@ -436,3 +495,41 @@ def cancel_activity_booking(
     except Exception:
         db.rollback()
         raise
+
+
+# ==========================================================
+# PAYHERE ONLINE PAYMENT ALIASES (A09)
+# ==========================================================
+
+@router.post(
+    "/{booking_id}/initiate-payment",
+    response_model=PaymentInitiateResponse,
+    summary="Initiate PayHere online payment for activity booking (A09)",
+)
+def initiate_activity_payment_alias(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return prepare_activity_online_payment(
+        db=db,
+        booking_id=booking_id,
+        current_user=current_user,
+    )
+
+
+@router.get(
+    "/{booking_id}/payment-status",
+    response_model=PaymentStatusResponse,
+    summary="Get PayHere payment status for activity booking (A09)",
+)
+def get_activity_payment_status_alias(
+    booking_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return get_activity_payment_status(
+        db=db,
+        booking_id=booking_id,
+        current_user=current_user,
+    )

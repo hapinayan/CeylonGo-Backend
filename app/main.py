@@ -117,6 +117,9 @@ from app.routers.provider_activities import (
     activity_uploads_router,
     router as provider_activities_router,
 )
+from app.routers.provider_activity_promotions import (
+    router as provider_activity_promotions_router,
+)
 from app.routers.admin_activities import (
     router as admin_activities_router,
 )
@@ -374,6 +377,7 @@ app.include_router(activities_public_router)
 app.include_router(activity_uploads_router)
 app.include_router(activity_reviews_router)
 app.include_router(activity_wishlists_router)
+app.include_router(provider_activity_promotions_router)
 app.include_router(provider_activities_router)
 app.include_router(admin_activities_router)
 app.include_router(admin_activity_bookings_router)

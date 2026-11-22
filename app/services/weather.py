@@ -79,10 +79,12 @@ def normalize_current(data: dict, coords: Coordinates, fetched: datetime):
 
 def normalize_interval(item: dict) -> ForecastInterval:
     probability = item.get("pop")
+    temperatures = item["main"]
+    temperature = temperatures["temp"]
     return ForecastInterval(
-        forecast_at=local_time(item["dt"]), temperature_c=item["main"]["temp"],
-        min_temperature_c=item["main"]["temp_min"],
-        max_temperature_c=item["main"]["temp_max"],
+        forecast_at=local_time(item["dt"]), temperature_c=temperature,
+        min_temperature_c=temperatures.get("temp_min", temperature),
+        max_temperature_c=temperatures.get("temp_max", temperature),
         rain_probability_percent=(
             None if probability is None else round(probability * 100, 2)
         ),

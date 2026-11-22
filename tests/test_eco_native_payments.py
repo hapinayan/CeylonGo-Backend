@@ -14,7 +14,9 @@ from app.models.eco_experience import EcoExperience, EcoSeasonRestriction
 from app.models.eco_reservation import (
     EcoAgeLimit, EcoAvailabilitySlot, EcoCancellationPolicy, EcoSlotClearance,
 )
-from app.models.shared import BookingReference, PaymentRefund, PaymentTransaction
+from app.models.shared import (
+    BookingReference, BookingStatusHistory, Notification, PaymentRefund, PaymentTransaction,
+)
 from app.schemas.eco_reservation import EcoRefundReconcile
 from app.services import eco_native_payments, eco_reservations
 from tests.test_eco_reservations import (
@@ -44,8 +46,10 @@ def checkout(client, booking):
     return client.post(f"{RESERVATIONS}/{booking['id']}/payments/initiate")
 
 
-@pytest.mark.parametrize("percent", [0, 35])
-def test_late_refund_uses_immutable_snapshot(eco_inventory, enabled, monkeypatch, percent):
+@pytest.mark.parametrize("percent,over_balance", [(0, False), (35, False), (35, True)])
+def test_late_refund_uses_immutable_snapshot(
+    eco_inventory, enabled, monkeypatch, percent, over_balance,
+):
     client, actor, engine, _ = eco_inventory
     monkeypatch.setenv("ECO_NATIVE_POLICY_SNAPSHOTS_ENABLED", "1")
     monkeypatch.setenv("ECO_NATIVE_REFUND_RECONCILIATION_ENABLED", "1")
@@ -65,6 +69,14 @@ def test_late_refund_uses_immutable_snapshot(eco_inventory, enabled, monkeypatch
         result = client.post(url)
         assert result.status_code == 200, result.text
         assert result.json()["payment_status"] == ("refund_pending" if percent else "no_refund_due")
+    if not percent:
+        actor["id"] = 4
+        report = f"{API}/admin/eco-reservations/report"
+        results = client.get(report, params={"payment_status": "no_refund_due"}).json()
+        assert results["total"] == 1
+        assert results["items"][0]["payment_status"] == "no_refund_due"
+        assert results["totals_by_currency"][0]["captured_online"] == booking["total"]
+        assert client.get(report, params={"payment_status": "paid"}).json()["total"] == 0
     with Session(engine) as db:
         assert db.get(EcoAvailabilitySlot, booking["slot_id"]).reserved_count == 0
         refunds = db.scalars(select(PaymentRefund)).all()
@@ -74,6 +86,13 @@ def test_late_refund_uses_immutable_snapshot(eco_inventory, enabled, monkeypatch
         assert len(refunds) == 1
         assert refunds[0].amount == Decimal("1260.00")
         refund_id = refunds[0].id
+        if over_balance:
+            db.add(PaymentRefund(
+                payment_transaction_id=refunds[0].payment_transaction_id,
+                amount=Decimal("2500.00"), currency="LKR", refund_status="completed",
+                refund_reason="Previously reconciled partial refund",
+            ))
+            db.commit()
     base = f"{API}/admin/eco-reservations/refunds/{refund_id}"
     actor["id"] = 4
     assert client.post(f"{base}/decision", json={"decision": "approved"}).status_code == 200
@@ -83,6 +102,11 @@ def test_late_refund_uses_immutable_snapshot(eco_inventory, enabled, monkeypatch
     evidence.update(state="succeeded", refund_reference="900123", amount="1.00")
     assert client.post(f"{base}/reconcile", json=evidence).status_code == 409
     evidence["amount"] = "1260.00"
+    if over_balance:
+        result = client.post(f"{base}/reconcile", json=evidence)
+        assert result.status_code == 409
+        assert result.json()["detail"] == "Cumulative refunds exceed the captured amount"
+        return
     for _ in range(2):
         assert client.post(f"{base}/reconcile", json=evidence).status_code == 200
     actor["id"] = 5
@@ -107,6 +131,110 @@ def test_weather_cascade_replays_without_releasing_twice(eco_inventory):
         assert db.get(EcoAvailabilitySlot, booking["slot_id"]).reserved_count == 0
 
 
+@pytest.mark.parametrize("online,already_closed", [(False, False), (True, False), (True, True)])
+def test_weather_restriction_closes_inventory_with_manual_paid_reservations(
+    eco_inventory, enabled, online, already_closed,
+):
+    client, actor, engine, day = eco_inventory
+    paid = confirm(eco_inventory)
+    if online:
+        assert checkout(client, paid).status_code == 200
+        assert callback(client, paid, "weather-capture").json()["status"] == "ok"
+        with Session(engine) as db:
+            capture = db.scalar(select(PaymentTransaction).where(
+                PaymentTransaction.gateway_transaction_id == "weather-capture",
+            ))
+            db.add(PaymentRefund(
+                payment_transaction_id=capture.id, amount=capture.amount,
+                currency=capture.currency, refund_reason="Existing refund review",
+                refund_status="pending",
+            ))
+            db.commit()
+    else:
+        assert action(client, actor, paid["id"], "cash").status_code == 200
+    actor["id"] = 13
+    unpaid = reservation(client, actor, paid["slot_id"], 1, traveler=13).json()
+    with Session(engine) as db:
+        if already_closed:
+            db.get(EcoAvailabilitySlot, paid["slot_id"]).is_open = False
+        restriction = EcoSeasonRestriction(
+            eco_experience_id=1, start_date=day, end_date=day,
+            restriction_type="weather_alert", reason="Offline exercise",
+        )
+        db.add(restriction)
+        db.commit()
+        restriction_id = restriction.id
+    actor["id"] = 4
+    url = f"{API}/admin/eco-experiences/1/restrictions/{restriction_id}/cancel-slots"
+    queue = f"{API}/admin/eco-reservations/report"
+    filters = {"weather_review_required": "true"}
+    assert client.get(queue, params=filters).json()["total"] == 0
+    assert client.post(url).json() == {
+        "slots_closed": int(not already_closed), "reservations_cancelled": 1,
+        "manual_reservation_ids": [paid["id"]],
+    }
+    assert client.post(url).json() == {
+        "slots_closed": 0, "reservations_cancelled": 0,
+        "manual_reservation_ids": [paid["id"]],
+    }
+    report = client.get(queue, params=filters).json()
+    assert report["total"] == 1
+    assert report["items"][0]["id"] == paid["id"]
+    actor["id"] = 13
+    assert client.get(queue, params=filters).status_code == 403
+    assert client.get(f"{RESERVATIONS}/{unpaid['id']}").json()["status"] == "cancelled"
+    actor["id"] = 5
+    detail = client.get(f"{RESERVATIONS}/{paid['id']}").json()
+    assert detail["status"] == "confirmed"
+    assert detail["payment_status"] == "paid"
+    with Session(engine) as db:
+        assert db.get(EcoAvailabilitySlot, paid["slot_id"]).reserved_count == 2
+        review = db.scalars(select(BookingStatusHistory).join(
+            BookingReference, BookingReference.id == BookingStatusHistory.booking_reference_id,
+        ).where(
+            BookingReference.booking_reference == paid["reference"],
+            BookingStatusHistory.notes.startswith(f"Eco restriction {restriction_id}: "),
+        )).one()
+        assert review.from_status == review.to_status == "confirmed"
+        users = db.scalars(select(Notification.user_id).where(
+            Notification.notification_type == "reservation_restriction_requires_manual_review",
+        )).all()
+        assert sorted(users) == [5, 12]
+
+
+def test_weather_restriction_rolls_back_if_notifications_fail(eco_inventory, monkeypatch):
+    client, actor, engine, day = eco_inventory
+    booking = confirm(eco_inventory)
+    with Session(engine) as db:
+        rule = EcoSeasonRestriction(
+            eco_experience_id=1, start_date=day, end_date=day,
+            restriction_type="weather_alert", reason="Offline rollback exercise",
+        )
+        db.add(rule)
+        db.commit()
+        rule_id = rule.id
+
+    original_notify = eco_native_payments.notify
+
+    def fail_after_notification(*args, **kwargs):
+        original_notify(*args, **kwargs)
+        raise RuntimeError("simulated notification failure")
+
+    actor["id"] = 4
+    path = f"{API}/admin/eco-experiences/1/restrictions/{rule_id}/cancel-slots"
+    with monkeypatch.context() as patch:
+        patch.setattr(eco_native_payments, "notify", fail_after_notification)
+        with pytest.raises(RuntimeError, match="simulated notification failure"):
+            client.post(path)
+    with Session(engine) as db:
+        inventory = db.get(EcoAvailabilitySlot, booking["slot_id"])
+        assert inventory.is_open and inventory.reserved_count == 2
+    actor["id"] = 5
+    assert client.get(f"{RESERVATIONS}/{booking['id']}").json()["status"] == "confirmed"
+    actor["id"] = 4
+    assert client.post(path).json() == {"slots_closed": 1, "reservations_cancelled": 1}
+
+
 def test_booking_needs_current_verified_slot_clearance_and_maximum_age(eco_inventory, monkeypatch):
     client, actor, engine, day = eco_inventory
     sid = slot(client, actor, day)["id"]
@@ -124,13 +252,89 @@ def test_booking_needs_current_verified_slot_clearance_and_maximum_age(eco_inven
                                     evidence_reference="synthetic", valid_until=end))
         db.commit()
     assert reservation(client, actor, sid, 1, participant_ages=[66]).status_code == 422
+    with Session(engine) as db:
+        permit = db.get(EcoSlotClearance, (sid, "permit"))
+        permit.valid_until = end - timedelta(seconds=1)
+        db.commit()
+    assert reservation(client, actor, sid, 1, participant_ages=[65]).status_code == 409
+    with Session(engine) as db:
+        permit = db.get(EcoSlotClearance, (sid, "permit"))
+        permit.valid_until = end
+        permit.revoked_at = eco_reservations.utc_now()
+        db.commit()
+    assert reservation(client, actor, sid, 1, participant_ages=[65]).status_code == 409
+    with Session(engine) as db:
+        permit = db.get(EcoSlotClearance, (sid, "permit"))
+        permit.revoked_at = None
+        permit.evidence_reference = " "
+        db.commit()
+    assert reservation(client, actor, sid, 1, participant_ages=[65]).status_code == 409
+    with Session(engine) as db:
+        db.get(EcoSlotClearance, (sid, "permit")).evidence_reference = "synthetic"
+        db.commit()
     assert reservation(client, actor, sid, 1, participant_ages=[65]).status_code == 201
 
 
+def test_admin_clearance_approval_and_revocation_gate_native_booking(
+    eco_inventory, enabled, monkeypatch,
+):
+    client, actor, engine, day = eco_inventory
+    sid = slot(client, actor, day)["id"]
+    with Session(engine) as db:
+        db.get(EcoExperience, 1).protected_area_permit_required = True
+        end = db.get(EcoAvailabilitySlot, sid).ends_at.replace(tzinfo=UTC)
+        db.commit()
+    root = f"{API}/admin/eco-experiences"
+    path = f"{root}/1/slots/{sid}/clearances/permit"
+    payload = {"evidence_reference": "Permit-123", "valid_until": end.isoformat()}
+    actor["id"] = 4
+    monkeypatch.delenv("ECO_NATIVE_SAFETY_RECORDS_ENABLED", raising=False)
+    assert client.put(path, json=payload).status_code == 503
+    monkeypatch.setenv("ECO_NATIVE_SAFETY_RECORDS_ENABLED", "1")
+    for user_id in (5, 12):
+        actor["id"] = user_id
+        assert client.put(path, json=payload).status_code == 403
+        assert client.post(f"{path}/revoke").status_code == 403
+    actor["id"] = 4
+    wrong_experience = f"{root}/2/slots/{sid}/clearances/permit"
+    assert client.put(wrong_experience, json=payload).status_code == 404
+    assert client.put(path, json={
+        **payload, "valid_until": (end - timedelta(seconds=1)).isoformat(),
+    }).status_code == 422
+    approved = client.put(path, json=payload)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["verified_by"] == 4
+    assert client.put(path, json=payload).json() == approved.json()
+    booked = reservation(client, actor, sid, 1)
+    assert booked.status_code == 201, booked.text
+    actor["id"] = 4
+    revoked = client.post(f"{path}/revoke").json()
+    assert revoked["revoked_at"] is not None
+    assert client.post(f"{path}/revoke").json() == revoked
+    assert reservation(client, actor, sid, 1, traveler=13).status_code == 409
+    assert action(client, actor, booked.json()["id"], "accept").status_code == 409
+    actor["id"] = 4
+    assert client.put(path, json=payload).status_code == 409
+    reapproval = {**payload, "expected_revoked_at": revoked["revoked_at"]}
+    reinstated = client.put(path, json=reapproval)
+    assert reinstated.status_code == 200
+    assert client.put(path, json=reapproval).json() == reinstated.json()
+    assert action(client, actor, booked.json()["id"], "accept").status_code == 200
+    actor["id"] = 5
+    assert checkout(client, booked.json()).status_code == 200
+    actor["id"] = 4
+    assert client.post(f"{path}/revoke").status_code == 200
+    assert callback(client, booked.json(), "capture-after-revocation").json()["status"] == (
+        "requires_reconciliation"
+    )
+    actor["id"] = 5
+    detail = client.get(f"{RESERVATIONS}/{booked.json()['id']}").json()
+    assert detail["payment_status"] == "unpaid"
+
+
 def test_parallel_capture_cancel_and_refund_replays(eco_inventory, enabled, monkeypatch, tmp_path):
-    client, _, source, _ = eco_inventory
+    _, _, source, _ = eco_inventory
     booking = confirm(eco_inventory)
-    assert checkout(client, booking).status_code == 200
     monkeypatch.setenv("ECO_NATIVE_REFUND_RECONCILIATION_ENABLED", "1")
     engine = create_engine(f"sqlite:///{tmp_path / 'eco-race.sqlite'}")
 
@@ -156,7 +360,7 @@ def test_parallel_capture_cancel_and_refund_replays(eco_inventory, enabled, monk
 
     monkeypatch.setattr(eco_reservations, "lock_schedule", lock_schedule)
     event.listen(Session, "after_transaction_end", release_lock)
-    traveler = SimpleNamespace(id=5)
+    traveler = SimpleNamespace(id=5, full_name="Offline Traveler", email="eco@example.test")
     admin = SimpleNamespace(id=4)
 
     def race(call):
@@ -172,7 +376,10 @@ def test_parallel_capture_cancel_and_refund_replays(eco_inventory, enabled, monk
             return first.result(timeout=15), second.result(timeout=15)
 
     try:
+        attempts = race(lambda db: eco_native_payments.checkout(db, traveler, booking["id"]))
+        assert {attempt.order_id for attempt in attempts} == {booking["reference"]}
         with Session(engine) as db:
+            assert len(db.scalars(select(PaymentTransaction)).all()) == 1
             reference = db.scalar(select(BookingReference.id).where(
                 BookingReference.booking_reference == booking["reference"]
             ))
@@ -206,9 +413,9 @@ def test_parallel_capture_cancel_and_refund_replays(eco_inventory, enabled, monk
 
 
 def callback(client, booking, payment_id, *, code="2", amount=None, currency=None,
-             corrupt_signature=False):
+             corrupt_signature=False, order=None):
     merchant = payhere_service.merchant_id
-    order = booking["reference"]
+    order = order or booking["reference"]
     amount = amount or booking["total"]
     currency = currency or booking["currency"]
     secret_hash = md5(payhere_service.merchant_secret.encode()).hexdigest().upper()
@@ -220,6 +427,56 @@ def callback(client, booking, payment_id, *, code="2", amount=None, currency=Non
         "payhere_amount": amount, "payhere_currency": currency, "status_code": code,
         "md5sig": "invalid" if corrupt_signature else signature,
     })
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_checkout_retry_is_separate_from_the_closed_order(
+    eco_inventory, enabled, monkeypatch, expired,
+):
+    client, _, _, _ = eco_inventory
+    booking = confirm(eco_inventory)
+    first = checkout(client, booking)
+    assert first.status_code == 200
+    if expired:
+        retry_at = eco_reservations.utc_now() + timedelta(minutes=31)
+        monkeypatch.setattr(eco_reservations, "utc_now", lambda: retry_at)
+    else:
+        assert callback(client, booking, "failed-first", code="-2").status_code == 200
+
+    retry = checkout(client, booking)
+    assert retry.status_code == 200
+    payload = retry.json()
+    order = payload["order_id"]
+    assert order != first.json()["order_id"]
+    assert payload["booking_reference"] == booking["reference"]
+    assert checkout(client, booking).json()["order_id"] == order
+    assert callback(client, booking, "invalid-retry", order=order,
+                    corrupt_signature=True).status_code == 400
+    for capture_id in ("late-first", "distinct-late-first"):
+        assert callback(client, booking, capture_id).json()["status"] == (
+            "requires_reconciliation"
+        )
+    status_path = f"{RESERVATIONS}/{booking['id']}/payments/status"
+    assert client.get(status_path).json()["payment_status"] == "pending"
+    assert callback(client, booking, "retry-paid", order=order).json()["status"] == "ok"
+    assert callback(client, booking, "retry-paid", order=order).json()["status"] == (
+        "already_processed"
+    )
+    assert client.get(status_path).json()["payment_status"] == "paid"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("merchant_id", " "),
+    ("merchant_secret", "test_merchant_secret"),
+    ("mode", "invalid"),
+])
+def test_checkout_rejects_invalid_merchant_configuration(
+    eco_inventory, enabled, monkeypatch, field, value,
+):
+    client, _, _, _ = eco_inventory
+    booking = confirm(eco_inventory)
+    monkeypatch.setattr(payhere_service, field, value)
+    assert checkout(client, booking).status_code == 503
 
 
 @pytest.mark.parametrize("decision", ["approved", "rejected"])

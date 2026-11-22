@@ -71,6 +71,18 @@ def test_verified_sponsorship_replay_expiry_and_durable_attribution(eco_inventor
         assert client.post(endpoint, json={"token": token}).status_code == 409
     assert reservation(client, actor, sid, 1, sponsored_tracking_token=token).status_code == 201
     assert reservation(client, actor, sid, 1, traveler=13, sponsored_tracking_token=token).status_code == 201
+    analytics = f"{root}/me/analytics"
+    assert client.get(analytics).status_code == 403
+    actor["id"] = 2
+    assert client.get(analytics).json()["attributed_bookings"] == 0
+    actor["id"] = 12
+    aggregate = client.get(analytics).json()
+    assert aggregate["attributed_bookings"] == 1
+    assert aggregate["campaigns"][0]["attributed_bookings"] == 1
+    assert client.get(f"{root}/me/campaigns/{cid}/analytics").json()["attributed_bookings"] == 1
+    assert client.get(analytics, params={"end_date": "2000-01-01"}).json()[
+        "attributed_bookings"
+    ] == 0
     with Session(engine) as db:
         assert db.scalar(select(func.count()).select_from(EcoPromotionAttribution)) == 1
         assert db.scalar(select(func.count()).select_from(EcoSponsorshipCapture)) == 2
@@ -78,7 +90,14 @@ def test_verified_sponsorship_replay_expiry_and_durable_attribution(eco_inventor
         campaign.ends_at = campaign.starts_at
         db.commit()
     assert not client.get(f"{API}/eco-experiences/1").json()["is_sponsored"]
+    assert client.get(f"{admin}/analytics").status_code == 403
     actor["id"] = 4
+    analytics = client.get(f"{admin}/analytics", params={"page_size": 1}).json()
+    assert analytics["attributed_bookings"] == 1
+    assert analytics["items"][0]["attributed_bookings"] == 1
+    assert client.get(f"{admin}/analytics", params={
+        "end_date": "2000-01-01",
+    }).json()["attributed_bookings"] == 0
     audit = client.get(f"{admin}/campaigns/{cid}/payments").json()
     assert {row["status"] for row in audit} == {"applied", "reconciliation_required"}
     for _ in range(2):
@@ -190,3 +209,15 @@ def test_schedule_moves_notify_only_affected_travelers_once_per_change(eco_inven
     assert [row.user_id for row in rows] == [5, 5]
     assert all(booking["reference"] in row.message for row in rows)
     assert len({row.message for row in rows}) == 2
+    inbox = f"{API}/notifications"
+    response = client.get(inbox, params={"unread_only": True})
+    assert response.status_code == 200, response.text
+    notices = response.json()["items"]
+    assert {notice["message"] for notice in notices if (
+        notice["notification_type"] == "reservation_slot_rescheduled"
+    )} == {row.message for row in rows}
+    assert any(notice["notification_type"] == "reservation_requested" for notice in notices)
+    actor["id"] = 13
+    assert all(booking["reference"] not in notice["message"] for notice in (
+        client.get(inbox).json()["items"]
+    ))

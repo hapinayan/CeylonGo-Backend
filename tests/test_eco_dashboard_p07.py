@@ -525,9 +525,10 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
         "deactivated", "published", "verified_badges", "pending_badges",
         "total_bookings", "pending_bookings", "confirmed_bookings",
         "completed_bookings", "cancelled_bookings", "rejected_bookings",
-        "total_revenue", "pending_cash_revenue", "refunded_amount",
+        "total_revenue", "pending_cash_revenue", "refunded_amount", "native_financials",
     }
     assert set(data_p.keys()) == allowed_p_keys
+    assert data_p.pop("native_financials") == []
     for k, v in data_p.items():
         if k in {"total_revenue", "pending_cash_revenue", "refunded_amount"}:
             assert isinstance(v, (int, float, str))
@@ -541,8 +542,10 @@ def test_private_information_exclusion(client: TestClient, db_session: Session):
         "total_listings", "published_listings", "verified_badges",
         "pending_badges", "total_active_providers", "by_status",
         "by_category", "by_district", "booking_metrics", "financial_metrics",
+        "native_financials",
     }
     assert set(data_a.keys()) == allowed_a_keys
+    assert data_a.pop("native_financials") == []
 
 
 def test_active_provider_filtering(client: TestClient, db_session: Session):

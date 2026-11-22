@@ -32,6 +32,15 @@ from typing import Any, Generator, Sequence
 
 logger = logging.getLogger("ceylongo_migrate")
 
+ALLOWED_INTEGRATION_TARGET_VERSIONS: frozenset[str] = frozenset({
+    "037",
+    "038",
+    "039",
+    "040",
+    "041",
+    "042",
+})
+
 
 # =============================================================================
 # Custom Exceptions
@@ -425,6 +434,7 @@ class DatabaseConfig:
         password = os.getenv("DB_PASSWORD") or None
         driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
         trust_cert = os.getenv("DB_TRUST_CERTIFICATE", "yes")
+        opt_in = os.getenv("RUN_SQLSERVER_INTEGRATION_TESTS") or None
 
         return cls(
             server=server,
@@ -434,6 +444,7 @@ class DatabaseConfig:
             driver=driver,
             trust_server_certificate=trust_cert,
             expected_server=server,
+            integration_opt_in=opt_in,
         )
 
     def build_connection_string(self) -> str:
@@ -981,16 +992,23 @@ def cmd_upgrade(
             verify_safe_integration_target,
         )
 
+        effective_opt_in = (
+            config.integration_opt_in
+            if config.integration_opt_in is not None
+            else os.getenv("RUN_SQLSERVER_INTEGRATION_TESTS")
+        )
         verify_safe_integration_target(
-            config.server, config.database, config.integration_opt_in
+            config.server, config.database, effective_opt_in
         )
         if (
             normalize_server_name(config.server) != ARTISAN_INTEGRATION_ALIAS.lower()
-            or config.user or config.password or target_version not in {"037", "038"}
+            or config.user
+            or config.password
+            or target_version not in ALLOWED_INTEGRATION_TARGET_VERSIONS
         ):
             raise DatabaseSafetyError(
-                "Artisan rehearsal requires the approved Windows-authenticated target "
-                "and a migration ceiling of 037 or 038."
+                "Integration rehearsal requires the approved Windows-authenticated target "
+                "and an explicitly approved migration ceiling (037-042)."
             )
 
     migrations = discover_migrations(migrations_dir)
@@ -1004,8 +1022,12 @@ def cmd_upgrade(
             if not isolated:
                 ensure_schema_migrations_table(conn)
             applied = get_applied_migrations(conn)
-            if isolated and not {f"{version:03d}" for version in range(1, 37)} <= applied.keys():
-                raise MigrationError("Artisan rehearsal requires a verified ledger through 036.")
+            min_verified = 38 if target_version in {"039", "040", "041", "042"} else 36
+            expected_set = {f"{v:03d}" for v in range(1, min_verified + 1)}
+            if isolated and not expected_set <= applied.keys():
+                raise MigrationError(
+                    f"Integration rehearsal requires a verified ledger through {min_verified:03d}."
+                )
 
             # 1. Verify unknown migrations in DB history and verify checksums
             discovered_map = {m.version: m for m in migrations}
@@ -1045,6 +1067,18 @@ def cmd_upgrade(
                 "012": ["dbo.artisan_listings"],
                 "013": ["dbo.showcase_items"],
                 "014": ["dbo.artisan_promotions"],
+                "041": [
+                    "dbo.eco_cancellation_policies",
+                    "dbo.eco_cancellation_snapshots",
+                    "dbo.eco_age_limits",
+                    "dbo.eco_slot_clearances",
+                    "dbo.eco_refund_reconciliations",
+                ],
+                "042": [
+                    "dbo.eco_sponsorship_captures",
+                    "dbo.eco_promotion_event_receipts",
+                    "dbo.eco_promotion_attributions",
+                ],
             }
             untracked_conflicts: list[str] = []
             for m in pending:

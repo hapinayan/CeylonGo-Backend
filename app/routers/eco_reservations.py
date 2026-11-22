@@ -16,11 +16,14 @@ from app.routers.provider_reservations import (
     Traveler,
 )
 from app.schemas.eco_reservation import (
+    EcoClearanceKind,
     EcoRefundDecision,
     EcoRefundReconcile,
     EcoRefundStatus,
     EcoReservationCreate,
     EcoReservationResponse,
+    EcoSlotClearanceApproval,
+    EcoSlotClearanceResponse,
     EcoSlotCreate,
     EcoSlotReschedule,
     EcoSlotResponse,
@@ -204,8 +207,37 @@ def cancel_restricted_eco_slots(
     restriction_id: BookingId,
     admin: Annotated[User, Depends(require_admin)],
     db: DB,
-) -> dict[str, int]:
+) -> dict[str, int | list[int]]:
     return payments.cancel_restricted_slots(db, admin, experience_id, restriction_id)
+
+
+@router.put(
+    "/admin/eco-experiences/{experience_id}/slots/{slot_id}/clearances/{kind}",
+    response_model=EcoSlotClearanceResponse,
+)
+def approve_slot_clearance(
+    experience_id: BookingId,
+    slot_id: BookingId,
+    kind: EcoClearanceKind,
+    payload: EcoSlotClearanceApproval,
+    admin: Annotated[User, Depends(require_admin)],
+    db: DB,
+):
+    return service.change_slot_clearance(db, admin.id, experience_id, slot_id, kind, payload)
+
+
+@router.post(
+    "/admin/eco-experiences/{experience_id}/slots/{slot_id}/clearances/{kind}/revoke",
+    response_model=EcoSlotClearanceResponse,
+)
+def revoke_slot_clearance(
+    experience_id: BookingId,
+    slot_id: BookingId,
+    kind: EcoClearanceKind,
+    admin: Annotated[User, Depends(require_admin)],
+    db: DB,
+):
+    return service.change_slot_clearance(db, admin.id, experience_id, slot_id, kind)
 
 
 @router.get("/admin/eco-reservations/report", response_model=EcoNativeAdminReport)
@@ -219,6 +251,7 @@ def report_native_eco_bookings(
     payment_status: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    weather_review_required: bool = False,
 ):
     if start_date and end_date and end_date < start_date:
         raise HTTPException(422, "End date must be on or after the start date")
@@ -226,6 +259,7 @@ def report_native_eco_bookings(
         provider_id=provider_id, status=booking_status, payment_status=payment_status,
         start=datetime.combine(start_date, time.min) if start_date else None,
         end=datetime.combine(end_date, time.max) if end_date else None,
+        weather_review_required=weather_review_required,
     )
     return {
         **reporting.page(db, query, page, page_size),

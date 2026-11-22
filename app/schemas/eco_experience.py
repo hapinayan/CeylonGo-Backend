@@ -917,6 +917,7 @@ class EcoProviderListingSummary(BaseModel):
     total_revenue: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
     pending_cash_revenue: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
     refunded_amount: Decimal = Field(default=Decimal("0.00"), ge=Decimal("0.00"))
+    native_financials: list["EcoNativeFinanceTotals"] = Field(default_factory=list)
 
 
 class EcoAdminStatusBreakdown(BaseModel):
@@ -1005,6 +1006,7 @@ class EcoAdminOverviewResponse(BaseModel):
     by_district: list[EcoAdminDistrictBreakdown]
     booking_metrics: EcoAdminBookingMetrics = Field(default_factory=EcoAdminBookingMetrics)
     financial_metrics: EcoAdminFinancialMetrics = Field(default_factory=EcoAdminFinancialMetrics)
+    native_financials: list["EcoNativeFinanceTotals"] = Field(default_factory=list)
 
 
 # ============================================================
@@ -1133,6 +1135,22 @@ class EcoNativeFinanceTotals(EcoNativeFinanceAmounts):
     currency: str
     bookings: int
     paid_bookings: int
+
+
+class EcoProviderBookingPayment(BaseModel):
+    booking_reference: str
+    payment_method: str
+    payment_status: str
+    currency: str
+    total_price: Decimal
+    finance: EcoNativeFinanceAmounts
+
+
+class EcoProviderBookingPayments(BaseModel):
+    items: list[EcoProviderBookingPayment]
+    total: int
+    page: int
+    page_size: int
 
 
 class EcoNativeRefundReportItem(BaseModel):

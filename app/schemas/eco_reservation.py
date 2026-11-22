@@ -5,6 +5,26 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
+EcoClearanceKind = Literal["permit", "guide"]
+
+
+class EcoSlotClearanceApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_reference: str = Field(max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    valid_until: AwareDatetime
+    expected_revoked_at: AwareDatetime | None = None
+
+
+class EcoSlotClearanceResponse(BaseModel):
+    slot_id: int
+    kind: EcoClearanceKind
+    verified_by: int
+    evidence_reference: str
+    valid_until: datetime
+    revoked_at: datetime | None
+
+
 class EcoSlotCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

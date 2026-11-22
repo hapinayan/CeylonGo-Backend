@@ -1031,6 +1031,20 @@ def track_campaign_click(
 # ==============================================================================
 
 
+def _attributed_booking_counts(db, campaign_ids, start_date, end_date):
+    if not campaign_ids or not eco_sponsorship.ledger_enabled():
+        return {}
+    attribution = EcoPromotionAttribution
+    query = select(attribution.promotion_id, func.count()).where(
+        attribution.promotion_id.in_(campaign_ids)
+    )
+    if start_date:
+        query = query.where(attribution.recorded_on >= start_date)
+    if end_date:
+        query = query.where(attribution.recorded_on <= end_date)
+    return dict(db.execute(query.group_by(attribution.promotion_id)).all())
+
+
 @eco_promotions_router.get(
     "/me/analytics",
     response_model=EcoPromotionProviderAnalyticsResponse,
@@ -1064,6 +1078,7 @@ def get_provider_promotions_analytics(
     )
 
     campaign_ids = [c.id for c in campaigns]
+    attributed = _attributed_booking_counts(db, campaign_ids, start_date, end_date)
     all_analytics_rows = []
     if campaign_ids:
         daily_query = db.query(EcoPromotionAnalytics).filter(
@@ -1120,6 +1135,7 @@ def get_provider_promotions_analytics(
                 is_currently_active=c.is_currently_active,
                 total_impressions=c_impr,
                 total_clicks=c_clicks,
+                attributed_bookings=attributed.get(c.id, 0),
                 ctr_percent=c_ctr,
             )
         )
@@ -1154,6 +1170,7 @@ def get_provider_promotions_analytics(
         active_campaigns_count=active_count,
         total_impressions=total_impressions,
         total_clicks=total_clicks,
+        attributed_bookings=sum(attributed.values()),
         average_ctr_percent=avg_ctr,
         start_date=start_date,
         end_date=end_date,
@@ -1235,17 +1252,7 @@ def get_single_campaign_analytics(
         for r in records
     ]
 
-    attributed_bookings = 0
-    if eco_sponsorship.ledger_enabled():
-        attribution = EcoPromotionAttribution
-        count = select(func.count()).select_from(attribution).where(
-            attribution.promotion_id == campaign.id
-        )
-        if start_date:
-            count = count.where(attribution.recorded_on >= start_date)
-        if end_date:
-            count = count.where(attribution.recorded_on <= end_date)
-        attributed_bookings = db.scalar(count)
+    attributed = _attributed_booking_counts(db, [campaign.id], start_date, end_date)
 
     return EcoPromotionCampaignAnalyticsResponse(
         campaign_id=campaign.id,
@@ -1265,7 +1272,7 @@ def get_single_campaign_analytics(
         start_date=start_date,
         end_date=end_date,
         daily_metrics=daily_metrics,
-        attributed_bookings=attributed_bookings,
+        attributed_bookings=attributed.get(campaign.id, 0),
     )
 
 
@@ -1529,6 +1536,7 @@ def get_admin_promotions_analytics(
 
     all_campaigns = base_q.all()
     all_c_ids = [c.id for c in all_campaigns]
+    attributed = _attributed_booking_counts(db, all_c_ids, start_date, end_date)
 
     tot_impr = 0
     tot_clicks = 0
@@ -1594,6 +1602,7 @@ def get_admin_promotions_analytics(
                 is_currently_active=c.is_currently_active,
                 total_impressions=c_impr,
                 total_clicks=c_clicks,
+                attributed_bookings=attributed.get(c.id, 0),
                 ctr_percent=c_ctr,
             )
         )
@@ -1602,6 +1611,7 @@ def get_admin_promotions_analytics(
         total_campaigns=total_campaigns,
         total_impressions=tot_impr,
         total_clicks=tot_clicks,
+        attributed_bookings=sum(attributed.values()),
         overall_ctr_percent=overall_ctr,
         start_date=start_date,
         end_date=end_date,

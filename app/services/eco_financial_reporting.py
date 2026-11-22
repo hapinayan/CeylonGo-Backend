@@ -10,7 +10,10 @@ from app.models.eco_reservation import (
     EcoAvailabilitySlot, EcoRefundReconciliation, EcoReservation,
 )
 from app.models.provider_profile import ProviderProfile
-from app.models.shared import BookingReference, PaymentRefund, PaymentTransaction, ProviderSettlement
+from app.models.shared import (
+    BookingReference, BookingStatusHistory, PaymentRefund, PaymentTransaction,
+    ProviderSettlement,
+)
 from app.services.eco_reservations import MODULE, online_attempt_exists, reservation_query
 
 ZERO = Decimal("0.00")
@@ -19,13 +22,17 @@ UNAPPLIED_CAPTURE_REASON = "Late or conflicting Eco capture"
 
 def scope(
     *, provider_id=None, status=None, payment_status=None, payment_method=None,
-    start=None, end=None,
+    start=None, end=None, weather_review_required=False,
 ):
     query = reservation_query(provider_id=provider_id, admin=provider_id is None)
     if status:
         query = query.where(EcoReservation.status == status)
     if payment_status:
-        query = query.where(BookingReference.payment_status == payment_status)
+        effective_payment_status = case(
+            (EcoReservation.payment_status == "no_refund_due", "no_refund_due"),
+            else_=BookingReference.payment_status,
+        )
+        query = query.where(effective_payment_status == payment_status)
     if payment_method:
         if payment_method == "online":
             query = query.where(online_attempt_exists(BookingReference.id))
@@ -37,6 +44,17 @@ def scope(
         query = query.where(EcoReservation.created_at >= start)
     if end:
         query = query.where(EcoReservation.created_at <= end)
+    if weather_review_required:
+        history = BookingStatusHistory
+        query = query.where(
+            EcoReservation.status.in_(("pending", "confirmed")),
+            EcoReservation.holds_capacity.is_(True),
+            select(history.id).where(
+                history.booking_reference_id == BookingReference.id,
+                history.from_status == history.to_status,
+                history.notes.startswith("Eco restriction "),
+            ).exists(),
+        )
     return query
 
 
@@ -179,12 +197,14 @@ def settlement_totals(db, provider_id=None):
     return list(db.execute(query).mappings())
 
 
-def page(db, query, page_number, page_size):
+def page(db, query, page_number, page_size, *, include_refund_states=True):
     count = db.scalar(select(func.count()).select_from(query.subquery()))
     rows = db.execute(query.order_by(
         EcoReservation.created_at.desc(), EcoReservation.id.desc(),
     ).offset((page_number - 1) * page_size).limit(page_size)).all()
-    entries = ledger(db, [ref.id for _, _, ref, _ in rows], include_states=True)
+    entries = ledger(
+        db, [ref.id for _, _, ref, _ in rows], include_states=include_refund_states,
+    )
     items = []
     for reservation, slot, ref, online in rows:
         amounts, refunds = entries.get(ref.id, (empty_amounts(), []))
@@ -192,7 +212,12 @@ def page(db, query, page_number, page_size):
             "id": reservation.id, "booking_reference": ref.booking_reference,
             "experience_id": slot.eco_experience_id, "provider_id": ref.provider_profile_id,
             "traveler_id": reservation.traveler_id, "status": reservation.status,
-            "payment_status": ref.payment_status, "currency": ref.currency,
+            "payment_status": (
+                reservation.payment_status
+                if reservation.payment_status == "no_refund_due"
+                else ref.payment_status
+            ),
+            "currency": ref.currency,
             "payment_method": "online" if online else "pay_at_location",
             "created_at": reservation.created_at, "cancelled_at": reservation.cancelled_at,
             "total_price": reservation.total_price, "finance": amounts, "refunds": refunds,

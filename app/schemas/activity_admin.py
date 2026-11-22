@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Annotated
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ActivityApprovalRequest(BaseModel):
@@ -339,3 +340,104 @@ class AdminActivityPlatformReportResponse(BaseModel):
     financial_overview: list[AdminActivityFinancialBreakdown] = []
     top_activities: list[AdminTopActivitySummary] = []
     top_providers: list[AdminTopProviderSummary] = []
+
+
+# ==============================================================================
+# Admin Promotion Management Schemas (C06)
+# ==============================================================================
+
+ADMIN_CAMPAIGN_VALID_ACTIONS = ("approve", "reject", "pause", "resume")
+
+# Allowed physical campaign statuses on SQL Server 2025 Express
+PHYSICAL_CAMPAIGN_STATUSES = (
+    "draft",
+    "pending_approval",
+    "active",
+    "paused",
+    "completed",
+    "cancelled",
+)
+
+# Eligible source statuses for each admin review action
+CAMPAIGN_ACTION_ELIGIBLE_STATUSES: dict[str, tuple[str, ...]] = {
+    "approve": ("pending_approval",),
+    "reject": ("pending_approval",),
+    "pause": ("active",),
+    "resume": ("paused",),
+}
+
+
+class AdminCampaignReviewRequest(BaseModel):
+    """
+    Reusable validation schema for administrative campaign moderation decisions (C06).
+    Prepared for future Phase 5D-4 write workflows.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Annotated[
+        str,
+        Field(description="Review decision action: approve, reject, pause, resume"),
+    ]
+    reason: Annotated[
+        str | None,
+        Field(
+            default=None,
+            max_length=500,
+            description="Mandatory reason when rejecting; optional notes for other actions",
+        ),
+    ] = None
+    notes: Annotated[
+        str | None,
+        Field(
+            default=None,
+            max_length=1000,
+            description="Optional internal administrator notes",
+        ),
+    ] = None
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if clean not in ADMIN_CAMPAIGN_VALID_ACTIONS:
+            raise ValueError(
+                f"Action '{clean}' is not supported. Must be one of: {', '.join(ADMIN_CAMPAIGN_VALID_ACTIONS)}"
+            )
+        return clean
+
+    @field_validator("reason")
+    @classmethod
+    def sanitize_reason(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        clean = v.strip()
+        return clean if clean else None
+
+    @field_validator("notes")
+    @classmethod
+    def sanitize_notes(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        clean = v.strip()
+        return clean if clean else None
+
+    @model_validator(mode="after")
+    def validate_rejection_reason(self) -> "AdminCampaignReviewRequest":
+        if self.action == "reject":
+            if not self.reason or len(self.reason) < 10:
+                raise ValueError("Rejection reason is mandatory and must contain at least 10 characters")
+        return self
+
+    def validate_status_eligibility(self, current_status: str) -> None:
+        """
+        Validate whether the campaign's current status permits the requested action.
+        Raises ValueError if status is ineligible.
+        """
+        eligible = CAMPAIGN_ACTION_ELIGIBLE_STATUSES.get(self.action, ())
+        normalized = current_status.strip().lower()
+        if normalized not in eligible:
+            raise ValueError(
+                f"Cannot execute '{self.action}' on campaign with status '{current_status}'. "
+                f"Eligible status(es): {', '.join(eligible)}"
+            )

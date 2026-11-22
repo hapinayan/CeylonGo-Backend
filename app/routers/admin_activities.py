@@ -21,6 +21,14 @@ from app.schemas.activity_admin import (
     ActivityUnsuspensionRequest,
     AdminActivityPlatformReportResponse,
 )
+from app.schemas.activity_promotion import (
+    ActivityCampaignPagination,
+    ActivityCampaignResponse,
+)
+from app.services.activity_promotions import (
+    get_admin_campaign,
+    list_admin_campaigns,
+)
 from app.services.activity_reports import generate_platform_activity_report
 
 
@@ -106,6 +114,67 @@ def get_platform_activity_reports(
         date_from=eff_from,
         date_to=eff_to,
     )
+
+
+# ==============================================================================
+# Admin Activity Promotions Management (C06 Foundation)
+# ==============================================================================
+
+
+@router.get(
+    "/promotions/campaigns",
+    response_model=ActivityCampaignPagination,
+    summary="List activity sponsored campaigns for admin review (C06)",
+)
+def list_activity_promotions_campaigns(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    status: str | None = Query(
+        default=None,
+        description="Filter by campaign status (draft, pending_approval, active, paused, completed, cancelled)",
+    ),
+    provider_profile_id: int | None = Query(
+        default=None,
+        ge=1,
+        description="Filter by provider profile ID",
+    ),
+    search: str | None = Query(
+        default=None,
+        max_length=150,
+        description="Search campaign name (case-insensitive substring)",
+    ),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
+):
+    """
+    Admin-only listing of activity sponsored campaigns across all providers (C06).
+    Enforces target_module = 'activity', admin authentication, and physical schema safety.
+    """
+    return list_admin_campaigns(
+        db,
+        status_filter=status,
+        provider_profile_id=provider_profile_id,
+        search=search,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/promotions/campaigns/{campaign_id}",
+    response_model=ActivityCampaignResponse,
+    summary="Get activity sponsored campaign details for admin review (C06)",
+)
+def get_activity_promotions_campaign(
+    campaign_id: int,
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Admin-only retrieval of a single activity sponsored campaign (C06).
+    Returns 404 for nonexistent or non-activity campaigns.
+    """
+    return get_admin_campaign(db, campaign_id=campaign_id)
 
 
 @router.get(

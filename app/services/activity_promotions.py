@@ -392,7 +392,6 @@ def get_provider_campaign(
 
     return _campaign_row_to_response(row)
 
-
 def update_provider_campaign(
     db: Session,
     profile: ProviderProfile,
@@ -535,3 +534,114 @@ def cancel_provider_campaign(
     db.commit()
 
     return get_provider_campaign(db, profile, campaign_id)
+
+
+# ==============================================================================
+# C06: Admin Promotion Management Service Functions (dbo.promotion_campaigns)
+# ==============================================================================
+
+VALID_CAMPAIGN_STATUS_FILTERS = {
+    "draft",
+    "pending_approval",
+    "active",
+    "paused",
+    "completed",
+    "cancelled",
+}
+
+
+def list_admin_campaigns(
+    db: Session,
+    status_filter: str | None = None,
+    provider_profile_id: int | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> ActivityCampaignPagination:
+    """
+    List activity sponsored campaigns across all providers for admin review (C06).
+    Enforces:
+    - Server-side target_module = 'activity' (cannot be overridden)
+    - Valid status filtering against physical schema values
+    - Provider profile ID filtering (must be >= 1)
+    - Case-insensitive search on campaign_name
+    - Stable deterministic ordering (created_at DESC, id DESC)
+    - Column-safe scalar projection of the 11 physical columns
+    """
+    if status_filter is not None:
+        clean_status = status_filter.strip().lower()
+        if clean_status not in VALID_CAMPAIGN_STATUS_FILTERS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"Invalid status filter '{status_filter}'. Allowed statuses: {', '.join(sorted(VALID_CAMPAIGN_STATUS_FILTERS))}",
+            )
+    else:
+        clean_status = None
+
+    if provider_profile_id is not None and provider_profile_id < 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="provider_profile_id must be a positive integer",
+        )
+
+    query = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(PromotionCampaign.target_module == "activity")
+    )
+
+    if clean_status:
+        query = query.filter(PromotionCampaign.status == clean_status)
+
+    if provider_profile_id is not None:
+        query = query.filter(PromotionCampaign.provider_profile_id == provider_profile_id)
+
+    if search is not None:
+        clean_search = search.strip()
+        if clean_search:
+            query = query.filter(PromotionCampaign.campaign_name.ilike(f"%{clean_search}%"))
+
+    total = query.count()
+    total_pages = math.ceil(total / page_size) if total > 0 else 0
+
+    rows = (
+        query.order_by(PromotionCampaign.created_at.desc(), PromotionCampaign.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return ActivityCampaignPagination(
+        items=[_campaign_row_to_response(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
+
+
+def get_admin_campaign(
+    db: Session,
+    campaign_id: int,
+) -> ActivityCampaignResponse:
+    """
+    Retrieve single activity sponsored campaign for admin review (C06).
+    Enforces:
+    - target_module = 'activity'
+    - 404 for non-existent or cross-module campaigns (prevents metadata leakage)
+    - Column-safe scalar projection of the 11 physical columns
+    """
+    row = (
+        db.query(*CAMPAIGN_PHYSICAL_COLUMNS)
+        .filter(
+            PromotionCampaign.id == campaign_id,
+            PromotionCampaign.target_module == "activity",
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Promotion campaign not found",
+        )
+
+    return _campaign_row_to_response(row)

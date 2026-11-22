@@ -39,7 +39,9 @@ from app.models.activity_booking import ActivityBooking
 from app.models.activity_image import ActivityImage
 from app.models.activity_slot import ActivitySlot
 from app.models.provider_profile import ProviderProfile
-from app.models.shared import ListingReference, Review
+from app.models.shared import ListingReference, ProviderSettlement, Review
+from app.schemas.payment import ProviderEarningsSummaryResponse, SettlementResponse
+from app.services.activity_payments import calculate_activity_provider_earnings_balances
 from app.schemas.activity import (
     ActivityActiveUpdate,
     ActivityCreate,
@@ -495,6 +497,84 @@ def get_provider_activity_analytics(
         capacity=capacity_overview,
         breakdown=breakdown,
     )
+
+
+# ==========================================================
+# PROVIDER EARNINGS & SETTLEMENTS (B14)
+# ==========================================================
+
+ALLOWED_SETTLEMENT_STATUSES = {"pending", "approved", "completed", "paid"}
+
+
+@router.get(
+    "/earnings",
+    response_model=ProviderEarningsSummaryResponse,
+    summary="Get server-calculated online booking earnings breakdown for activity provider (B14)",
+)
+def get_activity_provider_earnings(
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+    period_start: date | None = Query(
+        default=None,
+        description="Filter earnings for bookings starting on or after date",
+    ),
+    period_end: date | None = Query(
+        default=None,
+        description="Filter earnings for bookings starting on or before date",
+    ),
+):
+    if period_start and period_end and period_start > period_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="period_start cannot be after period_end",
+        )
+
+    balances = calculate_activity_provider_earnings_balances(
+        db=db,
+        provider_profile_id=profile.id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    return ProviderEarningsSummaryResponse.model_validate(balances)
+
+
+@router.get(
+    "/settlements",
+    response_model=list[SettlementResponse],
+    summary="List provider settlement records for activity provider (B14)",
+)
+def list_activity_provider_settlements(
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        description="Filter by settlement status: pending, approved, completed, paid",
+    ),
+    page: int = Query(default=1, ge=1, description="Page number (1-based)"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
+):
+    query = (
+        db.query(ProviderSettlement)
+        .filter(ProviderSettlement.provider_profile_id == profile.id)
+    )
+    if status_filter is not None:
+        cleaned_status = status_filter.strip().lower()
+        if cleaned_status not in ALLOWED_SETTLEMENT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"Invalid settlement status '{status_filter}'. Allowed: {', '.join(sorted(ALLOWED_SETTLEMENT_STATUSES))}",
+            )
+        query = query.filter(ProviderSettlement.settlement_status == cleaned_status)
+
+    offset = (page - 1) * page_size
+    settlements = (
+        query.order_by(ProviderSettlement.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+    return settlements
 
 
 @router.get(
@@ -1002,4 +1082,3 @@ def serve_activity_image(filename: str):
     ext = target_path.suffix.lower()
     media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
     return FileResponse(target_path, media_type=media_type)
-

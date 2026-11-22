@@ -43,6 +43,7 @@ from app.models.shared import (
     BookingStatusHistory,
     PaymentRefund,
     PaymentTransaction,
+    ProviderSettlement,
 )
 from app.models.user import User
 from app.schemas.payment import PaymentInitiateResponse, PaymentStatusResponse
@@ -729,10 +730,15 @@ def get_activity_provider_earnings_components(
         gross = tx.gross_amount or tx.amount or Decimal("0.00")
         total_gross += gross
 
+        rate = (
+            tx.commission_rate
+            if tx.commission_rate is not None
+            else PLATFORM_COMMISSION_RATE
+        )
         comm = (
             tx.commission_amount
             if tx.commission_amount is not None
-            else (gross * (PLATFORM_COMMISSION_RATE / Decimal("100"))).quantize(
+            else (gross * (rate / Decimal("100"))).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
         )
@@ -755,6 +761,7 @@ def get_activity_provider_earnings_components(
     commission_reversal = Decimal("0.00")
 
     if tx_ids:
+        tx_by_id = {tx.id: tx for tx, _, _ in rows}
         refund_rows = (
             db.query(PaymentRefund)
             .filter(
@@ -766,7 +773,13 @@ def get_activity_provider_earnings_components(
         )
         for r in refund_rows:
             verified_refunds += r.amount
-            comm_rev = (r.amount * (PLATFORM_COMMISSION_RATE / Decimal("100"))).quantize(
+            orig_tx = tx_by_id.get(r.payment_transaction_id)
+            orig_rate = (
+                orig_tx.commission_rate
+                if orig_tx and orig_tx.commission_rate is not None
+                else PLATFORM_COMMISSION_RATE
+            )
+            comm_rev = (r.amount * (orig_rate / Decimal("100"))).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
             prov_deduct = r.amount - comm_rev
@@ -784,3 +797,155 @@ def get_activity_provider_earnings_components(
         "provider_refund_reduction": provider_refund_reduction,
         "paid_count": paid_count,
     }
+
+
+def calculate_activity_provider_earnings_balances(
+    db: Session,
+    provider_profile_id: int,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> dict[str, Any]:
+    """
+    Calculate comprehensive earnings, commission, and available payout balances
+    for an activity provider (B14).
+    Uses persisted transaction and settlement records only.
+    """
+    comp = get_activity_provider_earnings_components(
+        db,
+        provider_profile_id=provider_profile_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+    completed_payable = comp["completed_provider_payable"]
+    refund_reduction = comp["provider_refund_reduction"]
+    provider_net_earnings = max(Decimal("0.00"), completed_payable - refund_reduction)
+
+    # Historical and reserved settlements
+    settlements = (
+        db.query(ProviderSettlement)
+        .filter(
+            ProviderSettlement.provider_profile_id == provider_profile_id,
+            ProviderSettlement.currency == "LKR",
+        )
+        .all()
+    )
+    total_settled = Decimal("0.00")
+    reserved_settlement = Decimal("0.00")
+
+    for s in settlements:
+        if s.settlement_status in ("completed", "paid"):
+            total_settled += s.net_payable
+        elif s.settlement_status in ("pending", "approved"):
+            reserved_settlement += s.net_payable
+
+    settlement_commitments = total_settled + reserved_settlement
+    settlement_deficit = settlement_commitments - (completed_payable - refund_reduction)
+    outstanding_liability = max(Decimal("0.00"), settlement_deficit)
+
+    available_settlement_balance = max(
+        Decimal("0.00"),
+        (completed_payable - refund_reduction) - settlement_commitments,
+    )
+
+    net_ceylongo_commission = max(
+        Decimal("0.00"), comp["completed_commission"] - comp["commission_reversal"]
+    )
+
+    return {
+        "total_gross_earnings": comp["total_gross"],
+        "completed_booking_earnings": comp["completed_gross"],
+        "ceylongo_commission": net_ceylongo_commission,
+        "commission_reversal": comp["commission_reversal"],
+        "verified_refunds": comp["verified_refunds"],
+        "provider_refund_reduction": refund_reduction,
+        "provider_net_earnings": provider_net_earnings,
+        "pending_earnings": comp["pending_earnings"],
+        "total_settled": total_settled,
+        "reserved_settlement": reserved_settlement,
+        "available_settlement_balance": available_settlement_balance,
+        "pending_settlement": available_settlement_balance,
+        "outstanding_liability": outstanding_liability,
+        "total_paid_bookings": comp["paid_count"],
+        "currency": "LKR",
+    }
+
+
+def validate_sri_lanka_bank_account(
+    bank_code: str,
+    branch_code: str,
+    account_number: str,
+    account_holder_name: str,
+) -> dict[str, Any]:
+    """
+    Validate Sri Lanka Interbank Payment System (SLIPS / CEFTS) bank account details.
+    Enforces format rules without storing raw credentials in unencrypted logs.
+    """
+    import re
+
+    cleaned_bank = (bank_code or "").strip()
+    cleaned_branch = (branch_code or "").strip()
+    cleaned_acc = (account_number or "").strip()
+    cleaned_name = (account_holder_name or "").strip()
+
+    errors: list[str] = []
+    if not re.fullmatch(r"\d{4}", cleaned_bank):
+        errors.append("bank_code must be a 4-digit numeric code")
+    if not re.fullmatch(r"\d{3}", cleaned_branch):
+        errors.append("branch_code must be a 3-digit numeric code")
+    if not re.fullmatch(r"\d{8,16}", cleaned_acc):
+        errors.append("account_number must be between 8 and 16 numeric digits")
+    if not re.fullmatch(r"[A-Za-z\s.]{2,100}", cleaned_name):
+        errors.append("account_holder_name must contain 2-100 alphabetic characters, spaces, and periods only")
+
+    is_valid = len(errors) == 0
+    masked_acc = (
+        f"{'*' * (len(cleaned_acc) - 4)}{cleaned_acc[-4:]}"
+        if len(cleaned_acc) >= 4
+        else "****"
+    )
+
+    return {
+        "is_valid": is_valid,
+        "bank_code": cleaned_bank,
+        "branch_code": cleaned_branch,
+        "account_number_masked": masked_acc,
+        "account_holder_name": cleaned_name,
+        "errors": errors,
+    }
+
+
+class MockActivityPayoutAdapter:
+    """
+    Mock payout adapter for offline simulation of bank payouts (B14).
+    Simulates disbursement without external banking rail connectivity.
+    """
+
+    def __init__(self, mode: str = "mock"):
+        self.mode = mode
+
+    def execute_payout(
+        self,
+        provider_profile_id: int,
+        amount: Decimal,
+        currency: str = "LKR",
+        payout_reference: str | None = None,
+    ) -> dict[str, Any]:
+        if amount <= Decimal("0.00"):
+            raise ValueError("Payout amount must be positive")
+        if currency != "LKR":
+            raise ValueError("Only LKR payouts are supported")
+
+        import uuid
+
+        ref = payout_reference or f"PAYOUT-MOCK-{uuid.uuid4().hex[:8].upper()}"
+        return {
+            "status": "simulated_success",
+            "provider_profile_id": provider_profile_id,
+            "amount": amount,
+            "currency": currency,
+            "payout_reference": ref,
+            "disbursed_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "mode": self.mode,
+            "is_live": False,
+        }

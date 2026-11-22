@@ -1780,10 +1780,10 @@ def create_provider_settlement(
             detail="period_end must be greater than or equal to period_start",
         )
 
-    if payload.net_payable > payload.gross_amount or payload.platform_fee < Decimal("0.00"):
+    if payload.net_payable <= Decimal("0.00") or payload.net_payable > payload.gross_amount or payload.platform_fee < Decimal("0.00"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Excessive settlement net_payable exceeds gross_amount or invalid platform fee",
+            detail="Excessive settlement net_payable exceeds gross_amount, net_payable must be positive, or invalid platform fee",
         )
 
     # 1. Prevent overlapping settlement periods for the provider

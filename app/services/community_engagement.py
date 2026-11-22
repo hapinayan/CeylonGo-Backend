@@ -225,6 +225,7 @@ def like_community_post(
                 message=f"{current_user.full_name} liked your Travel Community post.",
                 notification_type="community_post_like",
                 link_url=f"/community/posts/{post.id}",
+                deduplicate=False,
             )
 
         _commit(db)
@@ -497,6 +498,7 @@ def create_post_comment(
                     message=snippet,
                     notification_type="community_comment_reply",
                     link_url=link,
+                    deduplicate=False,
                 )
             # Also notify post author if distinct from commenter AND distinct from parent comment author
             if (
@@ -510,6 +512,7 @@ def create_post_comment(
                     message=snippet,
                     notification_type="community_post_comment",
                     link_url=link,
+                    deduplicate=False,
                 )
         else:
             # Top-level comment notifies post author (never self-notify)
@@ -521,6 +524,7 @@ def create_post_comment(
                     message=snippet,
                     notification_type="community_post_comment",
                     link_url=link,
+                    deduplicate=False,
                 )
 
         _commit(db)

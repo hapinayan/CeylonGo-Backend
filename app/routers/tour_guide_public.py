@@ -17,13 +17,13 @@ from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
-from app.routers.auth import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
+from app.routers.auth import get_current_user
 from app.schemas.tour_guide import (
     GuideCategoryInfo,
     PackagePricingType,

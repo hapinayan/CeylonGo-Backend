@@ -2,6 +2,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.eco_experience import EcoNativeFinanceTotals
+
 
 class PaymentInitiateResponse(BaseModel):
     booking_id: int
@@ -145,3 +147,4 @@ class AdminFinancialSummaryResponse(BaseModel):
     pending_settlement_payouts: Decimal
     total_advertising_revenue: Decimal
     currency: str = "LKR"
+    native_eco_financials: list[EcoNativeFinanceTotals] = Field(default_factory=list)

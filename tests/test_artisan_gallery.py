@@ -100,7 +100,9 @@ def client(db_session):
 
 
 def auth_header(user: User) -> dict[str, str]:
-    token = create_access_token(data={"sub": str(user.id)})
+    token = create_access_token(
+        data={"sub": str(user.id)}, credential_version=user.credential_version
+    )
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -502,6 +504,16 @@ def test_public_gallery_visibility_filtering(
     )
     assert res_owner.status_code == 200
     assert len(res_owner.json()) == 1
+
+    stale_headers = auth_header(user)
+    user.credential_version += 1
+    db_session.commit()
+    assert client.get(
+        f"/api/v1/artisan-listings/{pending_listing.id}/images", headers=stale_headers
+    ).status_code == 404
+    assert client.get(
+        f"/api/v1/artisan-listings/{pending_listing.id}/images", headers=auth_header(user)
+    ).status_code == 200
 
     # Admin approves listing
     admin_res = client.post(

@@ -353,6 +353,7 @@ class EcoPromotionDailyMetric(BaseModel):
 
 
 class EcoPromotionCampaignAnalyticsResponse(BaseModel):
+    attributed_bookings: int = 0
     """Detailed analytics response for a specific provider promotion campaign."""
     campaign_id: int
     eco_experience_id: int
@@ -382,6 +383,7 @@ class EcoPromotionCampaignSummaryAnalytics(BaseModel):
     is_currently_active: bool = False
     total_impressions: int = Field(ge=0)
     total_clicks: int = Field(ge=0)
+    attributed_bookings: int = Field(default=0, ge=0)
     ctr_percent: Decimal = Field(ge=Decimal("0.00"), decimal_places=2)
 
 
@@ -392,6 +394,7 @@ class EcoPromotionProviderAnalyticsResponse(BaseModel):
     active_campaigns_count: int = Field(ge=0)
     total_impressions: int = Field(ge=0)
     total_clicks: int = Field(ge=0)
+    attributed_bookings: int = Field(default=0, ge=0)
     average_ctr_percent: Decimal = Field(ge=Decimal("0.00"), decimal_places=2)
     start_date: date | None = None
     end_date: date | None = None
@@ -414,6 +417,7 @@ class EcoPromotionAdminAnalyticsItem(BaseModel):
     is_currently_active: bool = False
     total_impressions: int = Field(ge=0)
     total_clicks: int = Field(ge=0)
+    attributed_bookings: int = Field(default=0, ge=0)
     ctr_percent: Decimal = Field(ge=Decimal("0.00"), decimal_places=2)
 
 
@@ -422,6 +426,7 @@ class EcoPromotionAdminAnalyticsResponse(BaseModel):
     total_campaigns: int = Field(ge=0)
     total_impressions: int = Field(ge=0)
     total_clicks: int = Field(ge=0)
+    attributed_bookings: int = Field(default=0, ge=0)
     overall_ctr_percent: Decimal = Field(ge=Decimal("0.00"), decimal_places=2)
     start_date: date | None = None
     end_date: date | None = None

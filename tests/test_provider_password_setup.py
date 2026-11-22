@@ -8,10 +8,15 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.otp import generate_authorization_token, hash_authorization_token
 from app.core.rate_limiter import reset_all_limiters
-from app.core.security import hash_password
+from app.core.security import (
+    decode_access_token,
+    hash_password,
+    hash_reset_token,
+)
 from tests.access_tokens import create_fixture_access_token as create_access_token
 from app.database.connection import get_db
 from app.main import app
+from app.models.password_reset import PasswordReset
 from app.models.provider_profile import ProviderProfile
 from app.models.provider_registration_authorization import (
     ProviderRegistrationAuthorization,
@@ -568,3 +573,111 @@ def test_password_reset_cannot_activate_incomplete_provider(client: TestClient, 
     res = client.post("/api/v1/auth/forgot-password", json={"email": email})
     assert res.status_code == 200
     assert "If an account with that email exists" in res.json()["message"]
+
+
+@pytest.mark.parametrize("new_password", ["too-short", " " * 12])
+def test_approved_provider_recovery(client, db_session, monkeypatch, new_password):
+    user, _ = create_user_and_profile(
+        db_session, "recovery@example.com", is_active=True, password="Original password"
+    )
+    delivered = {}
+    login = {"email": user.email, "password": "Original password"}
+    initial_login = client.post("/api/v1/providers/login", json=login)
+    assert initial_login.status_code == 200
+    original_token = initial_login.json()["access_token"]
+    assert decode_access_token(original_token)["credential_version"] == 0
+
+    def send_email(**kwargs):
+        delivered.update(kwargs)
+        return True
+
+    monkeypatch.setattr("app.routers.auth.send_password_reset_email", send_email)
+    request = client.post("/api/v1/auth/forgot-password", json={"email": user.email})
+    assert request.status_code == 200
+    token = delivered["token"]
+    verification = client.get("/api/v1/auth/verify-reset-token", params={"token": token})
+    assert verification.status_code == 200
+
+    payload = {"token": token, "new_password": new_password}
+    response = client.post("/api/v1/auth/reset-password", json=payload)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "new_password"]
+
+    payload["new_password"] = "Replacement password"
+    assert client.post("/api/v1/auth/reset-password", json=payload).status_code == 200
+    assert client.post("/api/v1/auth/reset-password", json=payload).status_code == 400
+    assert client.get(
+        "/api/v1/providers/me", headers={"Authorization": f"Bearer {original_token}"}
+    ).status_code == 401
+    assert client.post("/api/v1/providers/login", json=login).status_code == 401
+    login["password"] = payload["new_password"]
+    fresh_login = client.post("/api/v1/providers/login", json=login)
+    assert fresh_login.status_code == 200
+    fresh_token = fresh_login.json()["access_token"]
+    assert decode_access_token(fresh_token)["credential_version"] == 1
+    assert client.get(
+        "/api/v1/providers/me", headers={"Authorization": f"Bearer {fresh_token}"}
+    ).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "password, approval_status", [(None, "approved"), ("Old password", "pending")]
+)
+def test_ineligible_provider_cannot_redeem_reset_token(
+    client, db_session, password, approval_status
+):
+    user, _ = create_user_and_profile(
+        db_session, "ineligible@example.com", is_active=True,
+        password=password, approval_status=approval_status,
+    )
+    old_hash = user.password_hash
+    token = "ineligible-provider-reset-test"
+    record = PasswordReset(
+        user_id=user.id, token_hash=hash_reset_token(token),
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5),
+    )
+    db_session.add(record)
+    db_session.commit()
+
+    response = client.post("/api/v1/auth/reset-password", json={
+        "token": token, "new_password": "Replacement password",
+    })
+    assert response.status_code == 400
+    db_session.refresh(record)
+    db_session.refresh(user)
+    assert record.is_used is False
+    assert user.password_hash == old_hash
+    assert user.credential_version == 0
+
+
+def test_provider_reset_rolls_back_claim_when_approval_changes(
+    client, db_session, monkeypatch
+):
+    user, profile = create_user_and_profile(
+        db_session, "approval-change@example.com", is_active=True,
+        password="Original password",
+    )
+    old_hash = user.password_hash
+    token = "approval-change-reset-test"
+    record = PasswordReset(
+        user_id=user.id, token_hash=hash_reset_token(token),
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5),
+    )
+    db_session.add(record)
+    db_session.commit()
+
+    def hash_after_approval_change(password):
+        profile.approval_status = "pending"
+        db_session.commit()
+        return hash_password(password)
+
+    monkeypatch.setattr("app.routers.auth.hash_password", hash_after_approval_change)
+    response = client.post("/api/v1/auth/reset-password", json={
+        "token": token, "new_password": "Replacement password",
+    })
+    assert response.status_code == 400
+    db_session.refresh(record)
+    db_session.refresh(user)
+    assert record.is_used is False and record.used_at is None
+    assert user.password_hash == old_hash
+    assert user.credential_version == 0

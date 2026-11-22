@@ -21,13 +21,13 @@ from PIL import Image, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_approved_provider
-from app.routers.auth import get_current_user
 from app.database.connection import get_db
 from app.models.artisan import ArtisanBusinessImage, ArtisanProductImage
 from app.models.artisan_listing import ArtisanListing
 from app.models.provider_profile import ProviderProfile
 from app.models.showcase_item import ShowcaseItem
 from app.models.user import User
+from app.routers.auth import get_current_user
 from app.schemas.artisan_image import (
     ArtisanBusinessImageResponse,
     ArtisanImageReorderRequest,

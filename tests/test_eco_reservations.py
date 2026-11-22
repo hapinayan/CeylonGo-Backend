@@ -94,6 +94,9 @@ def test_per_person_lifecycle_cash_history_and_access(eco_inventory, monkeypatch
     assert dashboard["bookings"]["upcoming"] == 1
     assert dashboard["cash_receipts"] == [{"currency": "LKR", "amount": "3600.00"}]
     assert dashboard["finance"] is None
+    summary = client.get(f"{API}/eco-experiences/me/summary").json()
+    assert summary["total_bookings"] == summary["confirmed_bookings"] == 1
+    assert summary["native_financials"][0]["cash_receipts"] == "3600.00"
     monkeypatch.setattr(
         eco_reservations,
         "utc_now",

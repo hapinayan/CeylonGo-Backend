@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Unicode, func, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Integer
+from sqlalchemy import Unicode, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -10,6 +11,11 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "credential_version >= 0", name="CK_users_credential_version_nonnegative"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
@@ -19,10 +25,16 @@ class User(Base):
 
     password_hash: Mapped[str | None] = mapped_column(Unicode(255), nullable=True)
 
+    credential_version: Mapped[int] = mapped_column(
+        BigInteger, server_default=text("0"), nullable=False
+    )
+
     role: Mapped[str] = mapped_column(Unicode(30), default="traveler", nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    auth_version: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
+    auth_version: Mapped[int] = mapped_column(
+        BigInteger, server_default=text("0"), nullable=False
+    )
 
     google_sub: Mapped[str | None] = mapped_column(
         Unicode(255), unique=True, nullable=True, index=True

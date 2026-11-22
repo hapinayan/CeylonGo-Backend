@@ -38,6 +38,10 @@ class ActivityDiscountCreate(BaseModel):
     valid_from: Annotated[date, Field(description="Start date of discount validity")]
     valid_to: Annotated[date, Field(description="End date of discount validity (inclusive)")]
     is_active: bool = True
+    activity_id: Annotated[
+        int | None,
+        Field(default=None, ge=1, description="Optional targeted activity ID (B15)"),
+    ] = None
 
     @field_validator("currency")
     @classmethod
@@ -75,6 +79,10 @@ class ActivityDiscountUpdate(BaseModel):
     valid_from: date | None = None
     valid_to: date | None = None
     is_active: bool | None = None
+    activity_id: Annotated[
+        int | None,
+        Field(default=None, ge=1, description="Optional targeted activity ID (B15)"),
+    ] = None
 
     @field_validator("currency")
     @classmethod
@@ -113,8 +121,56 @@ class ActivityDiscountResponse(BaseModel):
     valid_to: date
     is_active: bool
     created_at: datetime
+    activity_id: int | None = None
+    activity_title: str | None = None
+    original_price: Decimal | None = None
+    discounted_price: Decimal | None = None
     targeting_scope: str = "provider"
     activity_targeting_status: str = "BLOCKED_BY_SCHEMA"
+
+
+class ActivityDiscountPreviewRequest(BaseModel):
+    """Request payload to preview activity-specific discount pricing and eligibility (B15)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    activity_id: Annotated[int, Field(ge=1, description="Targeted activity ID")]
+    discount_percent: Annotated[
+        Decimal | None,
+        Field(default=None, ge=Decimal("0.00"), le=Decimal("100.00")),
+    ] = None
+    discount_amount: Annotated[
+        Decimal | None,
+        Field(default=None, ge=Decimal("0.00")),
+    ] = None
+    currency: Annotated[str, Field(default="LKR", min_length=3, max_length=3)] = "LKR"
+    valid_from: date
+    valid_to: date
+
+
+class ActivityDiscountPreviewResponse(BaseModel):
+    """Preview calculation of activity-specific discount pricing and eligibility (B15)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: int
+    activity_title: str
+    original_price: Decimal
+    discount_percent: Decimal | None = None
+    discount_amount: Decimal | None = None
+    discounted_price: Decimal
+    currency: str
+    valid_from: date
+    valid_to: date
+    is_eligible: bool
+    ineligibility_reason: str | None = None
+    targeting_scope: str = "activity"
+    activity_targeting_status: str = "PREVIEW_ONLY_MIGRATION_PENDING"
+    is_simulation: bool = True
+    simulation_notice: str = (
+        "Calculated pricing is a non-persistent preview simulation. "
+        "Persistent activity-specific targeting is pending Migration 041."
+    )
 
 
 class ActivityDiscountPagination(BaseModel):
@@ -160,6 +216,10 @@ class ActivityCampaignCreate(BaseModel):
             description="True to submit directly as pending_approval; False to save as draft",
         ),
     ] = True
+    activity_id: Annotated[
+        int | None,
+        Field(default=None, ge=1, description="Optional targeted activity ID (B16)"),
+    ] = None
 
     @field_validator("currency")
     @classmethod
@@ -194,6 +254,10 @@ class ActivityCampaignUpdate(BaseModel):
             default=None,
             description="Provider may only transition from 'draft' to 'pending_approval'",
         ),
+    ] = None
+    activity_id: Annotated[
+        int | None,
+        Field(default=None, ge=1, description="Optional targeted activity ID (B16)"),
     ] = None
 
     @field_validator("currency")
@@ -233,8 +297,48 @@ class ActivityCampaignResponse(BaseModel):
     starts_at: datetime
     ends_at: datetime
     created_at: datetime
+    activity_id: int | None = None
+    activity_title: str | None = None
     targeting_scope: str = "provider"
     activity_targeting_status: str = "BLOCKED_BY_SCHEMA"
+
+
+class ActivityCampaignPreviewRequest(BaseModel):
+    """Request payload to preview activity sponsored campaign performance and reach (B16)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    activity_id: Annotated[int, Field(ge=1, description="Targeted activity ID")]
+    budget: Annotated[Decimal, Field(gt=Decimal("0.00"), description="Total promotion budget")]
+    currency: Annotated[str, Field(default="LKR", min_length=3, max_length=3)] = "LKR"
+    starts_at: datetime
+    ends_at: datetime
+
+
+class ActivityCampaignPreviewResponse(BaseModel):
+    """Preview simulation of activity sponsored campaign reach and budget burn rate (B16)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: int
+    activity_title: str
+    budget: Decimal
+    currency: str
+    duration_days: float
+    daily_budget: Decimal
+    estimated_impressions: int
+    estimated_clicks: int
+    starts_at: datetime
+    ends_at: datetime
+    is_eligible: bool
+    ineligibility_reason: str | None = None
+    targeting_scope: str = "activity"
+    activity_targeting_status: str = "PREVIEW_ONLY_MIGRATION_PENDING"
+    is_simulation: bool = True
+    simulation_notice: str = (
+        "Campaign reach and click projections are simulated estimates based on budget and algorithmic averages, "
+        "not guaranteed delivery outcomes. Persistent activity-specific targeting is pending Migration 030/041."
+    )
 
 
 class ActivityCampaignPagination(BaseModel):

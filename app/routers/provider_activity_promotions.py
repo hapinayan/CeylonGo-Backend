@@ -20,10 +20,14 @@ from app.schemas.activity_promotion import (
     ActivityCampaignAnalyticsSummary,
     ActivityCampaignCreate,
     ActivityCampaignPagination,
+    ActivityCampaignPreviewRequest,
+    ActivityCampaignPreviewResponse,
     ActivityCampaignResponse,
     ActivityCampaignUpdate,
     ActivityDiscountCreate,
     ActivityDiscountPagination,
+    ActivityDiscountPreviewRequest,
+    ActivityDiscountPreviewResponse,
     ActivityDiscountResponse,
     ActivityDiscountUpdate,
     ActivityProviderPromotionsAnalytics,
@@ -34,11 +38,15 @@ from app.services.activity_promotions import (
     create_provider_discount,
     deactivate_provider_discount,
     get_activity_campaign_analytics,
+    get_activity_campaigns_preview,
+    get_activity_discounts_preview,
     get_provider_activities_promotions_analytics,
     get_provider_campaign,
     get_provider_discount,
     list_provider_campaigns,
     list_provider_discounts,
+    preview_activity_campaign,
+    preview_activity_discount,
     update_provider_campaign,
     update_provider_discount,
 )
@@ -94,6 +102,39 @@ def list_discount_offers(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post(
+    "/discounts/preview",
+    response_model=ActivityDiscountPreviewResponse,
+    summary="Preview activity-specific discount offer (B15)",
+)
+def preview_discount_offer(
+    payload: ActivityDiscountPreviewRequest,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Preview pricing calculation, boundaries, and eligibility for an activity discount offer (B15).
+    Enforces cross-tenant authorization and nonnegative price bounds.
+    """
+    return preview_activity_discount(db, profile, payload)
+
+
+@router.get(
+    "/activities/{activity_id}/discounts",
+    response_model=list[ActivityDiscountPreviewResponse],
+    summary="List active discount previews for a specific activity (B15)",
+)
+def list_activity_discount_previews(
+    activity_id: int,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    List active discount offers applicable to the provider's activity with calculated preview pricing (B15).
+    """
+    return get_activity_discounts_preview(db, profile, activity_id)
 
 
 @router.get(
@@ -194,6 +235,38 @@ def list_sponsored_campaigns(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post(
+    "/promotions/campaigns/preview",
+    response_model=ActivityCampaignPreviewResponse,
+    summary="Preview activity sponsored campaign reach and budget (B16)",
+)
+def preview_campaign_application(
+    payload: ActivityCampaignPreviewRequest,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    Preview duration, daily budget, estimated impressions, and eligibility for an activity campaign (B16).
+    """
+    return preview_activity_campaign(db, profile, payload)
+
+
+@router.get(
+    "/activities/{activity_id}/promotions/campaigns",
+    response_model=list[ActivityCampaignResponse],
+    summary="List sponsored campaigns targeting a specific activity (B16)",
+)
+def list_activity_campaign_previews(
+    activity_id: int,
+    profile: Annotated[ProviderProfile, Depends(require_activity_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """
+    List sponsored campaigns owned by the provider targeting the specified activity (B16).
+    """
+    return get_activity_campaigns_preview(db, profile, activity_id)
 
 
 @router.get(

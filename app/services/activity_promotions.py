@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import case, func, insert, update
 from sqlalchemy.orm import Session
 
+from app.models.activity import Activity
 from app.models.provider_profile import ProviderProfile
 from app.models.shared import AdminAuditLog, PromotionCampaign, PromotionEvent, PromotionPackage
 from app.schemas.activity_admin import AdminCampaignReviewRequest
@@ -25,10 +26,14 @@ from app.schemas.activity_promotion import (
     ActivityCampaignAnalyticsSummary,
     ActivityCampaignCreate,
     ActivityCampaignPagination,
+    ActivityCampaignPreviewRequest,
+    ActivityCampaignPreviewResponse,
     ActivityCampaignResponse,
     ActivityCampaignUpdate,
     ActivityDiscountCreate,
     ActivityDiscountPagination,
+    ActivityDiscountPreviewRequest,
+    ActivityDiscountPreviewResponse,
     ActivityDiscountResponse,
     ActivityDiscountUpdate,
     ActivityPromotionEventResponse,
@@ -79,6 +84,153 @@ def _campaign_row_to_response(row: Any) -> ActivityCampaignResponse:
 # ==============================================================================
 
 
+def validate_activity_discount_eligibility(
+    db: Session,
+    profile: ProviderProfile,
+    activity_id: int,
+    discount_percent: Decimal | None,
+    discount_amount: Decimal | None,
+    valid_from: date,
+    valid_to: date,
+) -> tuple[Activity, Decimal]:
+    """
+    Validates provider ownership, activity status, discount bounds, nonnegative pricing,
+    and date ranges for activity-specific discount offers (B15).
+    """
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if activity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity not found",
+        )
+
+    # Cross-tenant isolation check
+    if activity.provider_profile_id != profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Activity does not belong to this provider",
+        )
+
+    # Activity status check
+    if activity.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Activity is not eligible for promotions. Status is '{activity.approval_status}', must be 'approved'",
+        )
+
+    if not activity.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Activity is inactive and not eligible for promotions",
+        )
+
+    # Date validation
+    if valid_to < valid_from:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="valid_to cannot be earlier than valid_from",
+        )
+
+    today = date.today()
+    if valid_to < today:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Discount validity window cannot be in the past",
+        )
+
+    # Discount bounds and nonnegative pricing validation
+    has_percent = discount_percent is not None and discount_percent > Decimal("0.00")
+    has_amount = discount_amount is not None and discount_amount > Decimal("0.00")
+    if not has_percent and not has_amount:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="At least one of discount_percent or discount_amount must be greater than 0",
+        )
+
+    if has_percent:
+        if discount_percent > Decimal("100.00"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Discount percentage cannot exceed 100%",
+            )
+        discount_factor = Decimal("1.00") - (discount_percent / Decimal("100.00"))
+        discounted_price = (activity.price * discount_factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    else:
+        if discount_amount > activity.price:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"Fixed discount amount ({discount_amount}) cannot exceed activity price ({activity.price})",
+            )
+        discounted_price = (activity.price - discount_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # Ensure nonnegative pricing rule
+    discounted_price = max(Decimal("0.00"), discounted_price)
+
+    return activity, discounted_price
+
+
+def check_conflicting_discounts(
+    db: Session,
+    profile_id: int,
+    title: str,
+    valid_from: date,
+    valid_to: date,
+    exclude_discount_id: int | None = None,
+) -> None:
+    """Checks for duplicate or conflicting active discount offers for the provider."""
+    query = db.query(PromotionPackage).filter(
+        PromotionPackage.provider_profile_id == profile_id,
+        PromotionPackage.is_active == True,
+        PromotionPackage.title == title.strip(),
+        PromotionPackage.valid_from <= valid_to,
+        PromotionPackage.valid_to >= valid_from,
+    )
+    if exclude_discount_id is not None:
+        query = query.filter(PromotionPackage.id != exclude_discount_id)
+
+    if query.first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"An active discount offer with the title '{title.strip()}' already overlaps the specified date window",
+        )
+
+
+def preview_activity_discount(
+    db: Session,
+    profile: ProviderProfile,
+    payload: ActivityDiscountPreviewRequest,
+) -> ActivityDiscountPreviewResponse:
+    """
+    Computes a real-time preview of activity-specific discount pricing and eligibility (B15).
+    Enforces cross-tenant isolation and nonnegative price boundaries.
+    """
+    activity, discounted_price = validate_activity_discount_eligibility(
+        db=db,
+        profile=profile,
+        activity_id=payload.activity_id,
+        discount_percent=payload.discount_percent,
+        discount_amount=payload.discount_amount,
+        valid_from=payload.valid_from,
+        valid_to=payload.valid_to,
+    )
+
+    return ActivityDiscountPreviewResponse(
+        activity_id=activity.id,
+        activity_title=activity.title,
+        original_price=activity.price,
+        discount_percent=payload.discount_percent,
+        discount_amount=payload.discount_amount,
+        discounted_price=discounted_price,
+        currency=payload.currency,
+        valid_from=payload.valid_from,
+        valid_to=payload.valid_to,
+        is_eligible=True,
+        ineligibility_reason=None,
+        targeting_scope="activity",
+        activity_targeting_status="PREVIEW_ONLY_MIGRATION_PENDING",
+    )
+
+
 def create_provider_discount(
     db: Session,
     profile: ProviderProfile,
@@ -86,14 +238,35 @@ def create_provider_discount(
 ) -> ActivityDiscountResponse:
     """
     Create a new provider discount offer (B15).
-    Persists to dbo.promotion_packages at provider scope.
+    If activity_id is provided, validates eligibility first, then rejects persistence
+    with a clear migration-pending error so activity_id is NEVER falsely saved or silently discarded.
     """
+    if payload.activity_id is not None:
+        # Validate activity eligibility and ownership first so invalid IDs/unowned activities fail with 404/403/422
+        validate_activity_discount_eligibility(
+            db=db,
+            profile=profile,
+            activity_id=payload.activity_id,
+            discount_percent=payload.discount_percent,
+            discount_amount=payload.discount_amount,
+            valid_from=payload.valid_from,
+            valid_to=payload.valid_to,
+        )
+        # Fail closed on persistent persistence request: dbo.promotion_packages lacks activity_id column
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
+                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations, "
+                "or omit activity_id to create a provider-wide discount offer."
+            ),
+        )
+
     if payload.valid_to < payload.valid_from:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="valid_to cannot be earlier than valid_from",
         )
-
     has_percent = payload.discount_percent is not None and payload.discount_percent > Decimal("0.00")
     has_amount = payload.discount_amount is not None and payload.discount_amount > Decimal("0.00")
     if not has_percent and not has_amount:
@@ -101,6 +274,14 @@ def create_provider_discount(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="At least one of discount_percent or discount_amount must be greater than 0",
         )
+
+    check_conflicting_discounts(
+        db=db,
+        profile_id=profile.id,
+        title=payload.title,
+        valid_from=payload.valid_from,
+        valid_to=payload.valid_to,
+    )
 
     discount = PromotionPackage(
         provider_profile_id=profile.id,
@@ -117,7 +298,46 @@ def create_provider_discount(
     db.commit()
     db.refresh(discount)
 
-    return ActivityDiscountResponse.model_validate(discount)
+    return ActivityDiscountResponse(
+        id=discount.id,
+        provider_profile_id=discount.provider_profile_id,
+        title=discount.title,
+        description=discount.description,
+        discount_percent=discount.discount_percent,
+        discount_amount=discount.discount_amount,
+        currency=discount.currency,
+        valid_from=discount.valid_from,
+        valid_to=discount.valid_to,
+        is_active=discount.is_active,
+        created_at=discount.created_at,
+        activity_id=None,
+        activity_title=None,
+        original_price=None,
+        discounted_price=None,
+        targeting_scope="provider",
+        activity_targeting_status="BLOCKED_BY_SCHEMA",
+    )
+
+
+def get_activity_discounts_preview(
+    db: Session,
+    profile: ProviderProfile,
+    activity_id: int,
+) -> list[ActivityDiscountPreviewResponse]:
+    """
+    Returns active discount offers available to the provider for the specified activity (B15).
+    Enforces ownership and returns empty list because physical activity-level targeting is pending Migration 041.
+    Never incorrectly returns provider-wide promotions as though they are uniquely linked to the activity.
+    """
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if activity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Activity not found")
+    if activity.provider_profile_id != profile.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access forbidden: Activity does not belong to this provider")
+
+    # Physical table dbo.promotion_packages lacks activity_id column;
+    # We do NOT falsely return provider-wide discounts as if they were linked to this activity.
+    return []
 
 
 def list_provider_discounts(
@@ -166,6 +386,15 @@ def get_provider_discount(
     Retrieve single discount detail owned by the authenticated provider (B15).
     Enforces strict tenant isolation.
     """
+    if payload.activity_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
+                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations."
+            ),
+        )
+
     discount = (
         db.query(PromotionPackage)
         .filter(
@@ -193,6 +422,15 @@ def update_provider_discount(
     Update an existing provider discount package (B15).
     Validates date ranges and discount bounds.
     """
+    if payload.activity_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
+                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations."
+            ),
+        )
+
     discount = (
         db.query(PromotionPackage)
         .filter(
@@ -246,6 +484,15 @@ def deactivate_provider_discount(
     """
     Deactivate an existing provider discount offer (B15).
     """
+    if payload.activity_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific discount targeting is unavailable until Migration 041 is applied. "
+                "Use POST /api/v1/provider/activities/discounts/preview for non-persistent pricing simulations."
+            ),
+        )
+
     discount = (
         db.query(PromotionPackage)
         .filter(
@@ -272,6 +519,137 @@ def deactivate_provider_discount(
 # ==============================================================================
 
 
+def validate_activity_campaign_eligibility(
+    db: Session,
+    profile: ProviderProfile,
+    activity_id: int,
+    budget: Decimal,
+    starts_at: datetime,
+    ends_at: datetime,
+) -> tuple[Activity, float, Decimal, int, int]:
+    """
+    Validates provider ownership, activity status, budget thresholds, and scheduling bounds
+    for activity-specific sponsored campaigns (B16).
+    """
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if activity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Activity not found",
+        )
+
+    if activity.provider_profile_id != profile.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Activity does not belong to this provider",
+        )
+
+    if activity.approval_status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Activity is not eligible for sponsored campaigns. Status is '{activity.approval_status}', must be 'approved'",
+        )
+
+    if not activity.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Activity is inactive and not eligible for sponsored campaigns",
+        )
+
+    if budget <= Decimal("0.00"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Budget must be greater than zero",
+        )
+
+    if budget < Decimal("500.00"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Campaign budget must be at least LKR 500.00 for viable distribution",
+        )
+
+    now = _now_utc()
+    ends_at_utc = ends_at if ends_at.tzinfo else ends_at.replace(tzinfo=timezone.utc)
+    starts_at_utc = starts_at if starts_at.tzinfo else starts_at.replace(tzinfo=timezone.utc)
+
+    if ends_at_utc <= starts_at_utc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Campaign ends_at must be strictly after starts_at",
+        )
+
+    if ends_at_utc <= now:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Campaign ends_at must be in the future",
+        )
+
+    duration_secs = (ends_at_utc - starts_at_utc).total_seconds()
+    duration_days = max(1.0, round(duration_secs / 86400.0, 2))
+    daily_budget = (budget / Decimal(str(duration_days))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    estimated_impressions = int(budget * Decimal("10"))
+    estimated_clicks = int(estimated_impressions * Decimal("0.03"))
+
+    return activity, duration_days, daily_budget, estimated_impressions, estimated_clicks
+
+
+def preview_activity_campaign(
+    db: Session,
+    profile: ProviderProfile,
+    payload: ActivityCampaignPreviewRequest,
+) -> ActivityCampaignPreviewResponse:
+    """
+    Computes a preview simulation of activity sponsored campaign reach and burn rate (B16).
+    Enforces cross-tenant isolation and schedule validation.
+    """
+    activity, duration_days, daily_budget, est_imp, est_clicks = validate_activity_campaign_eligibility(
+        db=db,
+        profile=profile,
+        activity_id=payload.activity_id,
+        budget=payload.budget,
+        starts_at=payload.starts_at,
+        ends_at=payload.ends_at,
+    )
+
+    return ActivityCampaignPreviewResponse(
+        activity_id=activity.id,
+        activity_title=activity.title,
+        budget=payload.budget,
+        currency=payload.currency,
+        duration_days=duration_days,
+        daily_budget=daily_budget,
+        estimated_impressions=est_imp,
+        estimated_clicks=est_clicks,
+        starts_at=payload.starts_at,
+        ends_at=payload.ends_at,
+        is_eligible=True,
+        ineligibility_reason=None,
+        targeting_scope="activity",
+        activity_targeting_status="PREVIEW_ONLY_MIGRATION_PENDING",
+    )
+
+
+def get_activity_campaigns_preview(
+    db: Session,
+    profile: ProviderProfile,
+    activity_id: int,
+) -> list[ActivityCampaignResponse]:
+    """
+    Returns campaigns associated with the provider for the specified activity (B16).
+    Enforces ownership and returns empty list because physical listing-level targeting is pending Migration 030/041.
+    Never incorrectly returns provider-wide campaigns as though they are uniquely linked to the activity.
+    """
+    activity = db.query(Activity).filter(Activity.id == activity_id).first()
+    if activity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Activity not found")
+    if activity.provider_profile_id != profile.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access forbidden: Activity does not belong to this provider")
+
+    # Physical table dbo.promotion_campaigns lacks listing_reference_id column;
+    # We do NOT falsely return provider-wide campaigns as if they were linked to this activity.
+    return []
+
+
 def create_provider_campaign(
     db: Session,
     profile: ProviderProfile,
@@ -281,8 +659,30 @@ def create_provider_campaign(
     Submit a sponsored campaign application for activities (B16).
     Enforces target_module = 'activity', physical column compatibility,
     no self-approval, and valid scheduling bounds.
+    If activity_id is provided, validates eligibility first, then rejects persistence
+    with a clear migration-pending error so activity_id is NEVER falsely saved or silently discarded.
     """
     now = _now_utc()
+    if payload.activity_id is not None:
+        # Validate eligibility and ownership first so invalid IDs or unowned activities fail with 404/403/422
+        validate_activity_campaign_eligibility(
+            db=db,
+            profile=profile,
+            activity_id=payload.activity_id,
+            budget=payload.budget,
+            starts_at=payload.starts_at,
+            ends_at=payload.ends_at,
+        )
+        # Fail closed on persistent persistence request: dbo.promotion_campaigns lacks listing_reference_id
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific campaign targeting is unavailable until Migration 030/041 is applied. "
+                "Use POST /api/v1/provider/activities/promotions/campaigns/preview for non-persistent reach simulations, "
+                "or omit activity_id to create a provider-wide sponsored campaign."
+            ),
+        )
+
     ends_at_utc = payload.ends_at if payload.ends_at.tzinfo else payload.ends_at.replace(tzinfo=timezone.utc)
     starts_at_utc = payload.starts_at if payload.starts_at.tzinfo else payload.starts_at.replace(tzinfo=timezone.utc)
 
@@ -428,6 +828,15 @@ def update_provider_campaign(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Only draft campaigns can be modified. Current status: {row.status}",
+        )
+
+    if payload.activity_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Persistent activity-specific campaign targeting is unavailable until Migration 030/041 is applied. "
+                "Use POST /api/v1/provider/activities/promotions/campaigns/preview for non-persistent reach simulations."
+            ),
         )
 
     values_to_update: dict[str, Any] = {}

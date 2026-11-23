@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import true
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
@@ -34,7 +35,7 @@ def get_rental_locations(
     Returns active rental hubs across Sri Lanka with GPS coordinates (latitude, longitude)
     for map rendering. Optionally filterable by district.
     """
-    query = db.query(RentalLocation)
+    query = db.query(RentalLocation).filter(RentalLocation.is_active == true())
 
     if district and district.strip():
         query = query.filter(

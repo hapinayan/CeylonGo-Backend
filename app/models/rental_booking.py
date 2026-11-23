@@ -2,6 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -26,6 +27,10 @@ class RentalBooking(Base):
         CheckConstraint(
             "total_price >= 0",
             name="CK_rental_booking_price",
+        ),
+        CheckConstraint(
+            "passenger_count IS NULL OR passenger_count > 0",
+            name="CK_rental_bookings_passenger_count",
         ),
     )
 
@@ -73,6 +78,8 @@ class RentalBooking(Base):
     payment_method: Mapped[str] = mapped_column(Unicode(30), default="pay_at_location", nullable=False)
     payment_status: Mapped[str] = mapped_column(Unicode(30), default="unpaid", nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    passenger_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    self_drive_agreement_accepted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     cancellation_reason: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
     cancelled_by: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -35,7 +35,7 @@ from app.models.rental import (
     RentalVehicleImage,
     RentalAvailabilityBlock,
 )
-from app.models.shared import PromotionCampaign
+from app.models.shared import AdvertisingPayment, PromotionCampaign
 from app.database.connection import get_db
 from app.routers.auth import get_current_user
 from app.routers.rental_vehicles import router as rental_vehicles_router
@@ -365,6 +365,32 @@ def test_search_by_date_availability_excludes_booked_and_blocked(test_app_and_cl
     assert 6 not in avail_ids
 
 
+def test_combined_filters_use_inclusive_price_and_half_open_availability(test_app_and_client):
+    client, db = test_app_and_client
+    seed_test_fleet(db)
+    pickup = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=3)
+    vehicle = db.get(RentalVehicle, 1)
+    booking = RentalBooking(
+        vehicle_id=vehicle.id, user_id=3, pickup_at=pickup - timedelta(days=1),
+        return_at=pickup, total_price=vehicle.price_per_day, status="in_progress",
+    )
+    db.add(booking)
+    db.commit()
+    query = {
+        "district": vehicle.district, "city": vehicle.city, "vehicle_type": vehicle.vehicle_type,
+        "min_price": str(vehicle.price_per_day), "max_price": str(vehicle.price_per_day),
+        "pickup_at": pickup.isoformat(), "return_at": (pickup + timedelta(hours=2)).isoformat(),
+    }
+    response = client.get("/api/v1/rental-vehicles", params=query)
+    assert response.status_code == 200, response.text
+    assert [item["id"] for item in response.json()["items"]] == [vehicle.id]
+    booking.return_at = pickup + timedelta(seconds=1)
+    db.commit()
+    response = client.get("/api/v1/rental-vehicles", params=query)
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
 def test_search_date_availability_invalid_range_rejected(test_app_and_client):
     client, db = test_app_and_client
     seed_test_fleet(db)
@@ -488,6 +514,11 @@ def test_get_rental_locations_public_and_district_filter(test_app_and_client):
     client, db = test_app_and_client
     seed_test_fleet(db)
 
+    db.add(RentalLocation(
+        provider_id=1, location_name="Inactive Galle hub", district="Galle", city="Galle", is_active=False,
+    ))
+    db.commit()
+
     # All active locations
     resp = client.get("/api/v1/rental-locations")
     assert resp.status_code == 200
@@ -508,7 +539,14 @@ def test_get_vehicle_locations(test_app_and_client):
     client, db = test_app_and_client
     seed_test_fleet(db)
 
-    # Provider 1 has hubs in Galle and Mirissa
+    # The primary hub stays first even when the second hub sorts before it.
+    secondary = db.get(RentalLocation, 2)
+    secondary.location_name = "A secondary hub"
+    secondary.latitude = secondary.longitude = None
+    db.add(RentalLocation(
+        provider_id=1, location_name="Inactive Galle hub", district="Galle", city="Galle", is_active=False,
+    ))
+    db.commit()
     resp = client.get("/api/v1/rental-vehicles/1/locations")
     assert resp.status_code == 200
     locs = resp.json()
@@ -516,6 +554,22 @@ def test_get_vehicle_locations(test_app_and_client):
     # Primary vehicle location (Galle Fort Hub) is first
     assert locs[0]["id"] == 1
     assert locs[0]["location_name"] == "Galle Fort Hub"
+    assert locs[0]["latitude"] == "6.032800"
+    assert locs[0]["longitude"] == "80.217000"
+    assert locs[1]["id"] == 2
+    assert locs[1]["latitude"] is None
+    assert locs[1]["longitude"] is None
+
+
+def test_vehicle_locations_exclude_foreign_historical_primary(test_app_and_client):
+    client, db = test_app_and_client
+    seed_test_fleet(db)
+    db.get(RentalVehicle, 1).location_id = 3
+    db.commit()
+
+    response = client.get("/api/v1/rental-vehicles/1/locations")
+    assert response.status_code == 200
+    assert [hub["id"] for hub in response.json()] == [1, 2]
 
 
 # ==============================================================================
@@ -600,6 +654,29 @@ def test_calculate_quote_fallback_to_vehicle_price_per_day(test_app_and_client):
     # 3 * 6500 = 19500.00 LKR
     assert float(quote["total_price"]) == 19500.0
     assert float(quote["security_deposit"]) == 15000.0  # tuk-tuk standard deposit
+
+
+@pytest.mark.parametrize(("pickup_at", "return_at", "expected_status"), [
+    ("2090-12-05T03:30:00", "2090-12-06T09:00:00+05:30", 200),
+    ("2090-12-05T09:00:00+05:30", "2090-12-06T03:30:00", 200),
+    ("2090-12-05T03:30:00", "2090-12-05T09:00:00+05:30", 422),
+    ("2090-12-05T09:00:00+05:30", "2090-12-05T03:29:59", 422),
+])
+def test_calculate_quote_mixed_datetime_offsets(test_app_and_client, pickup_at, return_at, expected_status):
+    client, db = test_app_and_client
+    seed_test_fleet(db)
+
+    response = client.post(
+        "/api/v1/rental-vehicles/1/calculate-quote",
+        json={"pickup_at": pickup_at, "return_at": return_at},
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 200:
+        quote = response.json()
+        assert quote["duration_hours"] == 24
+        assert Decimal(quote["total_price"]) == Decimal(quote["rate"])
+    else:
+        assert "Return date must be strictly after pickup date" in response.text
 
 
 def test_calculate_quote_invalid_dates_rejected(test_app_and_client):
@@ -694,6 +771,16 @@ def test_sponsored_vehicle_boosted_to_top_of_discovery(test_app_and_client):
     db.add(camp)
     db.commit()
 
+    before_payment = client.get("/api/v1/rental-vehicles")
+    assert before_payment.status_code == 200
+    assert not any(item["is_sponsored"] for item in before_payment.json()["items"])
+    db.add(AdvertisingPayment(
+        campaign_id=camp.id, provider_profile_id=camp.provider_profile_id,
+        order_reference="AD-RENTAL-KANDY", gateway_transaction_id="KANDY-PAID",
+        amount=camp.budget, currency=camp.currency, payment_status="completed", verified_at=now,
+    ))
+    db.commit()
+
     resp = client.get("/api/v1/rental-vehicles")
     assert resp.status_code == 200
     items = resp.json()["items"]
@@ -706,6 +793,29 @@ def test_sponsored_vehicle_boosted_to_top_of_discovery(test_app_and_client):
     other_items = [i for i in items if i["id"] != 6]
     for i in other_items:
         assert i["is_sponsored"] is False
+
+    for campaign_status, starts_at, ends_at in (
+        ("rejected", now - timedelta(days=1), now + timedelta(days=1)),
+        ("approved", now - timedelta(days=1), now + timedelta(days=1)),
+        ("active", now - timedelta(days=2), now - timedelta(days=1)),
+        ("active", now + timedelta(days=1), now + timedelta(days=2)),
+    ):
+        camp.status, camp.starts_at, camp.ends_at = campaign_status, starts_at, ends_at
+        db.commit()
+        response = client.get("/api/v1/rental-vehicles")
+        assert response.status_code == 200
+        assert not any(item["is_sponsored"] for item in response.json()["items"])
+
+
+@pytest.mark.parametrize("query", [
+    "pickup_at=2090-01-01T10%3A00%3A00Z",
+    "return_at=2090-01-02T10%3A00%3A00Z",
+    "min_price=9000&max_price=7000",
+])
+def test_discovery_rejects_incomplete_or_inverted_filters(test_app_and_client, query):
+    client, _ = test_app_and_client
+    response = client.get(f"/api/v1/rental-vehicles?{query}")
+    assert response.status_code == 400
 
 
 def test_verified_only_provider_filter(test_app_and_client):

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -17,6 +17,20 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.user import Base, User
+
+
+class RentalAgeRule(Base):
+    __tablename__ = "rental_age_rules"
+
+    __table_args__ = (
+        CheckConstraint("vehicle_type IN ('bike', 'bicycle', 'tuk_tuk')",
+                        name="CK_rental_age_rules_vehicle_type"),
+        CheckConstraint("minimum_age BETWEEN 0 AND 120", name="CK_rental_age_rules_minimum_age"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vehicle_type: Mapped[str] = mapped_column(Unicode(20), nullable=False, unique=True)
+    minimum_age: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class RentalLocation(Base):
@@ -125,6 +139,11 @@ class RentalVehicleDocument(Base):
             "deductible_amount IS NULL OR deductible_amount >= 0",
             name="CK_rental_vehicle_docs_deductible",
         ),
+        CheckConstraint(
+            "insurance_effective_date IS NULL OR "
+            "(expiry_date IS NOT NULL AND insurance_effective_date <= expiry_date)",
+            name="CK_rental_vehicle_docs_insurance_dates",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -142,6 +161,8 @@ class RentalVehicleDocument(Base):
     deductible_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     insurance_provider: Mapped[str | None] = mapped_column(Unicode(150), nullable=True)
     insurance_policy_number: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    insurance_effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    insurance_exclusions: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.sysutcdatetime(), nullable=False
@@ -178,6 +199,14 @@ class RentalAvailabilityBlock(Base):
     )
 
     vehicle: Mapped["RentalVehicle"] = relationship("RentalVehicle", back_populates="availability_blocks")
+
+    @property
+    def start_date(self) -> date:
+        return self.start_datetime.date()
+
+    @property
+    def end_date(self) -> date:
+        return (self.end_datetime - timedelta(microseconds=1)).date()
 
 
 class RentalEligibilityCheck(Base):

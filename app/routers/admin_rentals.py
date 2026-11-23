@@ -11,15 +11,18 @@ from decimal import Decimal
 import math
 import mimetypes
 import os
+from pathlib import Path, PureWindowsPath
+from stat import S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
 from app.core.audit import sanitize_audit_details
+from app.core.booking_transactions import CAPTURED, RENTAL_BOOKING_REFERENCE_TYPES, lock_booking_resource
 from app.core.dependencies import (
     require_admin,
     require_finance_admin,
@@ -33,6 +36,7 @@ from app.core.dependencies import (
 from app.core.notification_service import create_notification
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import (
+    RentalAgeRule,
     RentalConditionEvidence,
     RentalDeposit,
     RentalIncident,
@@ -46,6 +50,7 @@ from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
     AdminAuditLog,
+    AdvertisingPayment,
     BookingReference,
     BookingStatusHistory,
     ListingReference,
@@ -57,7 +62,15 @@ from app.models.shared import (
     ProviderSettlement,
 )
 from app.models.user import User
+from app.schemas.rental_vehicle import VehicleType
+from app.services.rental_eligibility import rental_minimum_age
+from app.services.rental_promotions import (
+    has_eligible_rental_inventory,
+    verified_rental_promotion_payment,
+)
 from app.schemas.admin_rentals import (
+    RentalAgeRuleResponse,
+    RentalAgeRuleUpdate,
     AdminBookingStatusHistoryItem,
     AdminDocumentVerifyRequest,
     AdminDocumentVerifyResponse,
@@ -144,6 +157,51 @@ def log_admin_audit(
 # ==============================================================================
 # AD-02: RENTAL VEHICLE LISTING APPROVAL & MODERATION
 # ==============================================================================
+
+@router.get(
+    "/policies/minimum-age/{vehicle_type}",
+    response_model=RentalAgeRuleResponse,
+    dependencies=[Depends(require_operations_admin)],
+)
+def get_rental_age_rule(vehicle_type: VehicleType, db: Annotated[Session, Depends(get_db)]):
+    minimum_age, requires_dob = rental_minimum_age(db, vehicle_type)
+    return RentalAgeRuleResponse(
+        vehicle_type=vehicle_type, minimum_age=minimum_age,
+        requires_verified_dob=requires_dob,
+    )
+
+
+@router.put("/policies/minimum-age/{vehicle_type}", response_model=RentalAgeRuleResponse)
+def update_rental_age_rule(
+    vehicle_type: VehicleType,
+    payload: RentalAgeRuleUpdate,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    admin_user: Annotated[User, Depends(require_operations_admin)],
+):
+    lock_booking_resource(db, f"rental_age_rule_{vehicle_type}")
+    previous_age, previously_required_dob = rental_minimum_age(db, vehicle_type)
+    rule = db.query(RentalAgeRule).filter_by(vehicle_type=vehicle_type).one_or_none()
+    if rule is None:
+        rule = RentalAgeRule(vehicle_type=vehicle_type, minimum_age=payload.minimum_age)
+        db.add(rule)
+    else:
+        rule.minimum_age = payload.minimum_age
+    db.flush()
+    requires_dob = payload.minimum_age > 0
+    log_admin_audit(
+        db, admin_user.id, "update_rental_minimum_age", "rental_age_rules",
+        entity_id=rule.id,
+        details=(f"{vehicle_type}: {previous_age} to {payload.minimum_age}; "
+                 f"verified DOB required: {previously_required_dob} to {requires_dob}"),
+        ip_address=request.client.host if request.client else None,
+    )
+    db.commit()
+    return RentalAgeRuleResponse(
+        vehicle_type=vehicle_type, minimum_age=payload.minimum_age,
+        requires_verified_dob=requires_dob,
+    )
+
 
 @router.get(
     "/vehicles",
@@ -644,6 +702,11 @@ def list_pending_vehicle_documents(
             document_number=doc.document_number,
             file_reference=doc.file_reference,
             expiry_date=doc.expiry_date,
+            insurance_effective_date=doc.insurance_effective_date,
+            insurance_exclusions=doc.insurance_exclusions,
+            coverage_amount=doc.coverage_amount,
+            deductible_amount=doc.deductible_amount,
+            insurance_provider=doc.insurance_provider,
             is_verified=doc.is_verified,
             created_at=doc.created_at,
         )
@@ -698,6 +761,11 @@ def list_vehicle_documents(
             document_number=d.document_number,
             file_reference=d.file_reference,
             expiry_date=d.expiry_date,
+            insurance_effective_date=d.insurance_effective_date,
+            insurance_exclusions=d.insurance_exclusions,
+            coverage_amount=d.coverage_amount,
+            deductible_amount=d.deductible_amount,
+            insurance_provider=d.insurance_provider,
             is_verified=d.is_verified,
             created_at=d.created_at,
         )
@@ -740,6 +808,11 @@ def get_vehicle_document_detail(
         document_number=doc.document_number,
         file_reference=doc.file_reference,
         expiry_date=doc.expiry_date,
+        insurance_effective_date=doc.insurance_effective_date,
+        insurance_exclusions=doc.insurance_exclusions,
+        coverage_amount=doc.coverage_amount,
+        deductible_amount=doc.deductible_amount,
+        insurance_provider=doc.insurance_provider,
         is_verified=doc.is_verified,
         created_at=doc.created_at,
     )
@@ -766,26 +839,38 @@ def view_vehicle_document_file(
             detail="Vehicle document not found.",
         )
 
-    upload_dir = get_rental_documents_directory()
-    clean_filename = os.path.basename(doc.file_reference)
-    file_path = os.path.abspath(os.path.join(upload_dir, clean_filename))
+    # Legacy references can include a path prefix. Storage lookup uses the basename.
+    reference = PureWindowsPath(doc.file_reference)
+    filename = reference.name
+    if (
+        not filename
+        or doc.file_reference.endswith(("/", "\\"))
+        or ".." in reference.parts
+        or ":" in filename
+        or filename != filename.rstrip(" .")
+        or reference.is_reserved()
+        or any(ord(char) < 32 for char in filename)
+    ):
+        raise HTTPException(400, "Invalid document path reference.")
 
-    # Path traversal protection
-    if not file_path.startswith(os.path.abspath(upload_dir)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid document path traversal attempt detected.",
-        )
+    try:
+        upload_dir = Path(get_rental_documents_directory()).resolve(strict=True)
+        file_path = (upload_dir / filename).resolve(strict=True)
+        if not file_path.is_relative_to(upload_dir):
+            raise HTTPException(400, "Invalid document path reference.")
+        file_stat = file_path.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(404, "Document file not found on storage server.") from None
 
-    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+    if not S_ISREG(file_stat.st_mode):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document file not found on storage server.",
         )
 
-    media_type, _ = mimetypes.guess_type(file_path)
+    media_type, _ = mimetypes.guess_type(filename)
     if not media_type:
-        ext = os.path.splitext(file_path)[1].lower()
+        ext = os.path.splitext(filename)[1].lower()
         if ext in (".jpg", ".jpeg"):
             media_type = "image/jpeg"
         elif ext == ".png":
@@ -797,6 +882,7 @@ def view_vehicle_document_file(
 
     return FileResponse(
         path=file_path,
+        stat_result=file_stat,
         media_type=media_type,
         headers={
             "Cache-Control": "no-store",
@@ -1009,9 +1095,12 @@ def list_admin_rental_bookings(
         b_ref = (
             db.query(BookingReference)
             .filter(
-                BookingReference.module_type == "rental",
+                BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
                 BookingReference.target_booking_id == b.id,
+                BookingReference.user_id == b.user_id,
+                BookingReference.provider_profile_id == p.id,
             )
+            .order_by(case((BookingReference.module_type == "rental_vehicle", 0), else_=1), BookingReference.id)
             .first()
         )
         ref_str = b_ref.booking_reference if b_ref else f"RB-{b.id:06d}"
@@ -1089,9 +1178,12 @@ def get_admin_rental_booking_detail(
     b_ref = (
         db.query(BookingReference)
         .filter(
-            BookingReference.module_type == "rental",
+            BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
             BookingReference.target_booking_id == b.id,
+            BookingReference.user_id == b.user_id,
+            BookingReference.provider_profile_id == p.id,
         )
+        .order_by(case((BookingReference.module_type == "rental_vehicle", 0), else_=1), BookingReference.id)
         .first()
     )
     ref_str = b_ref.booking_reference if b_ref else f"RB-{b.id:06d}"
@@ -1202,7 +1294,7 @@ def get_admin_rental_booking_detail(
             db.query(PaymentTransaction)
             .filter(
                 PaymentTransaction.booking_reference_id == b_ref.id,
-                PaymentTransaction.payment_status.in_(["success", "paid"]),
+                PaymentTransaction.payment_status.in_((*CAPTURED, "success")),
             )
             .all()
         )
@@ -1468,7 +1560,7 @@ def list_admin_rental_payments(
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .join(ProviderProfile, BookingReference.provider_profile_id == ProviderProfile.id)
         .join(User, PaymentTransaction.user_id == User.id)
-        .filter(BookingReference.module_type == "rental")
+        .filter(BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES))
     )
 
     if payment_status:
@@ -1659,7 +1751,7 @@ def list_admin_rental_refunds(
         .join(PaymentTransaction, PaymentRefund.payment_transaction_id == PaymentTransaction.id)
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .join(User, PaymentTransaction.user_id == User.id)
-        .filter(BookingReference.module_type == "rental")
+        .filter(BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES))
     )
 
     if refund_status:
@@ -1724,7 +1816,7 @@ def review_admin_rental_refund(
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .filter(
             PaymentRefund.id == refund_id,
-            BookingReference.module_type == "rental",
+            BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
         )
         .first()
     )
@@ -1735,6 +1827,22 @@ def review_admin_rental_refund(
         )
 
     refund, tx, b_ref = row
+
+    booking = db.get(RentalBooking, b_ref.target_booking_id)
+    if booking is None:
+        raise HTTPException(409, "Refund has no matching rental booking")
+    lock_booking_resource(db, f"rental_vehicle_booking_{booking.vehicle_id}")
+    for record in (refund, tx, b_ref, booking):
+        db.refresh(record)
+    vehicle = db.get(RentalVehicle, booking.vehicle_id)
+    if (
+        vehicle is None
+        or b_ref.target_booking_id != booking.id
+        or b_ref.user_id != booking.user_id
+        or b_ref.provider_profile_id != vehicle.provider_id
+        or tx.user_id != booking.user_id
+    ):
+        raise HTTPException(409, "Refund has no matching rental booking")
 
     if refund.refund_status != "pending":
         raise HTTPException(
@@ -1765,7 +1873,8 @@ def review_admin_rental_refund(
         title=f"Rental Refund {payload.decision.capitalize()}",
         message=f"Your refund request for {refund.amount} {refund.currency} on booking #{b_ref.target_booking_id} has been {payload.decision}.",
         notification_type="refund_review",
-        link_url=f"/bookings/{b_ref.target_booking_id}",
+        link_url=f"/traveler/rental-bookings/{booking.id}",
+        deduplicate=False,
     )
 
     db.commit()
@@ -1833,7 +1942,7 @@ def list_admin_rental_promotions(
             .scalar() or 0
         )
         # Paid status: status is active, approved with payment, or completed
-        is_paid = c.status in ["active", "completed"]
+        is_paid = db.scalar(verified_rental_promotion_payment().where(PromotionCampaign.id == c.id)) is not None
 
         items.append(
             AdminRentalPromotionListItem(
@@ -1914,7 +2023,7 @@ def get_admin_rental_promotion_detail(
         status=c.status,
         starts_at=c.starts_at,
         ends_at=c.ends_at,
-        is_paid=c.status in ["active", "completed"],
+        is_paid=db.scalar(verified_rental_promotion_payment().where(PromotionCampaign.id == c.id)) is not None,
         impressions_count=imp_count,
         clicks_count=clk_count,
         created_at=c.created_at,
@@ -1966,6 +2075,7 @@ def review_admin_rental_promotion(
         )
 
     client_ip = request.client.host if request.client else None
+    lock_booking_resource(db, f"rental_promotion_{campaign_id}")
     row = (
         db.query(PromotionCampaign, ProviderProfile)
         .join(ProviderProfile, PromotionCampaign.provider_profile_id == ProviderProfile.id)
@@ -2045,6 +2155,19 @@ def review_admin_rental_promotion(
                 detail="Cannot activate campaign: valid promotion payment verification required. Provide payment_reference.",
             )
 
+        reference = payload.payment_reference.strip()
+        payment_id = db.scalar(verified_rental_promotion_payment().where(
+            PromotionCampaign.id == campaign.id,
+            or_(AdvertisingPayment.order_reference == reference,
+                AdvertisingPayment.gateway_transaction_id == reference),
+        ))
+        if payment_id is None:
+            raise HTTPException(400, "Rental campaign has no matching verified payment")
+        if campaign.ends_at <= utc_now() or not has_eligible_rental_inventory(
+            db, provider.id, campaign.listing_reference_id,
+        ):
+            raise HTTPException(400, "Rental campaign is expired or has no eligible listings")
+        campaign.spent_amount = db.get(AdvertisingPayment, payment_id).amount
         campaign.status = "active"
         msg = f"Campaign '{campaign.campaign_name}' activated with verified payment ref '{payload.payment_reference.strip()}'."
         log_admin_audit(
@@ -2097,7 +2220,7 @@ def review_admin_rental_promotion(
         campaign_name=campaign.campaign_name,
         previous_status=prev_status,
         new_status=campaign.status,
-        is_paid=campaign.status in ["active", "completed"],
+        is_paid=db.scalar(verified_rental_promotion_payment().where(PromotionCampaign.id == campaign.id)) is not None,
         message=msg,
     )
 
@@ -2215,13 +2338,13 @@ def get_admin_rental_revenue_analytics(
         Decimal("0.00"),
     )
 
-    # Payments query (module_type == 'rental')
+    # Include canonical and legacy rental references.
     p_query = (
         db.query(PaymentTransaction)
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .filter(
-            BookingReference.module_type == "rental",
-            PaymentTransaction.payment_status.in_(["success", "paid"]),
+            BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
+            PaymentTransaction.payment_status.in_((*CAPTURED, "success")),
         )
     )
     if provider_id:

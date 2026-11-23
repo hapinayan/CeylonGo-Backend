@@ -33,6 +33,7 @@ from app.models.shared import (
     ListingReference,
     Notification,
     PromotionCampaign,
+    AdvertisingPayment,
     Review,
     Wishlist,
 )
@@ -762,6 +763,12 @@ def test_sponsored_vehicle_boosted_and_labeled(isolated_db_session, seed_test_da
         ends_at=now + timedelta(days=10),
     )
     db.add(campaign)
+    db.flush()
+    db.add(AdvertisingPayment(
+        campaign_id=campaign.id, provider_profile_id=prov1.id,
+        order_reference="AD-RENTAL-GALLE", gateway_transaction_id="GALLE-PAID",
+        amount=campaign.budget, currency=campaign.currency, payment_status="completed", verified_at=now,
+    ))
     db.commit()
 
     client = make_test_client(db)
@@ -778,6 +785,24 @@ def test_sponsored_vehicle_boosted_and_labeled(isolated_db_session, seed_test_da
     # Non-sponsored vehicle (v3 from prov2) has is_sponsored=False
     v3_item = next(i for i in items if i["id"] == seed_test_data["v3"].id)
     assert v3_item["is_sponsored"] is False
+
+    targeted_vehicle = seed_test_data["v2"]
+    reference = ListingReference(module_type="rental_vehicle", target_id=targeted_vehicle.id,
+                                 provider_profile_id=prov1.id, title=targeted_vehicle.vehicle_name,
+                                 district=targeted_vehicle.district)
+    db.add(reference)
+    db.flush()
+    campaign.listing_reference_id = reference.id
+    db.commit()
+    response = client.get("/api/v1/rental-vehicles?sort_by=price_asc")
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"] if item["is_sponsored"]] == [targeted_vehicle.id]
+    assert client.get(f"/api/v1/rental-vehicles/{targeted_vehicle.id}").json()["is_sponsored"] is True
+    reference.target_id = seed_test_data["v3"].id
+    db.commit()
+    response = client.get("/api/v1/rental-vehicles")
+    assert response.status_code == 200
+    assert not any(item["is_sponsored"] for item in response.json()["items"])
 
 
 # ==============================================================================

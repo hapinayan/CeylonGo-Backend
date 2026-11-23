@@ -34,6 +34,7 @@ from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import AdminAuditLog, BookingReference, Notification
 from app.models.user import Base, User
 from app.routers.auth import get_current_user
+from app.routers.admin_rentals import router as admin_rentals_router
 from app.routers.rental_bookings import router as rental_bookings_router
 from app.routers.rental_eligibility import router as rental_eligibility_router
 from app.routers.rental_providers import router as rental_providers_router
@@ -72,6 +73,7 @@ def make_test_client(db_session, current_user=None):
     app.include_router(rental_eligibility_router)
     app.include_router(rental_bookings_router)
     app.include_router(rental_providers_router)
+    app.include_router(admin_rentals_router)
 
     app.dependency_overrides[get_db] = lambda: db_session
     if current_user:
@@ -521,6 +523,56 @@ def test_age_verification_fails_closed_when_verified_dob_unavailable(isolated_db
     assert resp.status_code == 403
     assert "trusted date of birth" in resp.json()["detail"].lower()
     assert "ar-02" in resp.json()["detail"].lower()
+
+
+def test_admin_age_override_enforces_trusted_dob_and_exact_birthday(isolated_db_session, seed_phase5_data):
+    db = isolated_db_session
+    traveler = seed_phase5_data["traveler_local"]
+    admin = make_test_client(db, seed_phase5_data["admin_user"])
+    traveler_client = make_test_client(db, traveler)
+    policy = "/api/v1/admin/rentals/policies/minimum-age/bicycle"
+    assert admin.get(policy).json()["minimum_age"] == 16
+    assert traveler_client.put(policy, json={"minimum_age": 20}).status_code == 403
+    assert admin.put(policy, json={"minimum_age": -1}).status_code == 422
+    assert admin.put(policy, json={"minimum_age": True}).status_code == 422
+    revision = admin.put(policy, json={"minimum_age": 20})
+    assert revision.status_code == 200, revision.text
+    assert revision.json()["requires_verified_dob"] is True
+    assert admin.get(policy).json()["minimum_age"] == 20
+    assert db.query(AdminAuditLog).filter_by(action="update_rental_minimum_age").count() == 1
+
+    birthday = datetime.now(timezone.utc).replace(month=6, day=15)
+    if birthday <= datetime.now(timezone.utc) + timedelta(days=2):
+        birthday = birthday.replace(year=birthday.year + 1)
+
+    def book(pickup):
+        return traveler_client.post("/api/v1/rental-bookings", json={
+            "vehicle_id": seed_phase5_data["bicycle"].id,
+            "pickup_at": pickup.isoformat(),
+            "return_at": (pickup + timedelta(hours=2)).isoformat(),
+        })
+
+    assert book(birthday).status_code == 403
+    kyc = ProviderProfile(
+        user_id=traveler.id, business_name="Travel KYC", phone="+94771234569", district="Colombo",
+        provider_type="rental", approval_status="pending",
+        date_of_birth=birthday.date().replace(year=birthday.year - 20),
+    )
+    db.add(kyc)
+    db.commit()
+    assert book(birthday).status_code == 403
+    evidence = RentalEligibilityCheck(
+        user_id=traveler.id, driver_license_number="B1234567", license_country="Sri Lanka",
+        license_expiry_date=birthday.date() + timedelta(days=30), date_of_birth=kyc.date_of_birth,
+        verification_status="rejected",
+    )
+    db.add(evidence)
+    db.commit()
+    assert book(birthday).status_code == 403
+    evidence.verification_status = "approved"
+    db.commit()
+    assert book(birthday - timedelta(days=1)).status_code == 403
+    assert book(birthday).status_code == 201
 
 
 def test_age_verification_enforces_category_minimum_age(isolated_db_session, seed_phase5_data):

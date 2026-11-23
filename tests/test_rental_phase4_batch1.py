@@ -17,6 +17,7 @@ with zero modifications to CeylonGoDB in compliance with fail-closed database gu
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import os
+from pathlib import Path
 import sqlite3
 import pytest
 from fastapi import FastAPI
@@ -548,25 +549,118 @@ def test_overall_vehicle_verification_status_updates(seed_test_data, isolated_db
     assert resp_ok.json()["new_verification_status"] == "verified"
 
 
-def test_document_file_access_security_and_path_traversal(seed_test_data, isolated_db_session):
-    """Requirement 14: Protects against path traversal and streams valid document files."""
+@pytest.mark.parametrize("reference", [
+    "rev_license_101.pdf",
+    "uploads/rental_documents/rev_license_101.pdf",
+    r"C:\legacy\uploads\rev_license_101.pdf",
+])
+def test_document_file_streams_valid_legacy_references(seed_test_data, isolated_db_session, reference):
+    db, _ = isolated_db_session
+    db.get(RentalVehicleDocument, 1).file_reference = reference
+    admin = seed_test_data["admin_user"]
+    admin.role = "operations_admin"
+    db.commit()
+    client = make_test_client(db, current_user=admin)
+
+    response = client.get("/api/v1/admin/rentals/documents/1/file")
+    assert response.status_code == 200
+    assert b"%PDF-1.4" in response.content
+    assert response.headers["Content-Type"] == "application/pdf"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_document_file_rejects_finance_admin(seed_test_data, isolated_db_session):
+    db, _ = isolated_db_session
+    admin = seed_test_data["admin_user"]
+    admin.role = "finance_admin"
+    db.commit()
+    client = make_test_client(db, current_user=admin)
+
+    assert client.get("/api/v1/admin/rentals/documents/1/file").status_code == 403
+
+
+def test_document_file_rejects_missing_record(seed_test_data, isolated_db_session):
     db, _ = isolated_db_session
     client = make_test_client(db, current_user=seed_test_data["admin_user"])
 
-    # 1. Valid file streaming
-    resp_file = client.get("/api/v1/admin/rentals/documents/1/file")
-    assert resp_file.status_code == 200
-    assert b"%PDF-1.4" in resp_file.content
-    assert resp_file.headers.get("X-Content-Type-Options") == "nosniff"
+    response = client.get("/api/v1/admin/rentals/documents/999/file")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Vehicle document not found."}
 
-    # 2. Path traversal attack attempt: modify document file reference to ../../secret.txt
-    doc = db.query(RentalVehicleDocument).filter(RentalVehicleDocument.id == 1).first()
-    doc.file_reference = "../../secret.txt"
+
+@pytest.mark.parametrize(("reference", "status_code", "detail"), [
+    ("missing.pdf", 404, "Document file not found on storage server."),
+    ("directory.pdf", 404, "Document file not found on storage server."),
+    ("rev_license_101.pdf/", 400, "Invalid document path reference."),
+    ("rev_license_101.pdf:stream", 400, "Invalid document path reference."),
+    ("../../rev_license_101.pdf", 400, "Invalid document path reference."),
+    (r"..\rev_license_101.pdf", 400, "Invalid document path reference."),
+])
+def test_document_file_access_security_and_path_traversal(
+    seed_test_data, isolated_db_session, reference, status_code, detail,
+):
+    db, docs_dir = isolated_db_session
+    (Path(docs_dir) / "directory.pdf").mkdir()
+    db.get(RentalVehicleDocument, 1).file_reference = reference
     db.commit()
+    client = make_test_client(db, current_user=seed_test_data["admin_user"])
 
-    # The router uses os.path.basename and bounds checking, safely returning 404/400
-    resp_attack = client.get("/api/v1/admin/rentals/documents/1/file")
-    assert resp_attack.status_code in (400, 404)
+    response = client.get("/api/v1/admin/rentals/documents/1/file")
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+
+
+def test_document_file_rejects_resolved_target_outside_root(seed_test_data, isolated_db_session, monkeypatch):
+    db, docs_dir = isolated_db_session
+    root = Path(docs_dir).resolve()
+    candidate = root / "rev_license_101.pdf"
+    outside_dir = root.with_name(root.name + "_outside")
+    outside_dir.mkdir()
+    outside = outside_dir / candidate.name
+    outside.write_bytes(b"private")
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if path == candidate:
+            return outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    client = make_test_client(db, current_user=seed_test_data["admin_user"])
+
+    response = client.get("/api/v1/admin/rentals/documents/1/file")
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid document path reference."}
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "junction"])
+def test_document_file_rejects_filesystem_link_escape(seed_test_data, isolated_db_session, link_kind):
+    db, docs_dir = isolated_db_session
+    root = Path(docs_dir)
+    link = root / "linked.pdf"
+    outside = root.parent / "private"
+    try:
+        if link_kind == "junction":
+            if os.name != "nt":
+                pytest.skip("Directory junctions require Windows")
+            import _winapi
+
+            outside.mkdir()
+            _winapi.CreateJunction(str(outside), str(link))
+        else:
+            outside.write_bytes(b"private")
+            link.symlink_to(outside)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Local filesystem cannot create a {link_kind}: {type(exc).__name__}")
+
+    db.get(RentalVehicleDocument, 1).file_reference = link.name
+    db.commit()
+    client = make_test_client(db, current_user=seed_test_data["admin_user"])
+
+    response = client.get("/api/v1/admin/rentals/documents/1/file")
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid document path reference."}
 
 
 # ==============================================================================

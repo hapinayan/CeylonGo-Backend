@@ -1,0 +1,67 @@
+TR-05 external release gates
+
+Approved policy required
+
+T-03: Product must supply two approved category identifiers, labels, aliases
+and legacy mappings.
+T-14: Product and Finance must approve a published cancellation fee mapping,
+rounding and cash/online treatment, including ambiguous historical snapshots.
+A-04: Operations must approve business evidence types, decision states,
+review permissions, expiry and provider approval/badge effects.
+X-01: Compliance must supply approved licence classes, required evidence
+and access rules. The source access criterion is truncated.
+X-06: Product and Storage must approve mandatory pickup/return evidence,
+upload ownership proof, exceptions and retention.
+X-10: Compliance and Product must approve jurisdiction-specific seats,
+the driver-seat convention, solo self-drive and legacy handling.
+X-11: Compliance must approve applicable foreign permit/endorsement
+combinations and how to validate them at booking and handover.
+T-18: Product must confirm whether scheduled reminders are required and
+their timing and recipients.
+X-07: Product and Finance must confirm whether booked grace and hourly rates
+remain immutable when a provider edits a rate plan.
+
+Authorized isolated SQL Server required
+
+The DBA must first authorize read-only access for the approved Windows
+principal and isolated host/database, with ODBC Driver 18 available on
+that host. Verify identity, the ledger through 042 and the catalog using
+TR05_SQLSERVER_PREFLIGHT_REPORT.txt. Migration writes through 046, a
+recoverable checkpoint, the 11 staging cases and independent-connection
+fixtures require separate permission under TR05_STAGING_RUNBOOK.txt.
+
+T-10 / P-08 / P-11: Prove booking overlap, both blackout writer paths,
+and provider acceptance against expiry/capture with separate connections.
+T-11 / T-12 / P-15: Verify capture/cancellation atomicity, cash collection
+and same-key retries against the real transaction ledger.
+T-18: Verify event and notification rollback together on a SQL connection
+and verify recipient isolation in deployed roles.
+P-13 / P-14 / X-09: Verify licensed self-drive handover and return, evidence
+and signed acceptance after SQL persistence.
+P-16 / A-06 / X-04 / X-13: Prove online and cash receipts, deposits, refund
+reserves and payouts reconcile to authorized financial evidence. Verify
+competing refund decisions yield one decision, audit entry and traveller alert
+using independent SQL Server connections.
+A-01: Rehearse rental provider approval/rejection and protected document
+access with migrated SQL Server and deployed role assignments.
+X-02 / X-03 / X-12: Verify migrated age rules, helmet metadata and private
+insurance evidence with historical and current records.
+
+Authorized PayHere sandbox required
+
+T-11 / T-14 / T-19 / P-16 / P-17 / A-06 / A-07 / X-13:
+Authorize a sandbox merchant, approved callback host, disposable synthetic
+accounts and the isolated persistence needed for PH-01 through PH-05.
+Supply settings via the approved secret channel. Follow
+TR05_PAYHERE_SANDBOX_CHECKLIST.txt and record signed callback and ledger
+evidence. PH-05 additionally needs an authorized refund execution mechanism
+or verified manual settlement evidence.
+
+Angular and Flutter environments required
+
+T-06 / T-18 / T-19 / P-13 / P-14 / P-15 / A-07 / X-02 / X-03 / X-09 / X-12:
+Provide the client projects or running acceptance builds and test accounts.
+Replay TR05_CLIENT_CONTRACT_FIXTURES.json plus the staging runbook checklist.
+Verify maps, published status and labels, alert navigation, signed inspection
+state, client key reuse and the display of age, helmet and insurance data.
+Repeat category and seating acceptance once T-03 and X-10 are approved.

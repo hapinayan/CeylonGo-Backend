@@ -1,10 +1,10 @@
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from math import ceil
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 VehicleType = Literal["bike", "bicycle", "tuk_tuk"]
@@ -84,13 +84,23 @@ class RentalQuoteRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_quote_dates(self):
-        if self.return_at <= self.pickup_at:
+        # The quote handler interprets naive timestamps as UTC.
+        pickup_at = self.pickup_at
+        return_at = self.return_at
+        if pickup_at.utcoffset() is None:
+            pickup_at = pickup_at.replace(tzinfo=timezone.utc)
+        if return_at.utcoffset() is None:
+            return_at = return_at.replace(tzinfo=timezone.utc)
+        if return_at.astimezone(timezone.utc) <= pickup_at.astimezone(timezone.utc):
             raise ValueError("Return date must be strictly after pickup date")
         return self
 
 
 class RentalQuoteResponse(BaseModel):
     vehicle_id: int
+    seating_capacity: int | None = None
+    max_passengers: int | None = None
+    min_passengers: int | None = None
     pickup_at: datetime
     return_at: datetime
     duration_hours: float
@@ -180,6 +190,7 @@ class RentalVehicleCreate(BaseModel):
     helmet_count: int | None = Field(default=0, ge=0)
     helmets_included: bool | None = Field(default=False)
     helmet_sizes: str | None = Field(default=None, max_length=100)
+    helmet_condition: str | None = Field(default=None, max_length=100)
     security_deposit: Decimal | None = Field(default=None, ge=0)
     fuel_policy: FuelPolicy | None = Field(default="same_to_same")
 
@@ -217,6 +228,7 @@ class RentalVehicleUpdate(BaseModel):
     helmet_count: int | None = Field(default=None, ge=0)
     helmets_included: bool | None = None
     helmet_sizes: str | None = Field(default=None, max_length=100)
+    helmet_condition: str | None = Field(default=None, max_length=100)
     security_deposit: Decimal | None = Field(default=None, ge=0)
     fuel_policy: FuelPolicy | None = None
 
@@ -240,13 +252,15 @@ class RentalAvailabilityBlockCreate(BaseModel):
 
     start_date: date
     end_date: date
-    block_type: str = Field(default="maintenance", max_length=30)
+    block_type: Literal["maintenance", "service", "accident_repair", "owner_unavailable", "administrative"] = "maintenance"
     reason: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def validate_dates(self):
         if self.end_date <= self.start_date:
             raise ValueError("End date must be after start date")
+        if self.end_date == date.max:
+            raise ValueError("End date is too late")
         if self.start_date < date.today():
             raise ValueError("Start date cannot be in the past")
         return self
@@ -271,6 +285,25 @@ class RentalVehicleDocumentCreate(BaseModel):
     document_type: str = Field(min_length=2, max_length=50)
     document_url: str = Field(min_length=5, max_length=1000)
     expiry_date: date | None = None
+    insurance_effective_date: date | None = None
+    insurance_exclusions: str | None = Field(default=None, max_length=1000)
+    coverage_amount: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    deductible_amount: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    insurance_provider: str | None = Field(default=None, max_length=150)
+    insurance_policy_number: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_insurance_metadata(self):
+        if self.document_type.strip() != "insurance_certificate" and any(value is not None for value in (
+            self.insurance_effective_date, self.insurance_exclusions, self.coverage_amount,
+            self.deductible_amount, self.insurance_provider, self.insurance_policy_number,
+        )):
+            raise ValueError("Insurance metadata is only accepted for insurance certificates")
+        if self.insurance_effective_date is not None and (
+            self.expiry_date is None or self.insurance_effective_date > self.expiry_date
+        ):
+            raise ValueError("Insurance effective date must be on or before the expiry date")
+        return self
 
     @field_validator("expiry_date")
     @classmethod
@@ -286,8 +319,14 @@ class RentalVehicleDocumentResponse(BaseModel):
     id: int
     vehicle_id: int
     document_type: str
-    document_url: str
+    document_url: str = Field(validation_alias=AliasChoices("document_url", "file_reference"))
     expiry_date: date | None = None
+    insurance_effective_date: date | None = None
+    insurance_exclusions: str | None = None
+    coverage_amount: Decimal | None = None
+    deductible_amount: Decimal | None = None
+    insurance_provider: str | None = None
+    insurance_policy_number: str | None = None
     is_verified: bool = False
     created_at: datetime
 
@@ -307,6 +346,8 @@ class RentalVehicleListItem(BaseModel):
     status: VehicleStatus
     model_year: int | None = None
     seating_capacity: int = 4
+    max_passengers: int | None = None
+    min_passengers: int | None = None
     transmission: str = "manual"
     fuel_type: str = "petrol"
     district: str | None = None
@@ -335,9 +376,12 @@ class RentalVehiclePagination(BaseModel):
 
 class VehicleInsuranceSummary(BaseModel):
     is_insured: bool = False
-    insurance_status: Literal["verified", "unverified", "expired", "not_provided"] = "not_provided"
+    insurance_status: Literal["verified", "unverified", "expired", "not_yet_effective", "not_provided"] = "not_provided"
     policy_number_masked: str | None = None
     expiry_date: date | None = None
+    effective_date: date | None = None
+    exclusions: str | None = None
+    evidence_verified: bool = False
     coverage_amount: Decimal | None = None
     deductible_amount: Decimal | None = None
     insurance_provider: str | None = None
@@ -358,6 +402,8 @@ class RentalVehicleDetailResponse(BaseModel):
     status: VehicleStatus
     model_year: int | None = None
     seating_capacity: int = 4
+    max_passengers: int | None = None
+    min_passengers: int | None = None
     transmission: str = "manual"
     fuel_type: str = "petrol"
     district: str | None = None

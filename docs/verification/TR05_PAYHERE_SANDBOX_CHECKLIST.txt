@@ -1,0 +1,81 @@
+TR-05 PayHere sandbox execution checklist
+
+Status | External execution pending
+
+Authorize the PayHere sandbox merchant, callback deployment and a disposable
+backend persistence environment before running PH-01 through PH-05. Use
+synthetic travellers, providers, listings, campaigns and finance reviewers.
+The current shell had no PAYHERE_* settings from the list below and no .env.
+Offline regression uses placeholder credentials, disables ODBC and blocks
+external networking. It cannot verify merchant provisioning, callback
+delivery, real SQL locking, or gateway settlement.
+
+Required configuration for the authorized environment
+
+PAYHERE_MODE=sandbox
+PAYHERE_MERCHANT_ID=<approved sandbox merchant ID>
+PAYHERE_MERCHANT_SECRET=<matching sandbox signing secret via secret store>
+PAYHERE_NOTIFY_URL=https://<approved callback host>/api/v1/payments/payhere/notify
+PAYHERE_RETURN_URL=https://<approved client host>/<success return path>
+PAYHERE_CANCEL_URL=https://<approved client host>/<cancel return path>
+
+Confirm the merchant, hosted sandbox checkout and callback configuration
+match the backend instance. Expect checkout_url to be
+https://sandbox.payhere.lk/pay/checkout. Check that notify_url is reachable
+from the sandbox using the approved setup. Use the browser return only for
+navigation. Read payment state from the backend after the signed callback.
+
+PH-01 | Checkout
+POST /api/v1/payments/rental/bookings/{booking_id}/initiate as the owning
+traveller. Repeat for the same payable order. Expect 200 and stable order,
+merchant, currency, exact amount, notify URL and hash for the same inputs.
+Confirm one pending transaction. Expect 403 for another traveller and 400
+for cash, zero-total, expired or terminal bookings. Confirm rejected
+requests leave the ledger unchanged.
+
+PH-02 | Verified capture and replay
+Complete the sandbox checkout, then verify delivery to POST
+/api/v1/payments/payhere/notify. Expect 200 with payment_status=paid, one
+capture, matching booking/reference states and one alert per recipient.
+Replay the same authorized callback and expect already_processed.
+Use approved synthetic negative cases for wrong merchant, signature,
+amount, currency or malformed fields. Expect 400 without writes.
+Expect 409 for a conflicting verified capture identity on the same order.
+Repeat with a distinct booking and confirm independent alerts.
+
+PH-03 | Late capture
+Initiate two synthetic orders. Cancel one and expire the pending hold for
+the other before sandbox notification delivery. Expect requires_reconciliation,
+exactly one pending refund per capture, and unchanged cancelled or expired
+inventory state. Replay and confirm no duplicate reservation. Record the
+checkout, terminal-transition and callback timestamps.
+
+PH-04 | Rental promotion
+POST /api/v1/provider/rentals/promotions/campaigns/{campaign_id}/payments/initiate
+after editorial approval. Verify stable order on retry and rejection for a
+different provider. Expect 409 on a synthetic stale checkout ledger whose
+amount or currency disagrees with the approved campaign. Before capture,
+finance activation via POST /api/v1/admin/rentals/promotions/{campaign_id}/review
+must fail. After a verified callback and replay, expect one advertising
+payment, no new rental booking payment, and activation only after the finance
+review. Check sponsored display within the campaign window and listing scope.
+
+PH-05 | Refund and settlements
+Reconcile /api/v1/admin/rentals/payments, /api/v1/admin/rentals/refunds,
+/api/v1/admin/rentals/settlements and /api/v1/provider/rentals/settlements.
+Confirm capture and currency match the order, refund reservations fit within
+the captured amount, and online receipts, cash, deposits and payouts stay
+separate. Review a synthetic refund using the finance route. An audit-review
+approval is distinct from execution. Obtain separate authorization for
+sandbox refund execution or verified manual settlement. Record unavailable
+gateway functionality as unexecuted.
+
+Evidence for each case
+
+Record case ID, PASS/FAIL/BLOCKED, UTC time, operator, environment and repo
+revision, authorization reference, actor role, synthetic booking/campaign ID,
+order and redacted payment identifier, expected/observed HTTP status and
+state, amount and currency, before/after ledger and audit counts, recipient
+alert counts, and a restricted gateway or settlement evidence reference.
+Exclude secrets, signature/hash values, payment-card data and raw callbacks
+from shared evidence.

@@ -52,8 +52,10 @@ from app.database.connection import get_db
 from app.main import app
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import RentalEligibilityCheck
+from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
     AdminAuditLog,
+    AdvertisingPayment,
     BookingReference,
     PaymentRefund,
     PaymentTransaction,
@@ -709,6 +711,20 @@ def test_rental_promotion_action_boundaries_and_zero_side_effects(client, db_ses
         assert camp_pending.status == "approved"
         assert db_session.query(AdminAuditLog).count() == audit_before_act
 
+    db_session.add_all([
+        RentalVehicle(
+            provider_id=camp_pending.provider_profile_id, vehicle_name="Eligible tuk-tuk",
+            vehicle_type="tuk_tuk", seating_capacity=4, price_per_day=Decimal("3500"),
+            approval_status="approved", status="available",
+        ),
+        AdvertisingPayment(
+            campaign_id=camp_pending.id, provider_profile_id=camp_pending.provider_profile_id,
+            order_reference="AD-RENTAL-RBAC", gateway_transaction_id="PAYHERE-TX-10001",
+            amount=camp_pending.budget, currency=camp_pending.currency,
+            payment_status="completed", verified_at=datetime.now(UTC).replace(tzinfo=None),
+        ),
+    ])
+    db_session.commit()
     # finance_admin can activate with payment_reference
     res_fin_activate = client.post(
         f"/api/v1/admin/rentals/promotions/{camp_pending.id}/review",
@@ -741,7 +757,7 @@ def test_rental_promotion_action_boundaries_and_zero_side_effects(client, db_ses
     # 4. Legacy 'admin' and 'super_admin' can perform both editorial and financial actions
     res_legacy_activate = client.post(
         f"/api/v1/admin/rentals/promotions/{camp_pending.id}/review",
-        json={"decision": "activate", "payment_reference": "PAYHERE-TX-10002"},
+        json={"decision": "activate", "payment_reference": "PAYHERE-TX-10001"},
         headers=role_headers["admin"],
     )
     assert res_legacy_activate.status_code == 200
@@ -890,7 +906,10 @@ def test_tour_guide_campaign_decision_boundaries_and_zero_side_effects(client, d
 # ==============================================================================
 
 
-def test_rental_eligibility_document_access_by_role_and_owner(client, db_session, role_headers, tmp_path, monkeypatch):
+@pytest.mark.parametrize("reference_field", ["license_front_image", "recognition_permit_document_url"])
+def test_rental_eligibility_document_access_by_role_and_owner(
+    client, db_session, role_headers, tmp_path, monkeypatch, reference_field,
+):
     """
     Verify GET /api/v1/rental-eligibility/document/{filename}:
     - Allows document owner (traveler).
@@ -918,8 +937,8 @@ def test_rental_eligibility_document_access_by_role_and_owner(client, db_session
         driver_license_number="B1234567",
         license_country="Sri Lanka",
         license_expiry_date=date.today() + timedelta(days=365),
-        license_front_image=f"/api/v1/rental-eligibility/document/{doc_filename}",
         verification_status="pending",
+        **{reference_field: f"/api/v1/rental-eligibility/document/{doc_filename}"},
     )
     db_session.add(eligibility)
     db_session.commit()
@@ -929,6 +948,8 @@ def test_rental_eligibility_document_access_by_role_and_owner(client, db_session
     # 1. Document owner allowed (200)
     res_owner = client.get(url, headers=owner_headers)
     assert res_owner.status_code == 200
+    assert res_owner.content == doc_path.read_bytes()
+    assert "no-store" in res_owner.headers["Cache-Control"]
 
     # 2. Authorized admin roles allowed (200): super_admin, legacy admin, operations_admin
     for allowed_admin in ("super_admin", "admin", "operations_admin"):

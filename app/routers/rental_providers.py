@@ -10,21 +10,29 @@ Handles:
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+from uuid import uuid4
 from math import ceil
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
 from app.core.notification_service import create_notification
+from app.core.listing_sync import record_booking_status_change
+from app.core.booking_transactions import (
+    CAPTURED, RENTAL_BOOKING_REFERENCE_TYPES, RESERVED_REFUNDS, capture_status, lock_booking_resource,
+)
+from app.core.rental_capacity import valid_tuk_tuk_seating_capacity
+from app.services.rental_eligibility import verify_rental_handover_driver
+from app.services.rental_availability import overlapping_rental_bookings
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import (
     RentalAvailabilityBlock,
     RentalConditionEvidence,
     RentalDeposit,
-    RentalEligibilityCheck,
     RentalIncident,
     RentalInspection,
     RentalLocation,
@@ -34,9 +42,11 @@ from app.models.rental import (
 from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
+    AdvertisingPayment,
     BookingReference,
     BookingStatusHistory,
     ListingReference,
+    PaymentRefund,
     PaymentTransaction,
     PromotionCampaign,
     PromotionEvent,
@@ -46,6 +56,13 @@ from app.models.shared import (
 )
 from app.models.user import User
 from app.routers.auth import get_current_user
+from app.schemas.payment import PaymentInitiateResponse
+from app.services.payhere_bookings import checkout_response
+from app.services.rental_promotions import (
+    RENTAL_CAMPAIGN_MODULES,
+    has_eligible_rental_inventory,
+    verified_rental_promotion_payment,
+)
 from app.schemas.rental_provider import (
     BlockType,
     ProviderAvailabilityBlockCreate,
@@ -242,6 +259,8 @@ def get_provider_booking_or_404(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rental booking not found or access denied",
         )
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
+    db.refresh(booking)
     return booking, vehicle
 
 
@@ -263,13 +282,13 @@ def find_active_booking_conflicts(
         db.query(RentalBooking)
         .filter(
             RentalBooking.vehicle_id == vehicle_id,
-            RentalBooking.status.in_(["pending", "confirmed", "active"]),
+            RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
         )
         .all()
     )
     active_conflicts = []
     for b in bookings:
-        if b.status == "pending" and b.expires_at and b.expires_at < now:
+        if b.status == "pending" and b.expires_at and b.expires_at <= now:
             continue
         active_conflicts.append(b)
     return active_conflicts
@@ -316,6 +335,7 @@ def build_vehicle_detail_response(vehicle: RentalVehicle) -> ProviderVehicleDeta
         helmet_count=getattr(vehicle, "helmet_count", None),
         helmets_included=getattr(vehicle, "helmets_included", None),
         helmet_sizes=getattr(vehicle, "helmet_sizes", None),
+        helmet_condition=vehicle.helmet_condition,
         security_deposit=getattr(vehicle, "security_deposit", None),
         fuel_policy=getattr(vehicle, "fuel_policy", None),
         primary_image_url=primary_url,
@@ -367,6 +387,7 @@ def add_rental_vehicle(
         helmet_count=payload.helmet_count,
         helmets_included=payload.helmets_included,
         helmet_sizes=payload.helmet_sizes,
+        helmet_condition=payload.helmet_condition,
         security_deposit=payload.security_deposit,
         fuel_policy=payload.fuel_policy,
     )
@@ -424,7 +445,7 @@ def list_provider_vehicles(
             db.query(RentalBooking)
             .filter(
                 RentalBooking.vehicle_id == v.id,
-                RentalBooking.status.in_(["pending", "confirmed", "active"]),
+                RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
                 or_(
                     RentalBooking.status != "pending",
                     RentalBooking.expires_at.is_(None),
@@ -462,6 +483,7 @@ def list_provider_vehicles(
                 helmet_count=getattr(v, "helmet_count", None),
                 helmets_included=getattr(v, "helmets_included", None),
                 helmet_sizes=getattr(v, "helmet_sizes", None),
+                helmet_condition=v.helmet_condition,
                 security_deposit=getattr(v, "security_deposit", None),
                 fuel_policy=getattr(v, "fuel_policy", None),
                 created_at=v.created_at,
@@ -514,6 +536,8 @@ def update_provider_vehicle(
             detail="No fields provided for update",
         )
 
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
+    db.refresh(vehicle)
     # Check retirement guard if setting status to 'retired'
     if update_data.get("status") == "retired":
         conflicts = find_active_booking_conflicts(vehicle.id, db)
@@ -540,7 +564,7 @@ def update_provider_vehicle(
                 detail="Bicycles must have fuel_type as 'none', 'pedal', or 'electric'",
             )
     elif target_vtype == "tuk_tuk":
-        if target_seats < 3 or target_seats > 4:
+        if not valid_tuk_tuk_seating_capacity(target_seats):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Tuk-tuks must have a legal passenger seating capacity between 3 and 4",
@@ -582,6 +606,8 @@ def retire_provider_vehicle(
     Strict safety check: Blocks retirement if any active, confirmed, or unexpired pending bookings exist.
     """
     vehicle = get_provider_vehicle_or_404(vehicle_id, provider.id, db)
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
+    db.refresh(vehicle)
 
     # Active booking guard
     conflicts = find_active_booking_conflicts(vehicle.id, db)
@@ -1003,6 +1029,7 @@ def create_vehicle_availability_block(
     db: Annotated[Session, Depends(get_db)],
 ):
     vehicle = get_provider_vehicle_or_404(vehicle_id, provider.id, db)
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
 
     start_norm = normalize_utc(payload.start_datetime)
     end_norm = normalize_utc(payload.end_datetime)
@@ -1015,25 +1042,13 @@ def create_vehicle_availability_block(
 
     # Collision guard with confirmed/active bookings (Requirement 5)
     if payload.is_active:
-        now = utc_now()
-        conflicting_bookings = (
-            db.query(RentalBooking)
-            .filter(
-                RentalBooking.vehicle_id == vehicle.id,
-                RentalBooking.status.in_(["pending", "confirmed", "active"]),
-                RentalBooking.pickup_at < end_norm,
-                RentalBooking.return_at > start_norm,
-            )
-            .all()
-        )
-        real_conflicts = [
-            b for b in conflicting_bookings
-            if not (b.status == "pending" and b.expires_at and b.expires_at < now)
-        ]
-        if real_conflicts:
+        conflict_count = overlapping_rental_bookings(
+            db, vehicle.id, start_norm, end_norm, utc_now(),
+        ).count()
+        if conflict_count:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Cannot block availability: overlaps with {len(real_conflicts)} active or confirmed booking(s).",
+                detail=f"Cannot block availability: overlaps with {conflict_count} active or confirmed booking(s).",
             )
 
     new_block = RentalAvailabilityBlock(
@@ -1069,6 +1084,7 @@ def update_vehicle_availability_block(
     db: Annotated[Session, Depends(get_db)],
 ):
     vehicle = get_provider_vehicle_or_404(vehicle_id, provider.id, db)
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
 
     block = (
         db.query(RentalAvailabilityBlock)
@@ -1096,25 +1112,13 @@ def update_vehicle_availability_block(
         )
 
     if target_active:
-        now = utc_now()
-        conflicting_bookings = (
-            db.query(RentalBooking)
-            .filter(
-                RentalBooking.vehicle_id == vehicle.id,
-                RentalBooking.status.in_(["pending", "confirmed", "active"]),
-                RentalBooking.pickup_at < target_end,
-                RentalBooking.return_at > target_start,
-            )
-            .all()
-        )
-        real_conflicts = [
-            b for b in conflicting_bookings
-            if not (b.status == "pending" and b.expires_at and b.expires_at < now)
-        ]
-        if real_conflicts:
+        conflict_count = overlapping_rental_bookings(
+            db, vehicle.id, target_start, target_end, utc_now(),
+        ).count()
+        if conflict_count:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Cannot update block: overlaps with {len(real_conflicts)} active or confirmed booking(s).",
+                detail=f"Cannot update block: overlaps with {conflict_count} active or confirmed booking(s).",
             )
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -1147,6 +1151,7 @@ def delete_vehicle_availability_block(
     db: Annotated[Session, Depends(get_db)],
 ):
     vehicle = get_provider_vehicle_or_404(vehicle_id, provider.id, db)
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
 
     block = (
         db.query(RentalAvailabilityBlock)
@@ -1340,12 +1345,23 @@ def delete_provider_location(
         .count()
     )
 
+    deactivation_reason = None
     if referenced_vehicles > 0:
+        deactivation_reason = f"{referenced_vehicles} vehicle(s) are stationed there"
+    elif db.query(RentalBooking.id).filter(
+        or_(
+            RentalBooking.pickup_location_id == location.id,
+            RentalBooking.return_location_id == location.id,
+        )
+    ).first() is not None:
+        deactivation_reason = "existing bookings reference it"
+
+    if deactivation_reason is not None:
         # Prevent broken foreign keys; deactivate location
         location.is_active = False
         db.commit()
         return {
-            "message": f"Location cannot be permanently deleted because {referenced_vehicles} vehicle(s) are stationed there. It has been deactivated instead.",
+            "message": f"Location cannot be permanently deleted because {deactivation_reason}. It has been deactivated instead.",
             "location_id": location_id,
             "is_active": False,
         }
@@ -1493,7 +1509,7 @@ def accept_provider_booking(
         )
 
     now = utc_now()
-    if booking.expires_at and booking.expires_at <= now:
+    if booking.pickup_at <= now or (booking.expires_at is not None and booking.expires_at <= now):
         booking.status = "expired"
         booking_ref = (
             db.query(BookingReference)
@@ -1712,31 +1728,7 @@ def record_vehicle_handover(
             detail=f"Handover can only be completed for 'confirmed' bookings. Current status is '{booking.status}'.",
         )
 
-    # AR-01, AR-02, AR-11: Recheck driving eligibility before vehicle handover (Condition 7)
-    driver_verification_msg = "Exempt (Bicycle)"
-    if vehicle.vehicle_type != "bicycle":
-        eligibility = (
-            db.query(RentalEligibilityCheck)
-            .filter(RentalEligibilityCheck.user_id == booking.user_id)
-            .first()
-        )
-        if not eligibility or eligibility.verification_status != "approved":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Handover cannot proceed: Renter driving license verification is missing or not approved.",
-            )
-        if eligibility.license_expiry_date < booking.return_at.date():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Handover cannot proceed: Renter driving license expired on {eligibility.license_expiry_date}, which is before the rental return date ({booking.return_at.date()}).",
-            )
-        if vehicle.vehicle_type == "tuk_tuk" and eligibility.license_country.strip().lower() != "sri lanka":
-            if not eligibility.idp_number:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Handover cannot proceed: Foreign traveler renting a tuk-tuk requires an International Driving Permit (IDP) and Sri Lankan recognition permit endorsement.",
-                )
-        driver_verification_msg = f"Verified (License: {eligibility.license_country} - Approved)"
+    driver_verification_msg = verify_rental_handover_driver(db, booking, vehicle)
 
     existing_insp = (
         db.query(RentalInspection)
@@ -1756,7 +1748,7 @@ def record_vehicle_handover(
     insp_notes = payload.notes or ""
     if payload.helmet_count is not None:
         sizes_str = ",".join(payload.helmet_sizes) if payload.helmet_sizes else ""
-        cond_str = payload.helmet_condition or "Good"
+        cond_str = payload.helmet_condition or ""
         helmet_tag = f"[Helmets: count={payload.helmet_count}, sizes={sizes_str}, condition={cond_str}]"
         insp_notes = f"{insp_notes} {helmet_tag}".strip()
 
@@ -1838,7 +1830,7 @@ def record_vehicle_handover(
     return ProviderHandoverResponse(
         booking_id=booking.id,
         status="active",
-        handover_completed_at=now,
+        handover_completed_at=now.replace(tzinfo=timezone.utc),
         message=f"Handover completed successfully for booking #{booking.id}.",
         inspection=insp_resp,
         driver_verification=driver_verification_msg,
@@ -2096,23 +2088,9 @@ def record_cash_payment(
     payload: ProviderRecordCashPaymentRequest,
     provider: Annotated[ProviderProfile, Depends(get_current_approved_rental_provider)],
     db: Annotated[Session, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(min_length=1, max_length=100)] = None,
 ):
     booking, vehicle = get_provider_booking_or_404(booking_id, provider.id, db)
-
-    if booking.payment_status == "paid":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Booking is already marked as fully paid.",
-        )
-
-    outstanding = booking.total_price
-    if payload.amount > outstanding:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Payment amount ({payload.amount} {booking.currency}) exceeds outstanding booking balance ({outstanding} {booking.currency}). Overpayments are not allowed.",
-        )
-
-    now = utc_now()
     booking_ref = (
         db.query(BookingReference)
         .filter(
@@ -2121,29 +2099,72 @@ def record_cash_payment(
         )
         .first()
     )
+    if booking_ref and (
+        booking_ref.user_id != booking.user_id
+        or booking_ref.provider_profile_id != provider.id
+        or booking_ref.total_price != booking.total_price
+        or booking_ref.currency != booking.currency
+    ):
+        raise HTTPException(409, "Rental booking reference requires reconciliation before cash collection")
 
-    tx_code = f"CASH-{booking.id}-{int(now.timestamp())}"
+    receipt_key = sha256(idempotency_key.encode()).hexdigest() if idempotency_key else uuid4().hex
+    tx_code = f"CASH-{booking.id}-{receipt_key}"
+    collected = Decimal("0.00")
     if booking_ref:
-        tx = PaymentTransaction(
-            booking_reference_id=booking_ref.id,
-            user_id=booking.user_id,
-            gateway_name="cash_on_pickup",
-            gateway_transaction_id=tx_code,
-            amount=payload.amount,
-            currency=booking.currency,
-            payment_status="success",
-            payment_method="cash",
-            paid_at=now,
+        receipts = db.query(PaymentTransaction).filter(
+            PaymentTransaction.booking_reference_id == booking_ref.id,
+            PaymentTransaction.user_id == booking.user_id,
+            PaymentTransaction.gateway_name == "cash_on_pickup",
+            PaymentTransaction.payment_method == "cash",
+            PaymentTransaction.currency == booking.currency,
+            PaymentTransaction.payment_status.in_((*CAPTURED, "success")),
         )
-        db.add(tx)
+        if idempotency_key:
+            recorded = receipts.filter(PaymentTransaction.gateway_transaction_id == tx_code).first()
+            if recorded is not None:
+                if recorded.amount != payload.amount:
+                    raise HTTPException(409, "Idempotency key already used for a different amount")
+                return rental_cash_receipt(booking, recorded)
+        collected = sum((receipt.amount for receipt in receipts.all()), Decimal("0.00"))
 
-    if payload.amount == outstanding:
-        booking.payment_status = "paid"
-        if booking_ref:
-            booking_ref.payment_status = "paid"
-    else:
-        booking.payment_status = "partially_paid"
+    if booking.payment_method != "pay_at_location" or booking.status not in ("confirmed", "active", "in_progress"):
+        raise HTTPException(409, "Booking is not eligible for cash collection")
+    if booking.payment_status == "paid":
+        raise HTTPException(409, "Booking is already marked as fully paid.")
+    if booking.payment_status not in ("unpaid", "partially_paid") or (
+        booking.payment_status == "partially_paid" and collected == 0
+    ):
+        raise HTTPException(409, "Booking payment state requires reconciliation before cash collection")
+    outstanding = booking.total_price - collected
+    if payload.amount > outstanding:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Payment amount ({payload.amount} {booking.currency}) exceeds outstanding booking balance ({outstanding} {booking.currency}). Overpayments are not allowed.",
+        )
 
+    if booking_ref is None:
+        booking_ref = BookingReference(
+            module_type="rental_vehicle", target_booking_id=booking.id,
+            provider_profile_id=provider.id, user_id=booking.user_id,
+            booking_reference=f"RB-CASH-{booking.id}", total_price=booking.total_price,
+            currency=booking.currency, booking_status=booking.status, payment_status=booking.payment_status,
+        )
+        db.add(booking_ref)
+        db.flush()
+    tx = PaymentTransaction(
+        booking_reference_id=booking_ref.id, user_id=booking.user_id,
+        gateway_name="cash_on_pickup", gateway_transaction_id=tx_code,
+        amount=payload.amount, currency=booking.currency, payment_status=capture_status(db),
+        payment_method="cash", paid_at=utc_now(),
+    )
+    db.add(tx)
+    booking.payment_status = "paid" if payload.amount == outstanding else "partially_paid"
+    booking_ref.payment_status = booking.payment_status
+
+    record_booking_status_change(
+        db, booking_ref.id, booking.status, booking.status, provider.user_id,
+        notes=f"Cash receipt {tx_code} recorded for {payload.amount} {booking.currency}.",
+    )
     create_notification(
         db=db,
         user_id=booking.user_id,
@@ -2151,19 +2172,22 @@ def record_cash_payment(
         message=f"Cash payment of {payload.amount} {booking.currency} recorded for rental {vehicle.vehicle_name}. Status: {booking.payment_status}.",
         notification_type="rental_payment_received",
         link_url=f"/traveler/rental-bookings/{booking.id}",
+        deduplicate=False,
     )
 
     db.commit()
-    db.refresh(booking)
+    return rental_cash_receipt(booking, tx)
 
+
+def rental_cash_receipt(booking, tx):
     return ProviderCashPaymentResponse(
         booking_id=booking.id,
-        amount_received=payload.amount,
-        currency=booking.currency,
+        amount_received=tx.amount,
+        currency=tx.currency,
         payment_status=booking.payment_status,
-        gateway_transaction_id=tx_code,
-        paid_at=now,
-        message=f"Cash payment of {payload.amount} {booking.currency} recorded successfully.",
+        gateway_transaction_id=tx.gateway_transaction_id,
+        paid_at=tx.paid_at,
+        message=f"Cash payment of {tx.amount} {tx.currency} recorded successfully.",
     )
 
 
@@ -2431,9 +2455,9 @@ def get_provider_dashboard(
         db.query(PaymentTransaction)
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .filter(
-            BookingReference.module_type == "rental_vehicle",
+            BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
             BookingReference.provider_profile_id == provider_id,
-            PaymentTransaction.payment_status.in_(["paid", "completed", "success"]),
+            PaymentTransaction.payment_status.in_((*CAPTURED, "success")),
         )
         .all()
     )
@@ -2506,7 +2530,7 @@ def get_provider_rental_settlements_summary(
             db.query(func.coalesce(func.sum(RentalBooking.total_price), Decimal("0.00")))
             .filter(
                 RentalBooking.vehicle_id.in_(vehicle_ids),
-                RentalBooking.status.in_(["confirmed", "active", "completed"]),
+                RentalBooking.status.in_(["confirmed", "active", "in_progress", "completed"]),
             )
             .scalar()
         )
@@ -2518,9 +2542,9 @@ def get_provider_rental_settlements_summary(
         db.query(PaymentTransaction)
         .join(BookingReference, PaymentTransaction.booking_reference_id == BookingReference.id)
         .filter(
-            BookingReference.module_type == "rental_vehicle",
+            BookingReference.module_type.in_(RENTAL_BOOKING_REFERENCE_TYPES),
             BookingReference.provider_profile_id == provider_id,
-            PaymentTransaction.payment_status.in_(["paid", "completed", "success"]),
+            PaymentTransaction.payment_status.in_((*CAPTURED, "success")),
         )
         .all()
     )
@@ -2534,6 +2558,20 @@ def get_provider_rental_settlements_summary(
         Decimal("0.00"),
     )
     confirmed_payments = online_paid + cash_paid
+
+    online_transaction_ids = [
+        tx.id for tx in transactions
+        if tx.gateway_name == "payhere" and tx.payment_method != "cash"
+    ]
+    refund_reserve = db.scalar(select(func.coalesce(func.sum(PaymentRefund.amount), 0)).where(
+        PaymentRefund.payment_transaction_id.in_(online_transaction_ids),
+        PaymentRefund.refund_status.in_(RESERVED_REFUNDS),
+    ))
+    held_deposits = db.scalar(select(func.coalesce(func.sum(
+        RentalDeposit.deposit_amount - RentalDeposit.deducted_amount - RentalDeposit.refunded_amount,
+    ), 0)).join(RentalBooking, RentalDeposit.booking_id == RentalBooking.id).where(
+        RentalBooking.vehicle_id.in_(vehicle_ids), RentalDeposit.deposit_status == "held",
+    ))
 
     # Provider settlements from dbo.provider_settlements
     settlements = (
@@ -2562,7 +2600,7 @@ def get_provider_rental_settlements_summary(
 
     # Pending balance is the recorded pending settlements plus un-settled online revenue
     pending_settlements = pending_from_records if pending_from_records > Decimal("0.00") else max(
-        Decimal("0.00"), online_paid - platform_commission - completed_payouts
+        Decimal("0.00"), online_paid - refund_reserve - platform_commission - completed_payouts
     )
 
     settlement_items = [
@@ -2588,6 +2626,8 @@ def get_provider_rental_settlements_summary(
         confirmed_payments=confirmed_payments,
         online_paid_amount=online_paid,
         cash_paid_amount=cash_paid,
+        online_refund_reserved_amount=refund_reserve,
+        security_deposits_held=held_deposits,
         platform_commission=platform_commission,
         completed_payouts=completed_payouts,
         pending_settlements=pending_settlements,
@@ -2727,6 +2767,55 @@ def list_provider_rental_campaigns(
         )
 
     return ProviderRentalCampaignListResponse(items=items, total=len(items))
+
+
+@router.post(
+    "/promotions/campaigns/{campaign_id}/payments/initiate",
+    response_model=PaymentInitiateResponse,
+)
+def initiate_rental_promotion_checkout(
+    campaign_id: int,
+    provider: Annotated[ProviderProfile, Depends(get_current_approved_rental_provider)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    lock_booking_resource(db, f"rental_promotion_{campaign_id}")
+    campaign = db.scalar(select(PromotionCampaign).where(
+        PromotionCampaign.id == campaign_id,
+        PromotionCampaign.provider_profile_id == provider.id,
+        PromotionCampaign.target_module.in_(RENTAL_CAMPAIGN_MODULES),
+    ))
+    if campaign is None:
+        raise HTTPException(404, "Rental campaign not found")
+    if campaign.status != "approved" or campaign.ends_at <= utc_now():
+        raise HTTPException(400, "Rental campaign must be approved and unexpired")
+    if not has_eligible_rental_inventory(db, provider.id, campaign.listing_reference_id):
+        raise HTTPException(400, "Provider has no eligible rental listings")
+    if db.scalar(verified_rental_promotion_payment().where(PromotionCampaign.id == campaign.id)):
+        raise HTTPException(409, "Rental campaign is already paid")
+    attempt = db.scalar(select(AdvertisingPayment).where(
+        AdvertisingPayment.campaign_id == campaign.id,
+        AdvertisingPayment.provider_profile_id == provider.id,
+        AdvertisingPayment.gateway_name == "payhere",
+        AdvertisingPayment.payment_status.in_(("pending", "failed")),
+    ).order_by(AdvertisingPayment.id.desc()).limit(1))
+    if attempt is None:
+        attempt = AdvertisingPayment(
+            campaign_id=campaign.id, provider_profile_id=provider.id,
+            order_reference=f"AD-RENTAL-{campaign.id}-{uuid4().hex}",
+            amount=campaign.budget, currency=campaign.currency,
+            gateway_name="payhere", payment_status="pending",
+        )
+        db.add(attempt)
+    else:
+        if attempt.amount != campaign.budget or attempt.currency != campaign.currency:
+            raise HTTPException(409, "Rental campaign checkout requires reconciliation")
+        attempt.payment_status = "pending"
+    response = checkout_response(
+        campaign.id, attempt.order_reference, campaign.campaign_name,
+        attempt.amount, attempt.currency, db.get(User, provider.user_id),
+    )
+    db.commit()
+    return response
 
 
 @router.post(

@@ -6,6 +6,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -122,6 +123,11 @@ class RentalBookingResponse(BaseModel):
     refund_record_created: bool = False
     created_at: datetime
     updated_at: datetime | None = None
+
+    @field_validator("self_drive_agreement_accepted", mode="before")
+    @classmethod
+    def default_legacy_agreement(cls, value):
+        return False if value is None else value
 
 
 class RentalBookingCancelResponse(BaseModel):
@@ -250,6 +256,7 @@ class RentalInspectionResponse(BaseModel):
     inspected_by: int | None = None
     customer_signature: str | None = None
     is_acknowledged: bool = False
+    acknowledged_at: datetime | None = None
     notes: str | None = None
     helmets: VehicleHelmetInfo | None = None
     fuel_policy: str = "same_to_same"

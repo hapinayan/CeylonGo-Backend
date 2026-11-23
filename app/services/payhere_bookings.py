@@ -1,7 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.booking_transactions import CAPTURED, lock_booking_resource
 from app.core.payhere import payhere_service
@@ -32,7 +32,7 @@ def lock_capture(db, payment_id, reference_id):
             select(PaymentTransaction.id)
             .where(
                 PaymentTransaction.gateway_name == "payhere",
-                PaymentTransaction.gateway_transaction_id == payment_id,
+                func.lower(PaymentTransaction.gateway_transaction_id) == canonical,
                 PaymentTransaction.booking_reference_id != reference_id,
                 PaymentTransaction.payment_status.in_(CAPTURED),
             )

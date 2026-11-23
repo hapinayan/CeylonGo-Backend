@@ -1,14 +1,16 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from math import ceil
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import case, func, or_, select, true
+from sqlalchemy import and_, case, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import require_approved_provider
+from app.core.booking_transactions import lock_booking_resource
 from app.core.publication import public_rental
+from app.core.rental_capacity import TUK_TUK_MIN_PASSENGERS, tuk_tuk_passenger_limit, valid_tuk_tuk_seating_capacity
 from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import (
@@ -20,9 +22,11 @@ from app.models.rental import (
 )
 from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
-from app.models.shared import PromotionCampaign
+from app.models.shared import ListingReference, PromotionCampaign
 from app.models.user import User
 from app.routers.auth import get_current_user, get_optional_current_user
+from app.services.rental_promotions import RENTAL_CAMPAIGN_MODULES, verified_rental_promotion_payment
+from app.services.rental_availability import overlapping_rental_bookings
 from app.schemas.rental_vehicle import (
     FuelPolicy,
     RentalAvailabilityBlockCreate,
@@ -141,23 +145,46 @@ def normalize_utc(value: datetime) -> datetime:
     return value
 
 
-def get_active_sponsored_provider_ids(db: Session) -> set[int]:
-    """Retrieves provider IDs with active rental promotion campaigns (TR-19)."""
+def tuk_tuk_capacity_metadata(vehicle: RentalVehicle) -> dict[str, int | None]:
+    if vehicle.vehicle_type != "tuk_tuk":
+        return {}
+    limit = tuk_tuk_passenger_limit(vehicle.seating_capacity)
+    return {
+        "max_passengers": limit,
+        "min_passengers": TUK_TUK_MIN_PASSENGERS if limit is not None else None,
+    }
+
+
+def get_active_rental_sponsorship(db: Session) -> tuple[set[int], set[int]]:
     current_time = utc_now()
     try:
         active_campaigns = (
-            db.query(PromotionCampaign.provider_profile_id)
+            db.query(PromotionCampaign.provider_profile_id, PromotionCampaign.listing_reference_id,
+                     RentalVehicle.id)
+            .outerjoin(ListingReference, and_(
+                ListingReference.id == PromotionCampaign.listing_reference_id,
+                ListingReference.module_type.in_(RENTAL_CAMPAIGN_MODULES),
+                ListingReference.provider_profile_id == PromotionCampaign.provider_profile_id,
+            ))
+            .outerjoin(RentalVehicle, and_(
+                RentalVehicle.id == ListingReference.target_id,
+                RentalVehicle.provider_id == PromotionCampaign.provider_profile_id,
+            ))
             .filter(
-                PromotionCampaign.target_module.in_(["rental", "rental_vehicle"]),
+                PromotionCampaign.target_module.in_(RENTAL_CAMPAIGN_MODULES),
                 PromotionCampaign.status == "active",
+                verified_rental_promotion_payment().exists(),
                 PromotionCampaign.starts_at <= current_time,
-                PromotionCampaign.ends_at >= current_time,
+                PromotionCampaign.ends_at > current_time,
             )
             .all()
         )
-        return {c[0] for c in active_campaigns}
+        return (
+            {provider_id for provider_id, reference_id, _ in active_campaigns if reference_id is None},
+            {vehicle_id for _, _, vehicle_id in active_campaigns if vehicle_id is not None},
+        )
     except Exception:
-        return set()
+        return set(), set()
 
 
 def get_vehicle_insurance_summary(vehicle_id: int, db: Session) -> VehicleInsuranceSummary:
@@ -168,13 +195,20 @@ def get_vehicle_insurance_summary(vehicle_id: int, db: Session) -> VehicleInsura
     - Never exposes private file storage paths or unverified claims.
     """
     today = date.today()
+    active_policy = and_(
+        RentalVehicleDocument.is_verified == true(),
+        RentalVehicleDocument.expiry_date >= today,
+        or_(RentalVehicleDocument.insurance_effective_date.is_(None),
+            RentalVehicleDocument.insurance_effective_date <= today),
+    )
     insurance_doc = (
         db.query(RentalVehicleDocument)
         .filter(
             RentalVehicleDocument.vehicle_id == vehicle_id,
             RentalVehicleDocument.document_type == "insurance_certificate",
         )
-        .order_by(RentalVehicleDocument.created_at.desc())
+        .order_by(case((active_policy, 1), else_=0).desc(),
+                  RentalVehicleDocument.created_at.desc(), RentalVehicleDocument.id.desc())
         .first()
     )
 
@@ -187,37 +221,41 @@ def get_vehicle_insurance_summary(vehicle_id: int, db: Session) -> VehicleInsura
         )
 
     is_expired = bool(insurance_doc.expiry_date and insurance_doc.expiry_date < today)
+    is_future = bool(insurance_doc.insurance_effective_date and insurance_doc.insurance_effective_date > today)
 
-    if insurance_doc.is_verified and not is_expired:
+    if insurance_doc.is_verified and insurance_doc.expiry_date is not None and not is_expired and not is_future:
         status_str = "verified"
         is_ins = True
     elif is_expired:
         status_str = "expired"
+        is_ins = False
+    elif insurance_doc.is_verified and is_future:
+        status_str = "not_yet_effective"
         is_ins = False
     else:
         status_str = "unverified"
         is_ins = False
 
     masked_policy = None
-    if insurance_doc.document_number:
-        clean_num = insurance_doc.document_number.strip()
+    policy_number = insurance_doc.insurance_policy_number or insurance_doc.document_number
+    if policy_number:
+        clean_num = policy_number.strip()
         if len(clean_num) <= 4:
             masked_policy = "****"
         else:
             masked_policy = f"{clean_num[:2]}****{clean_num[-4:]}"
-
-    cov_amount = getattr(insurance_doc, "coverage_amount", None)
-    ded_amount = getattr(insurance_doc, "deductible_amount", None)
-    ins_prov = getattr(insurance_doc, "insurance_provider", None)
 
     return VehicleInsuranceSummary(
         is_insured=is_ins,
         insurance_status=status_str,
         policy_number_masked=masked_policy,
         expiry_date=insurance_doc.expiry_date,
-        coverage_amount=cov_amount,
-        deductible_amount=ded_amount,
-        insurance_provider=ins_prov,
+        effective_date=insurance_doc.insurance_effective_date,
+        exclusions=insurance_doc.insurance_exclusions if is_ins else None,
+        evidence_verified=bool(is_ins and insurance_doc.file_reference.strip()),
+        coverage_amount=insurance_doc.coverage_amount if is_ins else None,
+        deductible_amount=insurance_doc.deductible_amount if is_ins else None,
+        insurance_provider=insurance_doc.insurance_provider if is_ins else None,
     )
 
 
@@ -262,22 +300,22 @@ def get_vehicle_helmet_info(vehicle: RentalVehicle, db: Session) -> VehicleHelme
     db_included = getattr(vehicle, "helmets_included", None)
     db_sizes = getattr(vehicle, "helmet_sizes", None)
     if db_count is not None and db_count > 0:
-        sizes_list = [s.strip() for s in db_sizes.split(",") if s.strip()] if db_sizes else ["Standard"]
+        sizes_list = [s.strip() for s in db_sizes.split(",") if s.strip()] if db_sizes else None
         return VehicleHelmetInfo(
             helmet_provided=True,
             helmet_count=db_count,
             helmet_sizes=sizes_list,
-            helmet_condition="Good",
+            helmet_condition=vehicle.helmet_condition,
             requires_helmet=True,
             notes=f"Provided with {db_count} helmet(s)",
         )
     elif db_included is not None and db_included:
-        sizes_list = [s.strip() for s in db_sizes.split(",") if s.strip()] if db_sizes else ["Standard"]
+        sizes_list = [s.strip() for s in db_sizes.split(",") if s.strip()] if db_sizes else None
         return VehicleHelmetInfo(
             helmet_provided=True,
-            helmet_count=1,
+            helmet_count=None,
             helmet_sizes=sizes_list,
-            helmet_condition="Good",
+            helmet_condition=vehicle.helmet_condition,
             requires_helmet=True,
             notes="Helmets included with vehicle rental",
         )
@@ -295,7 +333,7 @@ def get_vehicle_helmet_info(vehicle: RentalVehicle, db: Session) -> VehicleHelme
             sizes_m = re.search(r"sizes=([^,\]]+(?:,\s*[^,\]]+)*?)(?:,\s*condition|$)", content, re.IGNORECASE)
             sizes = [s.strip() for s in sizes_m.group(1).split(",") if s.strip()] if sizes_m else None
             cond_m = re.search(r"condition=([^,\]]+)", content, re.IGNORECASE)
-            cond = cond_m.group(1).strip() if cond_m else "Good"
+            cond = cond_m.group(1).strip() if cond_m else None
             return VehicleHelmetInfo(
                 helmet_provided=count > 0,
                 helmet_count=count,
@@ -306,18 +344,17 @@ def get_vehicle_helmet_info(vehicle: RentalVehicle, db: Session) -> VehicleHelme
             )
         # Free-text format: "2 helmets" or "includes 1 helmet"
         count_match = re.search(r"(\d+)\s*helmets?", desc, re.IGNORECASE)
-        count = int(count_match.group(1)) if count_match else 1
+        count = int(count_match.group(1)) if count_match else None
         sizes = []
         for s in ["XS", "S", "M", "L", "XL", "XXL"]:
             if re.search(r"\b" + s + r"\b", desc):
                 sizes.append(s)
         return VehicleHelmetInfo(
-            helmet_provided=True,
+            helmet_provided=count is not None and count > 0,
             helmet_count=count,
-            helmet_sizes=sizes if sizes else ["Standard"],
-            helmet_condition="Good",
+            helmet_sizes=sizes or None,
             requires_helmet=True,
-            notes=f"Disclosed by provider: {count} helmet(s)",
+            notes=f"Disclosed by provider: {count} helmet(s)" if count is not None else "Helmet quantity is unspecified.",
         )
 
     return VehicleHelmetInfo(
@@ -456,6 +493,11 @@ def get_rental_vehicles(
     if vehicle_type:
         query = query.filter(RentalVehicle.vehicle_type == vehicle_type)
 
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(400, "min_price must not exceed max_price")
+    if (pickup_at is None) != (return_at is None):
+        raise HTTPException(400, "pickup_at and return_at must be supplied together")
+
     # 3. Price range filters
     if min_price is not None:
         query = query.filter(RentalVehicle.price_per_day >= min_price)
@@ -482,7 +524,7 @@ def get_rental_vehicles(
         booking_overlap_subq = (
             db.query(RentalBooking.vehicle_id)
             .filter(
-                RentalBooking.status.in_(["pending", "confirmed", "active"]),
+                RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
                 or_(
                     RentalBooking.status != "pending",
                     RentalBooking.expires_at > current_time,
@@ -511,9 +553,10 @@ def get_rental_vehicles(
         )
 
     # 6. Sorting with sponsored promotion prioritization (TR-19)
-    sponsored_provider_ids = get_active_sponsored_provider_ids(db)
+    sponsored_provider_ids, sponsored_vehicle_ids = get_active_rental_sponsorship(db)
     sponsored_order = case(
-        (RentalVehicle.provider_id.in_(sponsored_provider_ids), 0),
+        (or_(RentalVehicle.provider_id.in_(sponsored_provider_ids),
+             RentalVehicle.id.in_(sponsored_vehicle_ids)), 0),
         else_=1,
     ).asc()
 
@@ -569,6 +612,7 @@ def get_rental_vehicles(
                 status=v.status,
                 model_year=v.model_year,
                 seating_capacity=v.seating_capacity,
+                **tuk_tuk_capacity_metadata(v),
                 transmission=v.transmission,
                 fuel_type=v.fuel_type,
                 district=loc_district,
@@ -576,7 +620,7 @@ def get_rental_vehicles(
                 location_id=v.location_id,
                 location_name=loc_name,
                 primary_image_url=primary_img,
-                is_sponsored=(v.provider_id in sponsored_provider_ids),
+                is_sponsored=(v.provider_id in sponsored_provider_ids or v.id in sponsored_vehicle_ids),
                 cancellation_policy=v.cancellation_policy,
                 free_cancellation_hours=v.free_cancellation_hours,
                 is_insured=ins.is_insured,
@@ -652,7 +696,7 @@ def get_rental_vehicle(
         is_verified = (vehicle.provider.approval_status == "approved")
         prov_name = vehicle.provider.business_name
 
-    sponsored_provider_ids = get_active_sponsored_provider_ids(db)
+    sponsored_provider_ids, sponsored_vehicle_ids = get_active_rental_sponsorship(db)
 
     # Sort images by display_order
     sorted_images = sorted(vehicle.images, key=lambda img: (img.display_order, img.id))
@@ -674,6 +718,7 @@ def get_rental_vehicle(
         status=vehicle.status,
         model_year=vehicle.model_year,
         seating_capacity=vehicle.seating_capacity,
+        **tuk_tuk_capacity_metadata(vehicle),
         transmission=vehicle.transmission,
         fuel_type=vehicle.fuel_type,
         district=loc_district,
@@ -699,7 +744,7 @@ def get_rental_vehicle(
         images=sorted_images,
         rate_plans=active_plans,
         approval_status=vehicle.approval_status,
-        is_sponsored=(vehicle.provider_id in sponsored_provider_ids),
+        is_sponsored=(vehicle.provider_id in sponsored_provider_ids or vehicle.id in sponsored_vehicle_ids),
         created_at=vehicle.created_at,
         updated_at=vehicle.updated_at,
     )
@@ -767,10 +812,8 @@ def get_rental_vehicle_locations(
     locations = (
         db.query(RentalLocation)
         .filter(
-            or_(
-                RentalLocation.id == vehicle.location_id,
-                RentalLocation.provider_id == vehicle.provider_id,
-            )
+            RentalLocation.provider_id == vehicle.provider_id,
+            RentalLocation.is_active == true(),
         )
         .order_by(
             case((RentalLocation.id == vehicle.location_id, 0), else_=1).asc(),
@@ -994,6 +1037,8 @@ def calculate_rental_quote(
 
     return RentalQuoteResponse(
         vehicle_id=vehicle.id,
+        seating_capacity=vehicle.seating_capacity,
+        **tuk_tuk_capacity_metadata(vehicle),
         pickup_at=pickup_at,
         return_at=return_at,
         duration_hours=duration_hours,
@@ -1056,7 +1101,7 @@ def get_rental_vehicle_availability(
         db.query(RentalBooking)
         .filter(
             RentalBooking.vehicle_id == vehicle.id,
-            RentalBooking.status.in_(["pending", "confirmed", "active"]),
+            RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
             or_(
                 RentalBooking.status != "pending",
                 RentalBooking.expires_at > current_time,
@@ -1158,6 +1203,9 @@ def create_rental_vehicle(
     if vehicle_data.location_id is not None:
         require_owned_pickup_location(db, provider.id, vehicle_data.location_id)
 
+    if vehicle_data.vehicle_type == "tuk_tuk" and not valid_tuk_tuk_seating_capacity(vehicle_data.seating_capacity):
+        raise HTTPException(422, "Tuk-tuk total seating capacity must be 3 or 4")
+
     new_vehicle = RentalVehicle(
         provider_id=provider.id,
         vehicle_type=vehicle_data.vehicle_type,
@@ -1175,6 +1223,10 @@ def create_rental_vehicle(
         city=vehicle_data.city,
         cancellation_policy=vehicle_data.cancellation_policy,
         free_cancellation_hours=vehicle_data.free_cancellation_hours,
+        helmet_count=vehicle_data.helmet_count,
+        helmets_included=vehicle_data.helmets_included,
+        helmet_sizes=vehicle_data.helmet_sizes,
+        helmet_condition=vehicle_data.helmet_condition,
         approval_status="approved" if current_user.role == "admin" else "pending",
     )
 
@@ -1244,14 +1296,25 @@ def update_rental_vehicle(
             detail="No fields provided for update",
         )
 
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle.id}")
+    db.refresh(vehicle)
     if update_data.get("location_id") is not None:
         require_owned_pickup_location(db, provider.id, update_data["location_id"])
+
+    if {"seating_capacity", "vehicle_type"}.intersection(update_data):
+        target_type = update_data.get("vehicle_type", vehicle.vehicle_type)
+        target_seats = update_data.get("seating_capacity", vehicle.seating_capacity)
+        if target_type == "tuk_tuk" and not valid_tuk_tuk_seating_capacity(target_seats):
+            raise HTTPException(422, "Tuk-tuk total seating capacity must be 3 or 4")
 
     # Update vehicle fields
     for field, value in update_data.items():
         if field in {"approval_status", "verification_status"} and current_user.role != "admin":
             continue
-        if value is None and field not in {"description", "cancellation_policy", "license_plate", "location_id"}:
+        if value is None and field not in {
+            "description", "cancellation_policy", "license_plate", "location_id",
+            "helmet_count", "helmets_included", "helmet_sizes", "helmet_condition",
+        }:
             raise HTTPException(
                 status_code=422,
                 detail=f"{field} cannot be null",
@@ -1319,17 +1382,12 @@ def create_rental_availability_block(
             detail="Rental vehicle not found or not owned by you",
         )
 
-    # 1. Check for overlapping confirmed or pending bookings
-    conflicting_booking = (
-        db.query(RentalBooking)
-        .filter(
-            RentalBooking.vehicle_id == vehicle_id,
-            RentalBooking.status.in_(["pending", "confirmed"]),
-            RentalBooking.start_date <= payload.end_date,
-            RentalBooking.end_date >= payload.start_date,
-        )
-        .first()
-    )
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle_id}")
+    start_at = datetime.combine(payload.start_date, datetime.min.time())
+    end_at = datetime.combine(payload.end_date + timedelta(days=1), datetime.min.time())
+    conflicting_booking = overlapping_rental_bookings(
+        db, vehicle_id, start_at, end_at, utc_now(),
+    ).first()
 
     if conflicting_booking:
         raise HTTPException(
@@ -1343,8 +1401,8 @@ def create_rental_availability_block(
         .filter(
             RentalAvailabilityBlock.vehicle_id == vehicle_id,
             RentalAvailabilityBlock.is_active.is_(True),
-            RentalAvailabilityBlock.start_date <= payload.end_date,
-            RentalAvailabilityBlock.end_date >= payload.start_date,
+            RentalAvailabilityBlock.start_datetime < end_at,
+            RentalAvailabilityBlock.end_datetime > start_at,
         )
         .first()
     )
@@ -1357,12 +1415,11 @@ def create_rental_availability_block(
 
     new_block = RentalAvailabilityBlock(
         vehicle_id=vehicle_id,
-        start_date=payload.start_date,
-        end_date=payload.end_date,
+        start_datetime=start_at,
+        end_datetime=end_at,
         block_type=payload.block_type,
         reason=payload.reason,
         is_active=True,
-        created_by=current_user.id,
     )
 
     try:
@@ -1386,7 +1443,7 @@ def list_rental_availability_blocks(
     db: Annotated[Session, Depends(get_db)],
 ):
     """List active availability blocks for a rental vehicle."""
-    vehicle = db.get(RentalVehicle, vehicle_id)
+    vehicle = db.query(RentalVehicle).filter(RentalVehicle.id == vehicle_id, public_rental()).first()
     if not vehicle:
         raise HTTPException(
             status_code=404,
@@ -1399,7 +1456,7 @@ def list_rental_availability_blocks(
             RentalAvailabilityBlock.vehicle_id == vehicle_id,
             RentalAvailabilityBlock.is_active.is_(True),
         )
-        .order_by(RentalAvailabilityBlock.start_date.asc())
+        .order_by(RentalAvailabilityBlock.start_datetime.asc())
         .all()
     )
 
@@ -1448,6 +1505,7 @@ def delete_rental_availability_block(
             detail="Rental vehicle not found or not owned by you",
         )
 
+    lock_booking_resource(db, f"rental_vehicle_booking_{vehicle_id}")
     block = (
         db.query(RentalAvailabilityBlock)
         .filter(
@@ -1525,8 +1583,14 @@ def add_rental_vehicle_document(
     doc = RentalVehicleDocument(
         vehicle_id=vehicle_id,
         document_type=payload.document_type.strip(),
-        document_url=payload.document_url.strip(),
+        file_reference=payload.document_url.strip(),
         expiry_date=payload.expiry_date,
+        insurance_effective_date=payload.insurance_effective_date,
+        insurance_exclusions=payload.insurance_exclusions,
+        coverage_amount=payload.coverage_amount,
+        deductible_amount=payload.deductible_amount,
+        insurance_provider=payload.insurance_provider,
+        insurance_policy_number=payload.insurance_policy_number,
         is_verified=False,
     )
     db.add(doc)

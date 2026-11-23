@@ -1,0 +1,166 @@
+TR-05 approval sheet
+
+Source reviewed: TR-05_Vehicle_Rental_Remaining_Work.docx and the repository
+requirements, schemas, migrations, routes and tests. The source summarizes
+acceptance but does not provide the decisions below. The listed options are
+proposals for review. Existing behavior remains in effect.
+
+Approval table
+ID | Current behavior | Options (proposals) | Recommendation | Risk | Approval question
+T-03 | API and SQL accept bike, bicycle and tuk_tuk. | A: add two approved identifiers with explicit compatibility mapping. B: approve a temporary three-category scope deferral. | A once the catalogue is supplied. | Unknown identifiers can break SQL writes and older clients. | Which option do you approve? For A, supply both IDs, labels, aliases and the mapping from existing records.
+T-14 | Cancellation uses booked hours and rate snapshots and reserves refunds against verified captures. Prose does not drive the fee. | A: version structured terms for new bookings and route unmatched historical cases to review. B: adopt one approved platform formula with explicit legacy treatment. | A, with Product and Finance sign-off. | Applying prose or present-day rates to older bookings can overcharge or over-reserve. | Which option, formula, cutoff, rounding, cash/online treatment and historical rule are approved?
+A-04 | Operations can review protected identity documents and decide provider approval. Business evidence has no independent decision. | A: gate onboarding with approved evidence. B: add separately audited evidence decisions and explicitly map them to onboarding or badges. | B using the existing protected access pattern. | Incorrect evidence or permission rules could expose private documents or block legitimate providers. | Which evidence types, reviewers, transitions, expiry and publication effects are approved?
+X-01 | Motorized rentals check approved driving evidence and validity through return. Existing local evidence access uses exact ownership and the established admin roles. | A: approved category-to-class matrix with evidence and access rules. B: authorized manual review for combinations not covered by a matrix. | A plus B only for an explicitly approved review queue. | Unsupported classes can be wrongly accepted or valid drivers blocked. | Which classes and evidence are approved per category, and who may inspect the documents under the untruncated access rule?
+X-06 | Pickup and return store timestamped inspection details and support signed traveller acknowledgement. References are optional and do not prove upload ownership. | A: managed upload IDs bound to actor, booking and inspection. B: allow approved external references with explicit proof and retention rules. | A, with documented exceptions if needed. | Unbound evidence can be attributed to the wrong inspection. Mandatory counts can block valid handovers. | For pickup and return, which evidence is required, what proves ownership, and what exceptions, clocks and retention apply?
+X-10 | Current tuk-tuk contract uses three or four total seats including the driver and at least one passenger. | A: per-vehicle verified capacity. B: approved jurisdiction/category limits with documented exceptions. Either needs an explicit solo decision. | A where authoritative vehicle evidence exists. Preserve historical rows. | Incorrect driver-seat semantics can misstate limits or invalidate older reservations. | Which capacity source is approved, is zero-passenger self-drive allowed, and how should legacy listings be treated?
+X-11 | The current foreign tuk-tuk check requires an approved eligibility record with an IDP number or recognition permit number on file. | A: approve alternatives with a jurisdiction/issuer table. B: approve cumulative documents where required, with stated exceptions. | Apply the Compliance-authored matrix at booking and handover. | Treating documents as interchangeable without approval can wrongly authorize a rental. | For each jurisdiction and licence class, which permits are alternatives or cumulative, and what validity/evidence must be verified at both checkpoints?
+
+Authority boundary: The supplied TR-05 document states the acceptance outcomes,
+including five categories and restricted evidence access, but omits the
+identifiers, formulae and approval matrices. SQL schemas and tests establish
+the current compatibility contract, not legal or financial approval. The
+repository checks and recipes below are implementation references.
+
+Source trace (catalogue page numbers are as identified in the supplied DOCX):
+T-03: T catalogue p. 31 asks for five categories; migration 019 line 23
+and app/schemas/rental_vehicle.py line 10 identify only the three current types.
+T-14: T catalogue p. 32 requires published terms; migration 026 line 443
+defines the free-window snapshot, not a mapping from prose to a monetary fee.
+A-04: A catalogue p. 33 requires business and identity review. The known
+approval entry point is app/routers/admin_providers.py line 285.
+X-01: X catalogue p. 33 requires valid licence class and restricted evidence
+access, with the access clause truncated. Migration 026 line 516 defines the
+eligibility record; the mounted local document route preserves the existing
+owner and Operations/super-admin authorization contract.
+X-06: X catalogue p. 33 requires timestamped photos, odometer and signed
+acknowledgement. The repository inspection routes do not supply an upload
+ownership or mandatory-photo matrix.
+X-10: X catalogue p. 33 requires legal capacity and party constraints.
+Migration 026 line 194 constrains seats to positive values, while
+app/core/rental_capacity.py implements current product bounds.
+X-11: X catalogue p. 33 requires the applicable endorsements before
+handover. Migration 033 line 25 stores a recognition permit number; this
+storage field does not determine when a permit is legally sufficient.
+
+T-03 | Vehicle catalogue | Product and database owners
+Question: What are the two additional approved category identifiers, labels
+and aliases? Which legacy rows, rate plans, eligibility rules, search filters
+and client enum values map to each category?
+Existing: bike, bicycle and tuk_tuk in public/provider schemas and SQL.
+Proposals: Introduce distinct types while preserving existing IDs; or approve
+explicit subtype mappings under existing types if they satisfy the catalogue.
+Recommendation: Keep the three current identifiers until a versioned catalogue
+and explicit legacy mapping are approved. Prefer an additive mapping.
+Impact: app/schemas/rental_vehicle.py, app/schemas/rental_provider.py,
+app/routers/rental_vehicles.py, app/services/rental_eligibility.py,
+migrations/019_create_rental_tables.sql and migrations/046_create_rental_age_rules.sql.
+Tests: test_get_categories_returns_supported_types_and_fleet_counts,
+test_category_specs_validation_* and new old/new client round-trip cases.
+
+A-04 | Provider business verification | Product and Operations
+Question: Which evidence types are required for each rental business type?
+Who can review them, with what reason, expiry and resubmission states? Does
+individual evidence approval gate provider approval, a badge, or publication?
+Existing: Shared provider approval checks identity document presence; admin
+can inspect protected identity documents. Existing business fields do not
+define an independent evidence decision.
+Proposals: Reuse onboarding review with documented business evidence gates;
+or use an independently auditable review linked to onboarding and badges.
+Recommendation: Reuse protected evidence access and retain a separate audit
+decision for each approved business-evidence type.
+Impact: app/routers/admin_providers.py, app/models/provider_profile.py and
+app/routers/rental_providers.py. Tests: test_secure_identity_document_viewing,
+test_approve_provider_success and a new business evidence decision matrix.
+
+T-14 | Cancellation terms | Product and Finance
+Question: What structured rule maps the published policy to cutoff, fee,
+rounding and treatment of unpaid, cash and captured-online reservations?
+Which historical snapshots may use a default and who handles disputes?
+Existing: Booking snapshots retain policy text, hours and daily rate. Zero
+hours and exact cutoff are handled. Existing numeric late-fee logic remains;
+refund reservations are limited to the verified capture and held amounts.
+Cancellation returns 409 for a reservation recorded in a different currency
+or with a negative amount, before any cancellation or refund change persists.
+Proposals: Publish versioned structured templates; or require explicit
+structured terms alongside prose and hold ambiguous legacy cases for review.
+Recommendation: Version structured terms for new bookings and route ambiguous
+legacy terms to authorized review. Approve the formula before changing fees.
+Impact: app/routers/rental_bookings.py, app/schemas/rental_booking.py and
+app/models/rental_booking.py. Tests: test_cancellation_keeps_booking_time_cutoff,
+test_rental_cancellation_reserves_only_remaining_verified_capture and
+test_rental_cancel_and_capture_serialized_outcomes.
+
+X-01 and X-11 | Licence and permit evidence | Compliance and Operations
+Question: What licence classes, issuers, jurisdictions and endorsements are
+accepted by category at booking and handover? Are permits alternatives or
+cumulative? What are their validity, review and protected-access rules?
+Existing: Motorized rentals require approved evidence covering the return
+date. The current foreign tuk-tuk check requires an approved eligibility
+record with an IDP number or recognition permit number on file. The source
+X-01 access wording is truncated.
+Proposals: Adopt a documented category/jurisdiction verification table;
+or require authorized manual review for unsupported combinations.
+Recommendation: Obtain the compliance-approved table and require authorized
+review of combinations it does not cover before extending the automated rule.
+Impact: app/routers/rental_eligibility.py, app/services/rental_eligibility.py,
+app/models/rental.py, booking and handover routes. Tests:
+test_secure_document_access_and_path_traversal_protection,
+test_ar11_foreign_tuk_tuk_aac_recognition_permit_verification and
+test_handover_rechecks_license_eligibility_and_sanitizes_response.
+
+X-06 | Inspection photos and ownership | Product, Operations and Storage
+Question: Which evidence is mandatory at each stage and under which exceptions?
+Which upload, owner and booking IDs prove a photo belongs to an inspection?
+Which capture/check-in clock and retention period are authoritative?
+Existing: Reports support optional photo references, timestamps, odometer
+and authenticated traveller acknowledgement. Reference validation does not
+establish ownership in an external upload system.
+Proposals: Bind authorized uploads to booking and inspection IDs; or permit
+approved external storage with explicit ownership proof and review.
+Recommendation: Bind managed upload IDs to owner, booking and inspection.
+Approve any external-reference exception and its retention rules separately.
+Impact: app/routers/rental_bookings.py, app/routers/rental_providers.py and
+app/schemas/rental_provider.py. Tests: test_record_vehicle_handover_success_and_lifecycle,
+test_return_inspection_cannot_be_acknowledged_via_handover_endpoint and
+new upload binding/retention cases when the contract is approved.
+
+X-10 | Seating and solo self-drive | Compliance and Product
+Question: What authoritative total/usable seats apply per jurisdiction and
+vehicle, including the driver? Is zero passengers valid for solo self-drive?
+What should happen to existing listings or bookings outside the approved rule?
+Existing: Supported tuk-tuk listings have three or four seats including the
+driver, with a minimum of one passenger. Public and booking validation agree,
+and typed party size coexists with historical fallback.
+Proposals: Validate per-vehicle verified capacity; or apply an approved
+category rule with documented exceptions and legacy handling.
+Recommendation: Prefer verified vehicle-specific capacity where evidence is
+available. Keep existing values until Compliance approves limits and solo use.
+Impact: app/core/rental_capacity.py, app/routers/rental_vehicles.py,
+app/routers/rental_bookings.py and migrations/044_add_rental_booking_party_size.sql.
+Tests: test_tuktuk_capacity_is_consistent_in_discovery_detail_quote_and_booking,
+test_get_rental_booking_retrieves_persisted_agreement_and_passengers and
+new approved solo and regulatory boundaries.
+
+Other pending acceptance decisions
+T-18: Define whether pickup and return alerts include scheduled reminders,
+their timing, recipients and late-change handling.
+T-02: Confirm whether any future filtering should use effective rate plans.
+Current filters use published base daily price.
+X-07: Decide whether grace and hourly price must be immutable booking-time
+snapshots across rate-plan edits. Current return checks use the existing rule.
+
+Implementation handoff after approval
+
+These are proposed schema and test designs. Each policy owner must supply the
+actual rule values, effective date, historical treatment and approval reference
+before implementation. Existing application behavior is the compatibility
+baseline for these seven policy-blocked rows.
+
+ID | Proposed storage and evaluation | Acceptance after approval
+T-14 | Store an immutable version reference and structured terms snapshot on each new booking. Capture the selected fee formula and operands, cutoff convention, rounding, currency, payment method treatment and legacy fallback once approved. Under the existing booking lock, calculate fees from the snapshot and reserve refunds solely against verified captures. | Exact cutoff and rounding boundaries, changed terms after booking, cash and unpaid outcomes, historical defaults or manual review, and retry/concurrency cases that keep reservations within the verified capture.
+X-10 | Keep owner-entered seats separate from verified capacity. Store the approved evidence reference, issuing authority, jurisdiction, verified seat count, validity and reviewer. Snapshot the resulting party limits on new bookings and use one calculation for discovery, quote and booking. | Verify valid, expired and unavailable evidence, the driver-seat convention, solo behavior, and historical booking display. Confirm a listing edit leaves booked snapshots intact.
+T-03 | Define a versioned category catalogue keyed by approved stable identifiers, with display labels, aliases and explicit legacy mappings. Apply mappings consistently to listings, searches, rate plans, eligibility and age rules. | Check old and new client round trips, all approved categories, conflict-free aliases and ledger-backed preservation of existing records.
+A-04 | Represent evidence type, subject, private file reference and expiry separately from each review decision. Record actor, reason, decision and timestamp. Apply approved gates to provider status, badge or publication. | Test permitted and denied reviewers, revisions, expiry and defined publication transitions without leaking private file references.
+X-01 | Represent an effective-dated matrix of vehicle categories, issuing jurisdictions, licence classes, required evidence and authorized reviewer roles. Reference the version used for each eligibility decision. | Check supported and unsupported class combinations, return-date validity, reviewer scope, rejection and any approved manual fallback.
+X-06 | Bind approved upload references to uploader, booking and inspection stage. Store evidence timestamps and retain authenticated acknowledgement independently. Enforce the approved stage-specific evidence list and exceptions. | Test wrong owner, wrong booking, wrong stage, missing mandatory evidence, retained historical inspections and authorized access.
+X-11 | Represent approved permit alternatives or cumulative sets by jurisdiction, issuer, class and vehicle category. Reference the rules and evidence used at booking and re-evaluate at handover. | Check both checkpoints, expired or missing permits, alternative versus cumulative sets and approved exception handling.

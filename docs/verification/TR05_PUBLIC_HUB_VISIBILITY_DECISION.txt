@@ -1,0 +1,137 @@
+TR05 T-06 public vehicle hub visibility decision
+Status: PROPOSED, NOT APPROVED
+
+Current behavior
+
+GET /api/v1/rental-vehicles/{vehicle_id}/locations is public. A missing or
+unapproved vehicle returns 404 with detail "Rental vehicle not found". An
+approved vehicle returns 200 with the provider's active hubs, or 200 with []
+if there are none. An eligible primary hub sorts first. The response includes
+the location label, existing address fields and nullable Decimal coordinates.
+
+Discovery, public vehicle detail and booking creation use public_rental.
+That predicate requires an available, approved vehicle, an approved provider
+profile backed by an active provider account, and an active provider-owned
+default hub when one is assigned. Authenticated detail previews have separate
+rules. Booking also checks supplied pickup and return hub IDs.
+
+An approved vehicle that fails publication can currently return active owned
+hubs even when public detail and booking return 404 and discovery omits it.
+That exposes the vehicle-to-hub association and can give a traveler choices
+they cannot book. The hub lookup already filters inactive and foreign hubs,
+including a foreign hub in a historical primary assignment. Active hub
+records can also appear independently in the general public hub directory.
+
+The T-06 fixture specifies a successful map-point response. Existing tests
+also expect a 200 with the provider's other active hubs when the primary
+assignment points to a foreign hub. The evidence index records the policy
+question as open.
+
+References
+  app/routers/rental_vehicles.py:464, :647, :793
+  app/routers/rental_bookings.py:713, :836
+  app/core/publication.py:13, :103
+  app/routers/rental_locations.py:27
+  app/schemas/rental_vehicle.py:28
+  tests/test_rental_phase2_batch1.py:538, :564
+  docs/verification/TR05_CLIENT_CONTRACT_FIXTURES.json:23
+  docs/verification/TR05_LOCAL_EVIDENCE_INDEX.txt:65
+
+Option A | Apply public_rental to the vehicle-specific hub route
+
+HTTP. Return 404 with the existing generic detail for a missing or
+unpublished vehicle. For a published vehicle, return 200 with the current
+response shape and ordering. A published vehicle without eligible hubs
+returns 200 with [].
+
+Publication and privacy. The vehicle-to-hub association follows the same
+publication boundary as discovery and public detail. The independent
+public directory keeps its existing scope.
+
+Traveler and client behavior. The selector can report an unavailable vehicle
+before booking. Publication may change between lookup and submission, so
+booking remains authoritative. Angular and Flutter need to distinguish 404
+from an empty list and refresh or clear stale selections. Direct links,
+cached vehicle IDs, and preview screens that independently call the hub
+route may move from 200 to 404.
+
+Regression coverage. Verify missing, unapproved, approved-but-unavailable,
+ineligible provider, and inactive or foreign default hub cases. Keep positive
+coverage for an active owned primary, ordering, Decimal coordinate strings,
+null coordinates, and a published vehicle with no default or eligible hubs.
+Update the foreign-primary test to expect 404 and verify discovery, public
+detail, and booking outcomes on the same hidden vehicle. Preserve the
+existing booking rejection and side-effect assertions.
+
+SQL Server acceptance. On an authorized migrated target, verify the existing
+predicate through both publication and withdrawal transitions. Include
+historical primary associations, provider eligibility changes, and hub
+deactivation. Verify that booking still rejects a stale selection.
+
+Option B | Preserve the approval-only visibility behavior
+
+HTTP. Keep 404 for missing or unapproved vehicles and 200 for approved
+vehicles, including approved vehicles that fail public_rental. Return only
+active owned hubs, or [] when there are none. Keep the primary ordering.
+
+Publication and privacy. Treat the exposed vehicle-to-hub association as
+an explicit informational exception. Product and the API owner would need
+to accept that the association remains visible for an approved vehicle
+after provider, availability, or default-hub changes hide the listing.
+
+Traveler and client behavior. Existing direct hub lookups keep their
+response behavior. Angular and Flutter need to treat a successful lookup
+as location information and rely on public detail and booking to determine
+whether the vehicle can be rented. They should handle an empty list and
+clear selection if booking rejects the vehicle.
+
+Regression coverage. Make the exception explicit with approved-but-
+unavailable, ineligible-provider, and invalid-default rows returning 200
+while detail and booking return 404. Assert that no inactive or foreign hub
+appears. Preserve missing and unapproved 404 cases, primary ordering,
+Decimal coordinates, nulls, and the empty-list case.
+
+SQL Server acceptance. On an authorized migrated target, confirm the
+approval-only behavior and ownership exclusions on historical data. Verify
+that publication withdrawal suppresses discovery, public detail and
+booking while hub lookup retains the approved exception.
+
+Recommended decision | Option A
+
+The public route is used to select pickup and return hubs for a vehicle.
+Aligning it with discovery, public detail and booking avoids offering hubs
+for a vehicle that fails publication and keeps vehicle visibility consistent.
+The recommendation remains proposed and requires explicit approval.
+
+Product and API owner approval question
+
+Do you approve Option A, applying public_rental to the public vehicle hub
+lookup and returning 404 with "Rental vehicle not found" for every missing
+or unpublished vehicle, while keeping 200 with [] for a published vehicle
+with no eligible hubs? If you select Option B, please confirm that an
+approved vehicle may expose its active provider-owned hubs even when it
+fails publication, and identify any supported client flow that relies on it.
+
+Implementation conditional on approval
+
+If Option A is approved, reuse public_rental in the vehicle lookup in
+app/routers/rental_vehicles.py:805. Retain hub filtering and serialization.
+Update tests/test_rental_phase2_batch1.py:538 and :564 and add cross-route
+coverage with tests/test_rental_phase2_batch2.py:195. Change the fixture,
+acceptance matrix and evidence index to record the approved status contract
+and the new local evidence after verification.
+
+If Option B is approved, retain the production route and record the
+informational exception in the T-06 documentation. Add the explicit
+exception regression cases and client acceptance expectations.
+
+Client acceptance and external gates
+
+Run both Angular and Flutter builds with published and unpublished deep
+links, a stale cached selection, an empty hub list, valid map coordinates
+and null coordinates. Confirm preview screens use the intended contract and
+that the booking flow handles a publication change between read and write.
+Acceptance still requires Product and API owner approval, runnable client
+builds and test accounts, and DBA-authorized isolated SQL Server staging
+with migrated publication data. This package records local source and test
+evidence. It grants no production or integration approval.

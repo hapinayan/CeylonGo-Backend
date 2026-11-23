@@ -571,11 +571,14 @@ def test_update_provider_vehicle(isolated_db_session, seed_test_data):
     assert data["approval_status"] == "pending"
 
 
-def test_soft_retirement_blocked_by_active_booking(isolated_db_session, seed_test_data):
+def test_soft_retirement_blocked_by_active_booking(isolated_db_session, seed_test_data, monkeypatch):
     """SP-03: Safe soft-retirement MUST prevent retirement if active or confirmed bookings exist (409 Conflict)."""
     db = isolated_db_session
     user = seed_test_data["prov_user1"]
     client = make_test_client(db, current_user=user)
+    locks = []
+    monkeypatch.setattr("app.routers.rental_providers.lock_booking_resource",
+                        lambda session, key: locks.append(key))
 
     # Vehicle 1 has active/confirmed booking b1 -> MUST FAIL with 409 Conflict
     resp_del = client.delete("/api/v1/provider/rentals/vehicles/1")
@@ -587,6 +590,7 @@ def test_soft_retirement_blocked_by_active_booking(isolated_db_session, seed_tes
     resp_patch = client.patch("/api/v1/provider/rentals/vehicles/1", json={"status": "retired"})
     assert resp_patch.status_code == 409
     assert "Cannot retire vehicle" in resp_patch.json()["detail"]
+    assert locks == ["rental_vehicle_booking_1", "rental_vehicle_booking_1"]
 
 
 def test_soft_retirement_success_when_no_active_bookings(isolated_db_session, seed_test_data):

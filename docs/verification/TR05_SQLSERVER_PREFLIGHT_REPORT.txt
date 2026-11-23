@@ -1,0 +1,184 @@
+TR-05 SQL Server staging preflight
+23 November 2026 | develop | 3bf9822f6be99780d0e25c8752ed263ac407c3c6
+
+Overall readiness | BLOCKED
+
+Static inspection and offline guards completed. Live identity, the migration
+ledger, the schema, and the target 046 plan remain unverified. This audit opened
+no SQL Server connection and ran no staging fixtures, migrations, or SQL writes.
+The earlier 522-test offline regression remains baseline evidence.
+
+Readiness gates
+
+PASS | Local migration sequence and parser
+The runner discovered 46 consecutive versions (001–046). Migrations 043–046
+parse into 1, 3, 4, and 1 batches respectively. The manifest below is suitable
+for comparison to the live ledger once read access is approved.
+
+PASS | Offline guard behavior
+114 passed, 0 failed, 0 errors, 0 skipped on Python 3.12.10. The run covered
+29 migration runner tests, 64 migration runner guard tests, and 21 database
+identity guard cases selected from tests/test_database_guard_and_openapi.py.
+The offline wrapper blocked ODBC and external networking. Evidence is in
+.venv/tr05-sql-preflight-guards.log and .venv/tr05-sql-preflight-guards.xml.
+Both pip check and git diff --check passed.
+
+FAIL | Connection configuration in this shell
+No .env file was present. .env.example is a template. DB_SERVER, DB_NAME,
+DB_DRIVER, DB_TRUST_CERTIFICATE, CEYLONGO_RENTAL_TEST_DB,
+RUN_SQLSERVER_INTEGRATION_TESTS, DB_USER, and DB_PASSWORD were unset.
+Without overrides scripts/migrate.py resolves to the protected default
+CeylonGoDB and the unapproved alias .\SQLEXPRESS. The rental fixture's exact
+database and opt-in checks also fail on the current configuration. Both
+credential variables were checked for presence only. Supply the approved
+target in a fresh shell after DBA authorization and leave both credential
+variables unset for Windows authentication.
+
+FAIL | Driver and execution host
+ODBC Driver 18 for SQL Server is the default but is absent from the local
+pyodbc driver enumeration. The current workstation environment did not
+match the guard's expected machine name. Ask the DBA to name the approved
+execution host and confirm Driver 18 is visible to its Python 3.12 runtime.
+The workstation environment is only a local indicator. The guarded SQL
+identity query is the authoritative runtime check.
+
+BLOCKED | DBA authorization and connected identity
+TR05_STAGING_RUNBOOK.txt and TR05_FINAL_BLOCKERS.txt both require approval.
+ARTISAN_FINAL_COMPLETION_PHASE_02_VERIFICATION_2026-11-20.md records earlier
+Artisan verification on this target through ledger 038. It supplies historical
+identity evidence for a different scope. No current TR-05 DBA approval or
+proof of isolation was found. Obtain approval for the Windows principal,
+machine and instance, database and connection alias, and read-only identity,
+ledger and catalog queries. Confirm that the database is disposable and is
+isolated from production.
+
+BLOCKED | Live ledger and schema
+The approved alias is localhost\SQLEXPRESS. The runtime guard must report
+VISHNUGA-KAJARASH\SQLEXPRESS, machine VISHNUGA-KAJARASH, instance SQLEXPRESS,
+and database CeylonGoDB_IntegrationTest. After identity verification, compare
+the full ordered ledger to disk by version, filename and checksum. Require
+the complete prefix through 042 and a contiguous applied suffix, if present.
+Verify the schema corresponding to the ledger and stop on untracked
+destination objects, gaps, unknown versions, or mismatches. Pending or applied
+status for 043–046 is currently unknown.
+
+BLOCKED | Bounded plan through 046
+scripts/migrate.py plan --target 046 was withheld. Its isolated branch checks
+the opt-in, approved alias and database, Windows authentication, and explicit
+ceiling before connecting, then verifies the connected identity. It builds
+the plan by subtracting ledger version keys from the file inventory. It does
+not itself compare ledger checksums or detect untracked target objects.
+Require the authorized ledger and catalog checks before accepting any plan.
+An unconfigured invocation may take the generic command path instead of
+the isolated path. Never run an unqualified plan or database validate in
+the current shell.
+
+PASS | Staging source review and historical collection evidence
+All 11 cases are listed in the earlier .venv/tr05-release2-staging-collect.log.
+The staging source was reviewed for the effects below. Case execution,
+rollback behavior on the target, and independent-connection acceptance
+are BLOCKED. Every fixture invocation opens a guarded SQL connection.
+
+BLOCKED | Later migration writes and staging data effects
+Separate written DBA approval is required for any bounded migration write,
+the 10 write-bearing cases under rollback, and any committed setup needed
+by the multi-connection rehearsal. The pre-write backup or disposable
+checkpoint must be verified. Confirm approved cleanup or restoration
+ownership and scope for committed synthetic data.
+
+Static migration manifest
+
+043_add_user_auth_version.sql | 1 batch
+SHA-256 5eb77c8f10b171e1e4627cdbf96f3faae8235b7a1ce8ffe721548db0e1973191
+Adds dbo.users.auth_version BIGINT NOT NULL DEFAULT (0), named
+DF_users_auth_version. Check the existing users table before migration,
+and the exact nullability, default and application behavior afterward.
+
+044_add_rental_booking_party_size.sql | 3 batches
+SHA-256 9aa22932174cc3ad2dabfbeb862fc736f190900264c08e600bcf74c459d4d073
+Adds nullable passenger_count INT and self_drive_agreement_accepted BIT.
+CK_rental_bookings_passenger_count permits NULL or a positive count.
+Verify its enabled and trusted state and the historical NULL values.
+
+045_add_rental_insurance_and_helmet_metadata.sql | 4 batches
+SHA-256 a0c55058d15a287be08405fb79e7bb166f661e4cb1f969d3d0cb9aa22ae166ba
+Adds nullable helmet_condition NVARCHAR(100), insurance_effective_date DATE,
+and insurance_exclusions NVARCHAR(1000). The named insurance date check
+requires an expiry on or after a supplied effective date. Verify the check
+is enabled and trusted and verify retained historical records.
+
+046_create_rental_age_rules.sql | 1 batch
+SHA-256 8d92cc873198d8998fd17d4cb721133dbeaed12038dd7c46b70df4e85d8c4df0
+Creates dbo.rental_age_rules with an identity key, a unique vehicle_type key,
+and checks for supported categories and ages 0–120. The migration seeds
+no age rows. Check the primary key, uniqueness and enabled, trusted checks.
+
+The runner's local parser and checksum function produced this manifest.
+The isolated upgrade path requires the ledger through 042 and checks
+untracked 043–045 columns and the 046 table. For any future upgrade, the
+SQL batches and ledger insert commit together per migration. A rollback
+of a failing version leaves earlier successful versions committed.
+Conditional DDL can skip pre-existing objects, so catalog comparison must
+check definitions as well as names. See scripts/migrate.py lines 825, 858,
+907, 1011 and 1088, and app/core/database_guard.py lines 170 and 397.
+
+Staging cases and cleanup
+
+The names below omit the common test_sqlserver_ prefix. All cases require
+staging_db_session. All except orm_compilation_all_models also require
+setup_staging_seed_data, which inserts two uniquely named synthetic users and
+an approved rental-provider profile before each case.
+
+1. orm_compilation_all_models (line 120) | SELECT samples across six mapped
+   tables, including rental_age_rules. Uses no seed fixture or application DML.
+2. ar02_traveler_dob_storage (144) | Inserts or updates traveller eligibility
+   with DOB, reads it back, and checks a computed age.
+3. ar03_helmet_columns (182) | Inserts a vehicle with structured helmet fields.
+4. ar04_security_deposit_storage (212) | Inserts a vehicle with a deposit amount.
+5. ar05_fuel_policy_values (238) | Inserts three vehicles with valid policies
+   and reads their stored policies.
+6. ar06_inspection_acknowledgement (272) | Inserts a vehicle, booking, and
+   signed acknowledgement metadata on a pickup inspection.
+7. ar07_return_timestamps_round_trip (327) | Inserts a vehicle, booking and
+   return inspection, then checks timestamp precision. Verifies no fee formula.
+8. ar11_recognition_permit_storage (355) | Inserts eligible driver evidence
+   with a recognition permit number and checks persistence.
+9. ar12_structured_insurance_storage (382) | Inserts a vehicle and insurance
+   document and reads its structured attributes.
+10. check_constraints_enforcement (423) | Attempts invalid fuel, helmet,
+    deposit, passenger and insurance values in nested savepoints. Inserts
+    one valid vehicle. Asserts named constraint errors.
+11. rental_booking_e2e_workflow (461) | Inserts vehicle, driver evidence,
+    booking, pickup/return inspections and deposit. Updates lifecycle and
+    deposit status by ORM. Does not call mounted API or payment flows.
+
+The fixture sets a session lock timeout, keeps an outer connection transaction,
+and lets session commits release savepoints. Teardown checks that the outer
+transaction survived, rolls it back and disposes the engine. For the authorized
+rehearsal, confirm seeded rows are absent from a fresh guarded connection.
+Rollback does not imply identity values remain consecutive. If the outer
+transaction is lost or a seed row persists, stop and escalate to the DBA.
+
+Independent-connection checks remain outside this suite. Use two separately
+verified connections, committed synthetic setup, bounded waits and a barrier,
+then inspect final rows from a fresh connection. Cover overlap and adjacent
+windows, both blackout writers, expiry/acceptance, capture/cancel order and
+replay, cash idempotency and conflicting same-key amounts, competing refund
+decisions, and rollback of event, ledger and notification writes. Committed
+setup is outside the fixture rollback. Approve its cleanup or checkpoint
+restoration before starting. See the runbook and final blockers for IDs.
+
+Next read-only action after authorization
+
+1. Obtain the DBA record naming the approved host, Windows principal,
+   database, isolation evidence and read-only scope. Confirm the ODBC driver
+   on that host. Configure exactly the approved alias and database, use
+   RUN_SQLSERVER_INTEGRATION_TESTS=1, and keep DB_USER and DB_PASSWORD unset.
+2. In that explicitly configured shell, use scripts/migrate.py validate to
+   verify the guarded connection and compare recorded checksums. Verify
+   ledger completeness and the current catalog using read-only queries.
+   Abort on any discrepancy.
+3. Run scripts/migrate.py plan --target 046 only after these checks. Accept
+   precisely the verified unapplied suffix through 046, possibly empty.
+   Save the identity, ledger, catalog and plan evidence. End the read-only
+   rehearsal before any upgrade or staging fixture execution.

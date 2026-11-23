@@ -1,0 +1,160 @@
+TR05 external acceptance handoff
+
+LOCAL VERIFICATION | Conditional freeze within the reviewed backend scope
+EXTERNAL ACCEPTANCE | Open
+PRODUCTION READINESS | Pending external evidence and release approval
+
+The latest user-supplied offline regression on develop reports 2,429 passed,
+0 failed, 52 skipped, 77 warnings, 331.12 seconds and successful exit. The
+rental SQL Server staging module was excluded. The evidence index records
+the source, historical results and skipped-test limitations. The real file
+symlink case remains unverified on the local filesystem. The deterministic
+containment case and real Windows junction case passed.
+
+Completed local work includes booking hub ownership and active-state
+validation, public hub filtering, protected admin document containment,
+consistent UTC return acknowledgement, and cash replay after final payment.
+It also includes preserving booking-referenced hubs on deletion and
+rejecting explicit nulls in required provider hub fields. The freeze is
+limited to reviewed backend behavior. The acceptance matrix retains all
+61 requirement classifications. Local results and projections provide a
+baseline for the gates below.
+
+1. Product and API decisions | Pending
+
+Owner: Product and the API owner, with the policy co-owners below.
+
+Required evidence and completion criteria:
+- Public hub visibility (T-06/P-09). Record approval of full publication
+  alignment or the current approval-only exception. For the proposed full
+  alignment, confirm 404 for missing or unpublished vehicles and 200 with
+  an empty array for published vehicles with no eligible hubs. If retaining
+  the exception, specify when an approved unpublished vehicle may expose
+  its active owned hubs and which client workflows rely on it. Close when
+  the owner records the status contract and any required follow-up is tracked.
+- Legacy pickup review (P-09). Confirm whether the provider hub write path,
+  which accepts active-state updates, keeps separate behavior or must follow
+  the inactive review workflow of the map-oriented write path. Record
+  ownership of review transitions and compatibility treatment for existing
+  clients and hubs. Close when both paths have an approved contract.
+- Remaining policy. Product and the database owner resolve catalogue IDs
+  and legacy mappings (T-03). Product and Finance resolve cancellation fee
+  and historical terms (T-14) and late-return rate snapshots (X-07).
+  Operations resolves business evidence and badge linkage (A-04).
+  Compliance and Operations resolve licence classes, evidence access and
+  permit combinations (X-01/X-11). Product, Operations and Storage resolve
+  inspection evidence (X-06). Compliance and Product resolve seating and
+  solo hire (X-10). Product resolves scheduled reminder scope (T-18).
+  Record the approved rule, owner, scope and treatment of older data for
+  each item, or an explicit approved deferral. Preserve the base daily-rate
+  filter while any future effective-rate change (T-02) remains undecided.
+
+Reference: TR05_PUBLIC_HUB_VISIBILITY_DECISION.txt;
+TR05_POLICY_DECISIONS.txt; TR05_FINAL_BLOCKERS.txt.
+
+2. Isolated SQL Server | Pending authorization and execution
+
+Owner: DBA for target identity, preflight, checkpoint and migration
+authorization. Backend QA for staged API and persistence evidence.
+
+Required evidence:
+- DBA-approved isolated host, database and principal. Record read-only
+  identity, existing migration ledger, expected suffix through 046, and
+  catalog checks. Obtain separate write authorization and a verified
+  checkpoint before migration execution. Record migration results,
+  checksums and post-migration schema verification.
+- Results for the 11 guarded staging cases and independent-connection
+  rehearsals from the runbook. Include publication transitions, booking
+  overlap and blackout contention, provider acceptance, capture and
+  cancellation, cash key replay, competing refund decisions, audit and
+  notification atomicity, and migrated acknowledgement and document data.
+- P-09 hub deletion race. Use independent verified connections and
+  synthetic pickup-only and return-only references. Exercise booking
+  reference insertion against deletion in both orderings. Record both
+  responses, final hub and booking rows, and any database conflict. Check
+  that no committed booking has a missing hub and that existing references
+  remain readable. The check and hard delete are separate operations.
+  The deployed conflict outcome remains unverified.
+
+Completion: Verifiable evidence of the approved target, migration ledger,
+persisted results and expected concurrency invariants. Record failure or
+block details where an expected outcome is absent. Keep rollout and
+production authorization separate.
+
+Reference: TR05_STAGING_RUNBOOK.txt; TR05_FINAL_BLOCKERS.txt;
+TR05_BACKEND_LOCAL_FREEZE_REPORT.txt.
+
+3. PayHere sandbox and financial reconciliation | Pending
+
+Owner: PayHere sandbox merchant owner and backend payments QA for
+configuration and callback evidence. Finance for ledger and refund review.
+
+Required evidence: Approved sandbox merchant, callback host and disposable
+persistence. Collect PH-01 through PH-05 results for rental checkout, signed
+capture and replay, late capture, promotion checkout and activation, and
+refund and settlement reconciliation. Record redacted order and payment
+identifiers, expected and actual amounts and currency, ledger state and
+recipient effects. Keep credentials and raw callback evidence in the
+approved restricted channel. Obtain separate authorization for sandbox
+refund execution or record verified manual settlement evidence.
+
+Completion: Signed callbacks produce the expected backend and ledger state,
+replays preserve single capture, the financial buckets reconcile, and
+refund execution or manual settlement is verified. A refund review or
+reservation is recorded separately from executed movement of funds.
+
+Reference: TR05_PAYHERE_SANDBOX_CHECKLIST.txt; TR05_STAGING_RUNBOOK.txt.
+
+4. Angular and Flutter | Pending builds and test accounts
+
+Owner: Angular and Flutter maintainers with client QA. Product and the API
+owner supply the agreed visibility contract.
+
+Required evidence: Runnable versions of both clients, intended browser
+origins and synthetic traveler, provider and admin accounts as applicable.
+Record client version, role, fixture, expected and observed outcome on each
+platform. Verify map markers and hub selection with Decimal and null
+coordinates, published and unpublished deep links, stale selections and
+empty hub lists. Verify UTC parsing for return acknowledgement and handover,
+and cash retry display with the same key and original receipt ID and amount
+after final collection. Confirm current paid status and one displayed
+receipt. Run the remaining client cases in the staging runbook.
+
+Completion: Both platforms pass the applicable scenarios against the approved
+contract, including the agreed distinction between hidden vehicle and
+empty hub list. Link results to T-06/P-09, P-14/X-06 and P-15/X-13 and the
+other client acceptance rows in the matrix.
+
+Reference: TR05_STAGING_RUNBOOK.txt; TR05_CLIENT_CONTRACT_FIXTURES.json;
+TR05_PUBLIC_HUB_VISIBILITY_DECISION.txt.
+
+5. Protected storage and inspection evidence | Pending
+
+Owner: Storage or infrastructure owner with Operations and security QA.
+Product and Operations approve inspection evidence rules with Storage.
+
+Required evidence: Approved storage topology and service-account access.
+On the target filesystem, verify authorized protected streaming, denial
+for other roles, private-reference handling, legacy paths, missing targets,
+and out-of-root link or junction handling where supported. Record no-store
+and nosniff headers. For inspection evidence, record approved source and
+ownership binding, required evidence, retention and exceptions. Verify
+upload ownership and booking and inspection association under those rules.
+
+Completion: Approved topology and scoped access checks pass for the
+supported target storage. The inspection ownership and retention policy
+is approved and its required flows have evidence. Record any unsupported
+filesystem scenario as unverified.
+
+Reference: TR05_POLICY_DECISIONS.txt; TR05_FINAL_BLOCKERS.txt;
+TR05_LOCAL_EVIDENCE_INDEX.txt.
+
+Handoff tracking
+
+For each gate, record the responsible owner, authorization reference,
+environment and revision or client build, case identifier, expected and
+observed outcome, evidence link and sign-off. Use synthetic data and avoid
+including credentials or private evidence in shared records. Keep pending,
+failed and skipped cases visible in TR05_ACCEPTANCE_MATRIX.csv until their
+owners provide disposition and evidence. This handoff establishes no
+external pass or release approval.

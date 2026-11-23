@@ -26,7 +26,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.security import create_access_token, hash_password
+from app.core.security import ADMIN_AUTH_METHOD, create_access_token, hash_password
 from app.database.connection import get_db
 from app.models.activity import Activity
 from app.models.activity_booking import ActivityBooking
@@ -269,7 +269,15 @@ def create_booking(
 
 
 def auth_header(user: User) -> dict:
-    token = create_access_token(data={"sub": str(user.id), "role": user.role})
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "auth_version": user.auth_version,
+    }
+    if user.role == "admin":
+        payload["auth_method"] = ADMIN_AUTH_METHOD
+
+    token = create_access_token(data=payload)
     return {"Authorization": f"Bearer {token}"}
 
 

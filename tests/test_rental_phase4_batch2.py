@@ -39,6 +39,7 @@ from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
     AdminAuditLog,
+    AdvertisingPayment,
     BookingReference,
     BookingStatusHistory,
     ListingReference,
@@ -53,6 +54,8 @@ from app.models.shared import (
 from app.models.user import Base, User
 from app.routers.admin_rentals import router as admin_rentals_router
 from app.routers.auth import get_current_user
+from app.core.payhere import payhere_service
+from app.routers.payments import router as payments_router
 from app.routers.rental_providers import router as rental_providers_router
 from app.routers.rental_vehicles import router as rental_vehicles_router
 
@@ -96,6 +99,7 @@ def isolated_db_session(tmp_path, monkeypatch):
 def make_test_client(db, current_user: User | None = None):
     app = FastAPI()
     app.include_router(admin_rentals_router)
+    app.include_router(payments_router)
     app.include_router(rental_providers_router)
     app.include_router(rental_vehicles_router)
 
@@ -331,7 +335,7 @@ def seed_test_data(isolated_db_session):
     br2 = BookingReference(
         id=602,
         booking_reference="RB-000502",
-        module_type="rental",
+        module_type="rental_vehicle",
         target_booking_id=b2.id,
         user_id=traveler_user_2.id,
         provider_profile_id=provider.id,
@@ -343,7 +347,7 @@ def seed_test_data(isolated_db_session):
     br3 = BookingReference(
         id=603,
         booking_reference="RB-000503",
-        module_type="rental",
+        module_type="rental_vehicle",
         target_booking_id=b3.id,
         user_id=traveler_user.id,
         provider_profile_id=provider.id,
@@ -378,7 +382,7 @@ def seed_test_data(isolated_db_session):
         gateway_transaction_id="CASH-2001",
         amount=Decimal("15000.00"),
         currency="LKR",
-        payment_status="paid",
+        payment_status="completed",
         payment_method="cash",
         paid_at=now - timedelta(hours=2),
     )
@@ -815,6 +819,20 @@ def test_admin_rental_refund_audit_review_lifecycle(seed_test_data, isolated_db_
 
     rf_id = seed_test_data["refund"].id
 
+    tx = seed_test_data["transactions"][2]
+    traveler_id = tx.user_id
+    tx.user_id = seed_test_data["prov_user"].id
+    db.commit()
+    mismatch = client.post(
+        f"/api/v1/admin/rentals/refunds/{rf_id}/review",
+        json={"decision": "approved"},
+    )
+    assert mismatch.status_code == 409
+    assert db.get(PaymentRefund, rf_id).refund_status == "pending"
+    assert db.query(Notification).filter_by(notification_type="refund_review").count() == 0
+    tx.user_id = traveler_id
+    db.commit()
+
     # 2. Admin approves refund (audit-only)
     res_app = client.post(
         f"/api/v1/admin/rentals/refunds/{rf_id}/review",
@@ -856,6 +874,7 @@ def test_admin_rental_refund_audit_review_lifecycle(seed_test_data, isolated_db_
     )
     assert notif is not None
     assert "Approved" in notif.title
+    assert notif.link_url == f"/traveler/rental-bookings/{seed_test_data['bookings'][2].id}"
 
 
 def test_admin_rental_promotion_moderation_approval_and_rejection(seed_test_data, isolated_db_session):
@@ -927,6 +946,49 @@ def test_admin_rental_promotion_activation_payment_verification_required(seed_te
     )
     assert res_act_nopay.status_code == 400
     assert "payment verification required" in res_act_nopay.json()["detail"]
+
+    missing = client.post(
+        f"/api/v1/admin/rentals/promotions/{camp1_id}/review",
+        json={"decision": "activate", "payment_reference": "BROWSER-SUPPLIED-REF"},
+    )
+    assert missing.status_code == 400
+    assert missing.json()["detail"] == "Rental campaign has no matching verified payment"
+
+    provider = db.get(ProviderProfile, camp1.provider_profile_id)
+    provider_client = make_test_client(db, current_user=db.get(User, provider.user_id))
+    checkout_url = f"/api/v1/provider/rentals/promotions/campaigns/{camp1_id}/payments/initiate"
+    checkout = provider_client.post(checkout_url)
+    assert checkout.status_code == 200, checkout.text
+    order = checkout.json()["order_id"]
+    assert provider_client.post(checkout_url).json()["order_id"] == order
+    attempt = db.query(AdvertisingPayment).filter_by(order_reference=order).one()
+    attempt.currency = "USD"
+    db.commit()
+    conflict = provider_client.post(checkout_url)
+    assert conflict.status_code == 409
+    assert db.query(AdvertisingPayment).filter_by(campaign_id=camp1_id).count() == 1
+    assert attempt.payment_status == "pending"
+    attempt.currency = camp1.currency
+    db.commit()
+
+    from hashlib import md5
+
+    amount = format(camp1.budget, ".2f")
+    secret_hash = md5(payhere_service.merchant_secret.encode()).hexdigest().upper()
+    signature = md5(f"{payhere_service.merchant_id}{order}{amount}{camp1.currency}2{secret_hash}".encode())
+    callback = {
+        "merchant_id": payhere_service.merchant_id,
+        "order_id": order,
+        "payment_id": "PAYHERE-PR-88991",
+        "payhere_amount": amount,
+        "payhere_currency": camp1.currency,
+        "status_code": "2",
+        "md5sig": signature.hexdigest().upper(),
+    }
+    assert client.post("/api/v1/payments/payhere/notify", data=callback).status_code == 200
+    assert client.post("/api/v1/payments/payhere/notify", data=callback).status_code == 200
+    db.refresh(camp1)
+    assert camp1.status == "approved"
 
     # 4. Activating with valid payment reference succeeds
     res_act_ok = client.post(

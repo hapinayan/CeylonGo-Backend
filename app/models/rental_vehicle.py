@@ -94,6 +94,7 @@ class RentalVehicle(Base):
     helmet_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     helmets_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     helmet_sizes: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
+    helmet_condition: Mapped[str | None] = mapped_column(Unicode(100), nullable=True)
     security_deposit: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     fuel_policy: Mapped[str | None] = mapped_column(Unicode(30), nullable=True)
 

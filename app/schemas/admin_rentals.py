@@ -9,10 +9,22 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
+from app.schemas.rental_vehicle import VehicleType
 
 VehicleApprovalDecision = Literal["approved", "rejected", "suspended"]
 VehicleVerificationDecision = Literal["verified", "rejected", "unverified", "suspended"]
 DocumentVerifyDecision = Literal["approved", "rejected"]
+
+
+class RentalAgeRuleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_age: int = Field(strict=True, ge=0, le=120)
+
+
+class RentalAgeRuleResponse(RentalAgeRuleUpdate):
+    vehicle_type: VehicleType
+    requires_verified_dob: bool
 
 
 # ==============================================================================
@@ -141,6 +153,11 @@ class AdminVehicleDocumentItem(BaseModel):
     document_number: str | None = None
     file_reference: str
     expiry_date: date | None = None
+    insurance_effective_date: date | None = None
+    insurance_exclusions: str | None = None
+    coverage_amount: Decimal | None = None
+    deductible_amount: Decimal | None = None
+    insurance_provider: str | None = None
     is_verified: bool
     created_at: datetime
 

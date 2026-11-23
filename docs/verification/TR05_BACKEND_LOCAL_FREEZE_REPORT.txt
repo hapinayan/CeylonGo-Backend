@@ -1,0 +1,73 @@
+TR05 backend local development freeze
+Status: Ready for a conditional freeze within the reviewed TR05 backend scope
+
+LOCAL VERIFICATION
+
+The latest user-supplied full local regression reports 2,429 passed,
+0 failed, 52 skipped, 77 warnings, 331.12 seconds and successful exit.
+The rental SQL Server staging module was excluded. The earlier 2,420-pass
+run remains historical evidence in TR05_LOCAL_EVIDENCE_INDEX.txt, which
+preserves both reported durations for that run. Batch 10 did not run tests.
+
+Completed local implementation batches and targeted results
+
+  Batch 1 | T-06 / P-09 | 120 passed | Active, owned hub validation and
+            public hub filtering.
+  Batch 2 | A-03 | 29 passed, 1 skipped | Admin document containment
+            and legacy reference compatibility.
+  Batch 3 | P-14 / X-06 | 18 passed | UTC return acknowledgement across
+            POST, list and detail.
+  Batch 4 | P-15 / X-13 | 19 passed | Cash replay after final collection.
+  Batch 9 | P-09 | 101 passed, 0 failed, 0 skipped | Provider hub integrity.
+
+Batch 9 deactivates vehicle- or booking-referenced hubs, including pickup-
+only and return-only references, while retaining hard deletion for unused
+hubs and preserving historical reads. Explicit null values for
+location_name, district, city and is_active now return 422 before mutation.
+Omission, valid updates and clearing nullable fields are covered. The
+focused regressions used SQLite with foreign keys enabled for hub cases.
+See app/routers/rental_providers.py:1274 and :1322,
+app/schemas/rental_provider.py:347 and tests/test_rental_phase3_batch2.py:583.
+
+Known limitations and decisions
+
+The full run's skipped cases and warnings remain part of the evidence.
+The real Windows file-symlink case was skipped locally. The independent
+resolved-target and real junction cases passed in Batch 2. SQLite evidence
+does not establish SQL Server concurrency behavior. A reference inserted
+after the hub reference check can still cause hard-delete persistence
+failure, although enforced foreign keys protect the booking reference.
+
+Public vehicle hub visibility remains approval-only pending Product and
+API owner approval. Alignment with public_rental is proposed in
+TR05_PUBLIC_HUB_VISIBILITY_DECISION.txt. The legacy provider pickup write
+route accepts active-state updates, while the map-oriented route sends
+changes for inactive review. Whether to align those workflows also awaits
+a Product and API owner decision. Neither behavior is part of the freeze
+implementation.
+
+EXTERNAL ACCEPTANCE AND PRODUCTION ACCEPTANCE
+
+SQL Server. Obtain DBA authorization for isolated preflight and separate
+approval for migration writes through 046. Run migrated persistence,
+publication transitions, independent-connection contention and ledger
+reconciliation, including the P-09 delete-versus-booking race. See
+TR05_STAGING_RUNBOOK.txt and TR05_FINAL_BLOCKERS.txt.
+
+PayHere. Use an authorized sandbox merchant, callback host and disposable
+persistence for checkout, signed callback and reconciliation evidence.
+Refund execution requires separate authorization or verified manual
+settlement evidence. See TR05_PAYHERE_SANDBOX_CHECKLIST.txt.
+
+Angular and Flutter. Obtain runnable builds and test accounts. Verify map
+rendering and hub selection, UTC parsing, cash key reuse and replay display,
+and the agreed public hub visibility contract.
+
+Storage and policy. Confirm approved storage topology and deployed
+document access. Approve evidence ownership, mandatory checks and retention,
+as well as the outstanding catalogue, cancellation, business evidence,
+licence, permit, seating, reminder and late-return policy decisions. See
+TR05_POLICY_DECISIONS.txt and TR05_FINAL_BLOCKERS.txt.
+
+The conditional freeze closes the reviewed local implementation batch.
+External acceptance, policy sign-off and production readiness remain open.

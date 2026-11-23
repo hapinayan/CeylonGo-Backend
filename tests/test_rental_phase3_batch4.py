@@ -27,6 +27,7 @@ from app.database.connection import get_db
 from app.models.provider_profile import ProviderProfile
 from app.models.rental import (
     RentalAvailabilityBlock,
+    RentalDeposit,
     RentalLocation,
     RentalRatePlan,
 )
@@ -35,6 +36,7 @@ from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
     BookingReference,
     ListingReference,
+    PaymentRefund,
     PaymentTransaction,
     PromotionCampaign,
     PromotionEvent,
@@ -586,6 +588,37 @@ def test_provider_earnings_and_settlements_summary(seed_test_data, isolated_db_s
     assert Decimal(str(data["pending_settlements"])) == Decimal("7000.00")
     assert len(data["settlements"]) == 1
     assert data["settlements"][0]["payout_reference"] == "PAYOUT-BANK-701"
+
+
+def test_pending_online_refund_is_reserved_from_unsettled_rental_balance(seed_test_data, isolated_db_session):
+    db = isolated_db_session
+    historical_receipt = db.get(PaymentTransaction, 3)
+    historical_receipt.payment_method = "card"
+    db.get(BookingReference, historical_receipt.booking_reference_id).module_type = "rental"
+    db.add_all([
+        PaymentRefund(payment_transaction_id=3, amount=Decimal("1200"), currency="LKR",
+                      refund_status="pending", refund_reason="Provider one cancellation"),
+        PaymentRefund(payment_transaction_id=4, amount=Decimal("900"), currency="LKR",
+                      refund_status="pending", refund_reason="Provider two cancellation"),
+        RentalDeposit(booking_id=1002, deposit_amount=Decimal("2500.00"),
+                      deducted_amount=Decimal("500.00"), deposit_status="held"),
+        RentalDeposit(booking_id=1004, deposit_amount=Decimal("3000.00"),
+                      refunded_amount=Decimal("3000.00"), deposit_status="fully_refunded"),
+        RentalDeposit(booking_id=2001, deposit_amount=Decimal("6000.00"), deposit_status="held"),
+    ])
+    db.commit()
+    provider = db.get(ProviderProfile, 101)
+    client = make_test_client(db, current_user=db.get(User, provider.user_id))
+    response = client.get("/api/v1/provider/rentals/settlements")
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    assert summary["provider_id"] == 101
+    assert summary["currency"] == "LKR"
+    assert Decimal(summary["online_paid_amount"]) == Decimal("14000")
+    assert Decimal(summary["cash_paid_amount"]) == Decimal("7000")
+    assert Decimal(summary["online_refund_reserved_amount"]) == Decimal("1200")
+    assert Decimal(summary["security_deposits_held"]) == Decimal("2000")
+    assert Decimal(summary["pending_settlements"]) == Decimal("12800")
 
 
 def test_settlement_detail_and_cross_provider_isolation(seed_test_data, isolated_db_session):

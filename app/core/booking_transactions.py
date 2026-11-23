@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 CAPTURED = ("paid", "completed")
 EXECUTED_REFUNDS = ("processed", "completed")
 RESERVED_REFUNDS = ("pending", "approved", *EXECUTED_REFUNDS)
+RENTAL_BOOKING_REFERENCE_TYPES = ("rental_vehicle", "rental")
 
 
 def lock_booking_resource(db: Session, resource: str) -> None:

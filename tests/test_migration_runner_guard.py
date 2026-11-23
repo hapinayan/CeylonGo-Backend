@@ -2,8 +2,8 @@
 Unit Tests for Migration Runner Safety Guards and Isolated Target Authorization.
 ================================================================================
 Verifies fail-closed protections in scripts/migrate.py:
-- Bounded migration ceilings (037-042 allowed on integration database).
-- Rejection of out-of-bounds targets (<=036, >=043, arbitrary strings).
+- Bounded migration ceilings (037-046 allowed on integration database).
+- Rejection of out-of-bounds targets (<=036, >=047, arbitrary strings).
 - Rejection of unbounded migration execution (target_version=None).
 - Enforcement of RUN_SQLSERVER_INTEGRATION_TESTS opt-in requirement.
 - Server identity verification against ARTISAN_INTEGRATION_ALIAS.
@@ -17,6 +17,7 @@ CRITICAL: All tests run offline with mocks and SQLite fixtures.
 NEVER connects to or mutates real Microsoft SQL Server instances.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -26,10 +27,14 @@ from app.core.database_guard import (
 )
 from scripts.migrate import (
     ALLOWED_INTEGRATION_TARGET_VERSIONS,
+    BatchExecutionError,
     DatabaseConfig,
     MigrationError,
     calculate_checksum,
+    cmd_plan,
     cmd_upgrade,
+    cmd_validate,
+    discover_migrations,
 )
 
 # ------------------------------------------------------------------------------
@@ -161,12 +166,12 @@ def test_guard_permits_explicitly_approved_targets(
 # ==============================================================================
 
 @pytest.mark.parametrize(
-    "bad_target", ["036", "043", "044", "050", "999", "invalid"]
+    "bad_target", ["036", "047", "048", "050", "999", "invalid"]
 )
 def test_guard_rejects_unapproved_or_out_of_bounds_targets(
     mock_isolated_db_environment, monkeypatch, bad_target
 ):
-    """Targets below 037, above 042, or non-numeric must fail-closed."""
+    """Targets below 037, above 046, or non-numeric must fail-closed."""
     mock_conn, migrations_dir = mock_isolated_db_environment
     monkeypatch.setenv("RUN_SQLSERVER_INTEGRATION_TESTS", "1")
 
@@ -450,6 +455,110 @@ def test_guard_requires_verified_historical_ledger_through_038(
                 confirmed=True,
             )
         assert "requires a verified ledger through 038" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("target,ledger_end,conflict,expected_error", [
+    ("043", 42, None, None),
+    ("044", 42, None, None),
+    ("045", 42, None, None),
+    ("046", 42, None, None),
+    ("046", 43, None, None),
+    ("046", 41, None, "verified ledger through 042"),
+    ("046", 42, ("dbo.users", "auth_version"), "untracked schema objects"),
+    ("046", 42, ("dbo.rental_bookings", "passenger_count"), "untracked schema objects"),
+    ("046", 42, ("dbo.rental_vehicle_documents", "insurance_effective_date"), "untracked schema objects"),
+    ("046", 42, ("dbo.rental_age_rules",), "untracked tables"),
+    ("046", 42, ("rollback probe",), "synthetic 045 batch failure"),
+])
+def test_guard_checks_real_rental_upgrade_inventory_in_order(
+    mock_isolated_db_environment, target, ledger_end, conflict, expected_error,
+):
+    conn, migrations_dir = mock_isolated_db_environment
+    source = Path(__file__).resolve().parents[1] / "migrations"
+    for migration in discover_migrations(source):
+        if int(migration.version) >= 43:
+            (migrations_dir / migration.filename).write_bytes(migration.filepath.read_bytes())
+    inventory = discover_migrations(migrations_dir)
+    ledger = [(m.version, m.filename, m.checksum, None, 0, "executed")
+              for m in inventory if int(m.version) <= ledger_end]
+    cursor = conn.cursor.return_value
+    default_execute = cursor.execute.side_effect
+    rollback_probe = conflict == ("rollback probe",)
+
+    def execute(sql, *args):
+        if rollback_probe and "ADD insurance_exclusions NVARCHAR" in str(sql):
+            raise RuntimeError("synthetic 045 batch failure")
+        result = default_execute(sql, *args)
+        if "FROM DBO.SCHEMA_MIGRATIONS" in str(sql).upper():
+            cursor.fetchall.return_value = ledger
+        elif str(sql).startswith(("SELECT OBJECT_ID(", "SELECT COL_LENGTH(")):
+            cursor.fetchone.return_value = (1,) if conflict and args == (conflict,) else (None,)
+        return result
+
+    cursor.execute.side_effect = execute
+    config = DatabaseConfig(server=r"localhost\SQLEXPRESS", database="CeylonGoDB_IntegrationTest",
+                            integration_opt_in="1")
+    with patch("scripts.migrate.get_connection", return_value=conn), patch("scripts.migrate.migration_lock"):
+        if rollback_probe:
+            with pytest.raises(BatchExecutionError, match=expected_error) as failure:
+                cmd_upgrade(config, migrations_dir, target_version=target, confirmed=True)
+            assert failure.value.version == "045"
+            assert failure.value.batch_index == 3
+            conn.rollback.assert_called_once()
+            assert conn.commit.call_count == 2
+            writes = [call.args[1][0] for call in cursor.execute.call_args_list
+                      if "INSERT INTO dbo.schema_migrations" in str(call.args[0])]
+            assert writes == ["043", "044"]
+        elif expected_error:
+            with pytest.raises(MigrationError, match=expected_error):
+                cmd_upgrade(config, migrations_dir, target_version=target, confirmed=True)
+            conn.commit.assert_not_called()
+        else:
+            assert cmd_upgrade(config, migrations_dir, target_version=target, confirmed=True) == 0
+            writes = [call.args[1][0] for call in cursor.execute.call_args_list
+                      if "INSERT INTO dbo.schema_migrations" in str(call.args[0])]
+            assert writes == [f"{version:03d}" for version in range(ledger_end + 1, int(target) + 1)]
+            assert conn.commit.call_count == len(writes)
+
+
+@pytest.mark.parametrize("command", ["plan", "validate"])
+def test_guard_applies_to_read_only_staging_preflight(mock_isolated_db_environment, command):
+    conn, migrations_dir = mock_isolated_db_environment
+    config = DatabaseConfig(
+        server=r"localhost\SQLEXPRESS", database="CeylonGoDB_IntegrationTest", integration_opt_in="0",
+    )
+
+    def preflight(config):
+        if command == "plan":
+            return cmd_plan(config, migrations_dir, target_version="042")
+        return cmd_validate(config, migrations_dir, check_db=True)
+
+    with patch("scripts.migrate.get_connection", return_value=conn) as connect:
+        with pytest.raises(DatabaseSafetyError, match="OPT-IN REQUIRED"):
+            preflight(config)
+        connect.assert_not_called()
+
+        config.integration_opt_in = "1"
+        with patch("app.core.database_guard.verify_connected_server_identity",
+                   side_effect=DatabaseSafetyError("Identity mismatch")) as identity, \
+             patch("scripts.migrate.get_applied_migrations") as ledger:
+            with pytest.raises(DatabaseSafetyError, match="Identity mismatch"):
+                preflight(config)
+            identity.assert_called_once()
+            ledger.assert_not_called()
+        assert preflight(config) == 0
+        conn.commit.assert_not_called()
+        assert conn.close.call_count == 2
+
+
+def test_guard_rejects_missing_new_ceiling_before_connecting(mock_isolated_db_environment):
+    _, migrations_dir = mock_isolated_db_environment
+    config = DatabaseConfig(server=r"localhost\SQLEXPRESS", database="CeylonGoDB_IntegrationTest",
+                            integration_opt_in="1")
+    with patch("scripts.migrate.get_connection") as connect:
+        with pytest.raises(MigrationError, match="Approved migration target 046 is missing from disk"):
+            cmd_upgrade(config, migrations_dir, target_version="046", confirmed=True)
+        connect.assert_not_called()
 
 
 # ==============================================================================

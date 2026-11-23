@@ -16,7 +16,7 @@ import sqlite3
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -416,6 +416,41 @@ def test_create_availability_block_collision_guard(isolated_db_session, seed_tes
     assert resp_clear.json()["block_type"] == "service"
 
 
+def test_legacy_and_provider_blackouts_share_calendar_and_vehicle_lock(isolated_db_session, seed_test_data, monkeypatch):
+    db = isolated_db_session
+    booking = seed_test_data["b1"]
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+    legacy = "/api/v1/rental-vehicles/1/availability-blocks"
+    current = "/api/v1/provider/rentals/vehicles/1/blocks"
+    lock_keys = []
+    for router in ("rental_vehicles", "rental_providers"):
+        monkeypatch.setattr(f"app.routers.{router}.lock_booking_resource",
+                            lambda session, key: lock_keys.append(key))
+    booking.status = "in_progress"
+    db.commit()
+    start = booking.pickup_at.date()
+    end = start + timedelta(days=1)
+    dates = {"start_date": start.isoformat(), "end_date": end.isoformat()}
+    assert client.post(legacy, json=dates).status_code == 409
+
+    booking.status = "pending"
+    booking.expires_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    monkeypatch.setattr("app.routers.rental_vehicles.utc_now", lambda: booking.expires_at)
+    created = client.post(legacy, json=dates)
+    assert created.status_code == 201, created.text
+    assert created.json()["start_date"] == dates["start_date"]
+    assert created.json()["end_date"] == dates["end_date"]
+    block_id = created.json()["id"]
+    block = db.get(RentalAvailabilityBlock, block_id)
+    assert block.end_datetime == datetime.combine(end + timedelta(days=1), datetime.min.time())
+    assert any(item["id"] == block_id for item in client.get(legacy).json())
+    assert client.patch(f"{current}/{block_id}", json={"reason": "Shared calendar"}).status_code == 200
+    assert client.delete(f"{legacy}/{block_id}").status_code == 200
+    assert all(item["id"] != block_id for item in client.get(legacy).json())
+    assert lock_keys == ["rental_vehicle_booking_1"] * 4
+
+
 def test_update_and_delete_availability_block(isolated_db_session, seed_test_data):
     """SP-08: Provider can update and delete vehicle availability blocks."""
     db = isolated_db_session
@@ -545,9 +580,21 @@ def test_create_provider_location_and_gps_validation(isolated_db_session, seed_t
     assert Decimal(str(data["longitude"])) == Decimal("80.106300")
 
 
-def test_update_and_safe_delete_location(isolated_db_session, seed_test_data):
-    """SP-09: Provider updates location; deleting location with stationed vehicles soft-deactivates safely."""
+@pytest.fixture
+def hub_integrity_db(isolated_db_session, seed_test_data):
     db = isolated_db_session
+    db.execute(text("PRAGMA foreign_keys=ON"))
+    assert db.scalar(text("PRAGMA foreign_keys")) == 1
+    try:
+        yield db
+    finally:
+        db.rollback()
+        db.execute(text("PRAGMA foreign_keys=OFF"))
+
+
+def test_update_and_safe_delete_location(hub_integrity_db, seed_test_data):
+    """SP-09: Provider updates location; deleting location with stationed vehicles soft-deactivates safely."""
+    db = hub_integrity_db
     user = seed_test_data["prov_user1"]
     client = make_test_client(db, current_user=user)
 
@@ -579,6 +626,77 @@ def test_update_and_safe_delete_location(isolated_db_session, seed_test_data):
     resp_del_perm = client.delete(f"/api/v1/provider/rentals/locations/{temp_id}")
     assert resp_del_perm.status_code == 200
     assert "deleted successfully" in resp_del_perm.json()["message"]
+    assert db.get(RentalLocation, temp_id) is None
+
+
+@pytest.mark.parametrize(("pickup_id", "return_id"), [
+    (3, None), (None, 3), (3, 3),
+], ids=["pickup-only", "return-only", "both"])
+def test_delete_booking_referenced_hub_preserves_history(hub_integrity_db, seed_test_data, pickup_id, return_id):
+    db = hub_integrity_db
+    db.add(RentalLocation(id=3, provider_id=101, location_name="Alternate hub", district="Galle", city="Galle"))
+    db.flush()
+    booking = seed_test_data["b1"]
+    booking.pickup_location_id = pickup_id
+    booking.return_location_id = return_id
+    db.commit()
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+
+    response = client.delete("/api/v1/provider/rentals/locations/3")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "message": "Location cannot be permanently deleted because existing bookings reference it. It has been deactivated instead.",
+        "location_id": 3,
+        "is_active": False,
+    }
+    db.refresh(booking)
+    assert (booking.pickup_location_id, booking.return_location_id) == (pickup_id, return_id)
+    assert db.get(RentalLocation, 3).is_active is False
+    assert (booking.pickup_location.location_name if pickup_id else None) == ("Alternate hub" if pickup_id else None)
+    assert (booking.return_location.location_name if return_id else None) == ("Alternate hub" if return_id else None)
+
+
+@pytest.mark.parametrize("field", ["location_name", "district", "city", "is_active"])
+def test_patch_location_rejects_explicit_null_without_mutation(hub_integrity_db, seed_test_data, field):
+    db = hub_integrity_db
+    location = seed_test_data["loc1"]
+    previous = getattr(location, field)
+    previous_address = location.address
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+
+    response = client.patch("/api/v1/provider/rentals/locations/1", json={field: None, "address": "Changed"})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", field]
+    db.refresh(location)
+    assert getattr(location, field) == previous
+    assert location.address == previous_address
+
+
+def test_patch_location_preserves_omitted_fields_and_clears_nullable_fields(hub_integrity_db, seed_test_data):
+    db = hub_integrity_db
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+    path = "/api/v1/provider/rentals/locations/1"
+    before = client.get(path).json()
+    assert before["address"] is not None and before["latitude"] is not None and before["longitude"] is not None
+    omitted = client.patch(path, json={})
+    assert omitted.status_code == 200
+    assert omitted.json() == before
+
+    response = client.patch(path, json={"city": "Galle Fort", "address": None, "latitude": None, "longitude": None})
+    assert response.status_code == 200, response.text
+    assert response.json() == {**before, "city": "Galle Fort", "address": None, "latitude": None, "longitude": None}
+
+
+def test_provider_cannot_update_or_delete_foreign_hub(hub_integrity_db, seed_test_data):
+    db = hub_integrity_db
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+    path = "/api/v1/provider/rentals/locations/2"
+
+    assert client.patch(path, json={"is_active": False}).status_code == 404
+    assert client.delete(path).status_code == 404
+    assert db.get(RentalLocation, 2).is_active is True
 
 
 def test_public_locations_traveler_integration(isolated_db_session, seed_test_data):

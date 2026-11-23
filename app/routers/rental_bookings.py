@@ -1,4 +1,5 @@
 import math
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING
 import hashlib
@@ -7,11 +8,13 @@ from typing import Annotated, Literal
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, or_, text
+from sqlalchemy import and_, or_, text, true
 from sqlalchemy.orm import Session
 
+from app.core.booking_transactions import CAPTURED, RESERVED_REFUNDS
 from app.core.dependencies import require_traveler
 from app.core.publication import public_rental
+from app.core.rental_capacity import TUK_TUK_MIN_PASSENGERS, tuk_tuk_passenger_limit
 from app.database.connection import get_db
 from app.core.notification_service import create_notification
 from app.models.user import User
@@ -25,6 +28,7 @@ from app.models.rental import (
     RentalEligibilityCheck,
     RentalIncident,
     RentalInspection,
+    RentalLocation,
 )
 from app.models.shared import BookingReference, BookingStatusHistory, PaymentRefund, PaymentTransaction
 from app.routers.auth import get_current_user
@@ -60,6 +64,12 @@ from app.schemas.rental_booking import (
 
 
 from app.services.provider_reservations import record_native_event
+from app.services.rental_eligibility import (
+    FOREIGN_TUK_TUK_PERMIT_MESSAGE,
+    has_foreign_tuk_tuk_permit,
+    rental_minimum_age,
+    verify_rental_handover_driver,
+)
 
 router = APIRouter(
     prefix="/api/v1/rental-bookings",
@@ -213,7 +223,7 @@ def validate_rental_dates(
         db.query(RentalBooking)
         .filter(
             RentalBooking.vehicle_id == vehicle.id,
-            RentalBooking.status.in_(["pending", "confirmed", "active"]),
+            RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
             or_(
                 RentalBooking.status != "pending",
                 RentalBooking.expires_at > current_time,
@@ -282,7 +292,7 @@ def get_my_rental_bookings(
     elif status_filter == "active":
         query = query.filter(
             or_(
-                RentalBooking.status == "active",
+                RentalBooking.status.in_(("active", "in_progress")),
                 and_(
                     RentalBooking.status == "confirmed",
                     RentalBooking.pickup_at <= current_time,
@@ -357,10 +367,12 @@ def get_my_rental_bookings(
                 status=b.status,
                 payment_method=b.payment_method,
                 payment_status=b.payment_status,
-                cancellation_policy=b.cancellation_policy_snapshot or (v.cancellation_policy if v else None),
-                free_cancellation_hours=b.free_cancellation_hours_snapshot or 24,
+                cancellation_policy=b.cancellation_policy_snapshot,
+                free_cancellation_hours=b.free_cancellation_hours_snapshot if b.free_cancellation_hours_snapshot is not None else 24,
                 cancellation_reason=b.cancellation_reason,
                 cancelled_at=b.cancelled_at,
+                self_drive_agreement_accepted=bool(b.self_drive_agreement_accepted),
+                passenger_count=b.passenger_count,
                 created_at=b.created_at,
             )
         )
@@ -611,21 +623,28 @@ def get_rental_booking(
         )
         .first()
     )
+    legacy_party = {}
     if ref:
         booking.booking_reference = ref.booking_reference
 
-        # Retrieve agreement acceptance and passenger count from persistent BookingStatusHistory (AR-09, AR-10)
-        history_entry = (
-            db.query(BookingStatusHistory)
-            .filter(BookingStatusHistory.booking_reference_id == ref.id)
-            .order_by(BookingStatusHistory.created_at.asc())
-            .first()
-        )
-        if history_entry and history_entry.notes:
-            booking.self_drive_agreement_accepted = "Self-drive agreement accepted: True" in history_entry.notes
-            import re
-            m = re.search(r"Passenger count:\s*(\d+)", history_entry.notes)
-            booking.passenger_count = int(m.group(1)) if m else None
+        if booking.self_drive_agreement_accepted is None:
+            history_entry = (
+                db.query(BookingStatusHistory)
+                .filter(
+                    BookingStatusHistory.booking_reference_id == ref.id,
+                    BookingStatusHistory.from_status.is_(None),
+                    BookingStatusHistory.to_status == "pending",
+                )
+                .order_by(BookingStatusHistory.created_at, BookingStatusHistory.id)
+                .first()
+            )
+            if history_entry and history_entry.notes:
+                legacy_party["self_drive_agreement_accepted"] = (
+                    "Self-drive agreement accepted: True" in history_entry.notes
+                )
+                count_match = re.search(r"Passenger count:\s*([1-9]\d*)\.", history_entry.notes)
+                if count_match and booking.passenger_count is None:
+                    legacy_party["passenger_count"] = int(count_match.group(1))
 
     v = booking.vehicle
     if v:
@@ -650,7 +669,7 @@ def get_rental_booking(
         booking.security_deposit = deposit_map.get(v.vehicle_type, Decimal("10000.00")) if v else Decimal("10000.00")
         booking.deposit_status = "not_collected"
 
-    return booking
+    return RentalBookingResponse.model_validate(booking).model_copy(update=legacy_party)
 
 
 # ==========================================
@@ -735,16 +754,21 @@ def create_rental_booking(
                     detail=f"Driving license expires on {eligibility.license_expiry_date}, which is before the rental return date ({return_at.date()}).",
                 )
             if vehicle.vehicle_type == "tuk_tuk" and eligibility.license_country.strip().lower() != "sri lanka":
-                has_permit = bool(eligibility.idp_number or getattr(eligibility, "recognition_permit_number", None))
+                has_permit = has_foreign_tuk_tuk_permit(eligibility)
                 if not has_permit:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Foreign travelers renting a tuk-tuk require an International Driving Permit (IDP) and Sri Lankan recognition permit endorsement.",
+                        detail=FOREIGN_TUK_TUK_PERMIT_MESSAGE,
                     )
 
         # AR-02: Minimum Age Requirements & Trusted Evidence Integrity (Conditions 11, 12, 13, 14)
         # 11: Do NOT accept client-supplied driver_dob in booking creation as authoritative proof of age.
         # 12: Check if an existing approved identity verification record provides a trustworthy date of birth (e.g. verified DOB on license or ProviderProfile.date_of_birth from KYC).
+        min_age, requires_dob = rental_minimum_age(db, vehicle.vehicle_type)
+        if eligibility is None and requires_dob:
+            eligibility = db.query(RentalEligibilityCheck).filter_by(
+                user_id=current_user.id, verification_status="approved",
+            ).first()
         verified_dob = None
         if eligibility and getattr(eligibility, "date_of_birth", None):
             verified_dob = eligibility.date_of_birth
@@ -754,12 +778,9 @@ def create_rental_booking(
                 .filter(ProviderProfile.user_id == current_user.id)
                 .first()
             )
-            if user_kyc_profile and user_kyc_profile.date_of_birth:
+            if user_kyc_profile and user_kyc_profile.approval_status == "approved" and user_kyc_profile.date_of_birth:
                 verified_dob = user_kyc_profile.date_of_birth
 
-        # 13: If verified DOB is available, calculate age at pickup and enforce category policy:
-        # Bike: 18+, Tuk-Tuk: 21+, Bicycle: 16+
-        min_age = 18 if vehicle.vehicle_type == "bike" else (21 if vehicle.vehicle_type == "tuk_tuk" else 16)
         if verified_dob:
             pickup_date = pickup_at.date()
             age_at_pickup = (
@@ -772,7 +793,7 @@ def create_rental_booking(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Renter must be at least {min_age} years old at pickup for {vehicle.vehicle_type} rentals. Current verified age is {age_at_pickup}.",
                 )
-        elif vehicle.vehicle_type != "bicycle":
+        elif requires_dob:
             # 14: If verified DOB is unavailable, fail closed for age-restricted bookings and report the missing trusted-data dependency.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -789,13 +810,14 @@ def create_rental_booking(
 
         # AR-10: Tuk-Tuk Passenger Count & Seating Capacity Validation
         if vehicle.vehicle_type == "tuk_tuk":
-            if booking_data.passenger_count is None or booking_data.passenger_count < 1:
+            if booking_data.passenger_count is None or booking_data.passenger_count < TUK_TUK_MIN_PASSENGERS:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Tuk-tuk bookings require a valid passenger count of at least 1 passenger (AR-10).",
                 )
-            # Maximum legal passenger capacity is seating_capacity - 1 (1 seat reserved for self-drive driver)
-            max_passengers = max(1, vehicle.seating_capacity - 1)
+            max_passengers = tuk_tuk_passenger_limit(vehicle.seating_capacity)
+            if max_passengers is None:
+                raise HTTPException(400, "Tuk-tuk seating capacity must be verified before booking")
             if booking_data.passenger_count > max_passengers:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -810,6 +832,25 @@ def create_rental_booking(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Passenger count ({booking_data.passenger_count}) exceeds vehicle passenger capacity of {max_passengers} for {vehicle.vehicle_type}.",
                     )
+
+        for field, location_id in (
+            ("pickup_location_id", booking_data.pickup_location_id),
+            ("return_location_id", booking_data.return_location_id),
+        ):
+            if location_id is None:
+                continue
+            location = (
+                db.query(RentalLocation.id)
+                .with_hint(RentalLocation, "WITH (HOLDLOCK)", "mssql")
+                .filter(
+                    RentalLocation.id == location_id,
+                    RentalLocation.provider_id == vehicle.provider_id,
+                    RentalLocation.is_active == true(),
+                )
+                .first()
+            )
+            if location is None:
+                raise HTTPException(400, f"{field} must identify an active hub for this vehicle's provider")
 
         # Mark expired pending bookings for this vehicle as 'expired'
         expired_bookings = (
@@ -849,7 +890,7 @@ def create_rental_booking(
             db.query(RentalBooking)
             .filter(
                 RentalBooking.vehicle_id == vehicle.id,
-                RentalBooking.status.in_(["pending", "confirmed", "active"]),
+                RentalBooking.status.in_(["pending", "confirmed", "active", "in_progress"]),
                 RentalBooking.pickup_at < return_at,
                 RentalBooking.return_at > pickup_at,
             )
@@ -886,12 +927,18 @@ def create_rental_booking(
             return_at=return_at,
             total_price=total_price,
             status="pending",
-            pickup_location_id=booking_data.pickup_location_id or vehicle.location_id,
-            return_location_id=booking_data.return_location_id or vehicle.location_id,
+            pickup_location_id=(
+                vehicle.location_id if booking_data.pickup_location_id is None else booking_data.pickup_location_id
+            ),
+            return_location_id=(
+                vehicle.location_id if booking_data.return_location_id is None else booking_data.return_location_id
+            ),
             currency="LKR",
             payment_method=booking_data.payment_method or "pay_at_location",
             payment_status="unpaid",
             expires_at=hold_expires_at,
+            passenger_count=booking_data.passenger_count,
+            self_drive_agreement_accepted=booking_data.self_drive_agreement_accepted,
             daily_rate_snapshot=vehicle.price_per_day,
             cancellation_policy_snapshot=vehicle.cancellation_policy,
             free_cancellation_hours_snapshot=vehicle.free_cancellation_hours,
@@ -930,9 +977,6 @@ def create_rental_booking(
             notes=agreement_note,
         )
         db.add(status_history)
-        db.commit()
-        db.refresh(new_booking)
-
         # TR-18: Dispatch in-app notification to rental provider
         provider_profile = (
             db.query(ProviderProfile)
@@ -948,7 +992,8 @@ def create_rental_booking(
                 notification_type="rental_booking_created",
                 link_url=f"/provider/rentals/bookings/{new_booking.id}",
             )
-            db.commit()
+        db.commit()
+        db.refresh(new_booking)
 
         # Attach booking reference to response
         new_booking.booking_reference = ref_code
@@ -969,9 +1014,6 @@ def create_rental_booking(
                 instructions="Please pay cash (LKR) directly to the rental provider upon vehicle handover. A refundable security deposit is also collected at pickup.",
             )
 
-        # Attach AR-09 & AR-10 attributes to returned booking response
-        new_booking.self_drive_agreement_accepted = booking_data.self_drive_agreement_accepted
-        new_booking.passenger_count = booking_data.passenger_count
         new_booking.fuel_policy = "not_applicable" if vehicle.vehicle_type == "bicycle" or (vehicle.fuel_type and vehicle.fuel_type.lower() == "electric") else "same_to_same"
         deposit_map = {
             "bike": Decimal("10000.00"),
@@ -1053,31 +1095,8 @@ def cancel_rental_booking(
                 detail="Cannot cancel after pickup time",
             )
 
-        previous = booking.status
-        # Policy-aware cancellation evaluation (TR-14)
-        hours_until_pickup = (booking.pickup_at - current_time).total_seconds() / 3600.0
-        free_hours = booking.free_cancellation_hours_snapshot or 24
-
-        if hours_until_pickup >= free_hours:
-            is_within_free_cancellation = True
-            cancellation_fee = Decimal("0.00")
-            refund_amount = booking.total_price
-            refund_eligible = True
-            msg = f"Cancelled within the free cancellation window ({int(free_hours)} hours). Eligible for 100% refund."
-        else:
-            is_within_free_cancellation = False
-            penalty = booking.daily_rate_snapshot or (booking.total_price / Decimal("2.0"))
-            cancellation_fee = min(penalty, booking.total_price).quantize(Decimal("0.01"))
-            refund_amount = (booking.total_price - cancellation_fee).quantize(Decimal("0.01"))
-            refund_eligible = refund_amount > Decimal("0.00")
-            msg = f"Cancelled past the free cancellation window ({int(free_hours)} hours). Cancellation fee of {cancellation_fee} LKR applied."
-
-        booking.status = "cancelled"
-        booking.cancelled_by = current_user.id
-        booking.cancelled_at = current_time
-        booking.cancellation_reason = f"Cancelled by traveler: {msg}"
-
-        # Synchronize BookingReference
+        vehicle = db.get(RentalVehicle, booking.vehicle_id)
+        provider = db.get(ProviderProfile, vehicle.provider_id)
         booking_ref = (
             db.query(BookingReference)
             .filter(
@@ -1086,59 +1105,95 @@ def cancel_rental_booking(
             )
             .first()
         )
+        if booking_ref and (booking_ref.user_id != booking.user_id or booking_ref.provider_profile_id != provider.id):
+            raise HTTPException(409, "Rental booking reference requires reconciliation before cancellation")
+
+        previous = booking.status
+        # Policy-aware cancellation evaluation (TR-14)
+        free_hours = booking.free_cancellation_hours_snapshot
+        if free_hours is None:
+            free_hours = 24
+
+        if booking.pickup_at - current_time >= timedelta(hours=free_hours):
+            is_within_free_cancellation = True
+            cancellation_fee = Decimal("0.00")
+            msg = f"Cancelled within the free cancellation window ({free_hours} hours)."
+        else:
+            is_within_free_cancellation = False
+            penalty = booking.daily_rate_snapshot
+            if penalty is None:
+                penalty = booking.total_price / Decimal("2")
+            cancellation_fee = min(penalty, booking.total_price).quantize(Decimal("0.01"))
+            msg = f"Cancelled past the free cancellation window ({free_hours} hours). Policy fee: {cancellation_fee} {booking.currency or 'LKR'}."
+
+        booking.status = "cancelled"
+        booking.cancelled_by = current_user.id
+        booking.cancelled_at = current_time
+        booking.cancellation_reason = f"Cancelled by traveler: {msg}"
+
         if booking_ref:
             booking_ref.booking_status = "cancelled"
 
-        # If booking was paid online, create audit record in PaymentRefund
+        refund_amount = Decimal("0.00")
         refund_record_created = False
-        if booking.payment_status == "paid" and refund_amount > Decimal("0.00") and booking_ref:
+        if booking.payment_method == "online" and booking.payment_status == "paid" and booking_ref:
             tx = (
                 db.query(PaymentTransaction)
-                .filter(PaymentTransaction.booking_reference_id == booking_ref.id)
-                .order_by(PaymentTransaction.id.desc())
+                .filter(
+                    PaymentTransaction.booking_reference_id == booking_ref.id,
+                    PaymentTransaction.user_id == booking.user_id,
+                    PaymentTransaction.gateway_name == "payhere",
+                    PaymentTransaction.payment_method == "online",
+                    PaymentTransaction.payment_status.in_(CAPTURED),
+                    PaymentTransaction.gateway_transaction_id.is_not(None),
+                    PaymentTransaction.paid_at.is_not(None),
+                    PaymentTransaction.currency == (booking.currency or "LKR"),
+                    PaymentTransaction.amount == booking.total_price,
+                )
+                .order_by(PaymentTransaction.paid_at, PaymentTransaction.id)
                 .first()
             )
             if tx:
-                refund_audit = PaymentRefund(
-                    payment_transaction_id=tx.id,
-                    amount=refund_amount,
-                    currency="LKR",
-                    refund_reason=f"Traveler cancellation refund audit: {msg}",
-                    refund_status="pending",  # Audit record only; no automatic payout
+                reserved = db.query(PaymentRefund.amount, PaymentRefund.currency).filter(
+                    PaymentRefund.payment_transaction_id == tx.id,
+                    PaymentRefund.refund_status.in_(RESERVED_REFUNDS),
+                ).all()
+                if any(currency != tx.currency or amount < 0 for amount, currency in reserved):
+                    raise HTTPException(409, "Existing refund reservations require reconciliation before cancellation")
+                reserved_amount = sum((amount for amount, _ in reserved), Decimal("0.00"))
+                refund_amount = max(
+                    Decimal("0.00"),
+                    (tx.amount - cancellation_fee - reserved_amount).quantize(Decimal("0.01")),
                 )
-                db.add(refund_audit)
-                refund_record_created = True
-        vehicle = db.get(RentalVehicle, booking.vehicle_id)
-        provider = db.get(ProviderProfile, vehicle.provider_id)
+                if refund_amount > 0:
+                    db.add(PaymentRefund(
+                        payment_transaction_id=tx.id,
+                        amount=refund_amount,
+                        currency=tx.currency,
+                        refund_reason=f"Traveler cancellation refund audit: {msg}",
+                        refund_status="pending",
+                    ))
+                    booking.payment_status = booking_ref.payment_status = "refund_pending"
+                    refund_record_created = True
         record_native_event(
             db, booking, "rental_vehicle", provider.id, previous, "cancelled",
-            current_user.id, provider.user_id,
+            current_user.id, provider.user_id, notify=False,
         )
 
+        if provider.user_id:
+            create_notification(
+                db=db,
+                user_id=provider.user_id,
+                title=f"Rental Booking #{booking.id} Cancelled",
+                message=f"Booking #{booking.id} for {vehicle.vehicle_name} was cancelled by traveler.",
+                notification_type="rental_booking_cancelled",
+                link_url=f"/provider/rentals/bookings/{booking.id}",
+            )
         db.commit()
         db.refresh(booking)
 
-        # TR-18: Dispatch in-app notification to rental provider
-        vehicle = db.get(RentalVehicle, booking.vehicle_id)
-        if vehicle:
-            provider_profile = (
-                db.query(ProviderProfile)
-                .filter(ProviderProfile.id == vehicle.provider_id)
-                .first()
-            )
-            if provider_profile and provider_profile.user_id:
-                create_notification(
-                    db=db,
-                    user_id=provider_profile.user_id,
-                    title=f"Rental Booking #{booking.id} Cancelled",
-                    message=f"Booking #{booking.id} for {vehicle.vehicle_name} was cancelled by traveler. Status: {booking.status}.",
-                    notification_type="rental_booking_cancelled",
-                    link_url=f"/provider/rentals/bookings/{booking.id}",
-                )
-                db.commit()
-
         booking.is_within_free_cancellation = is_within_free_cancellation
-        booking.refund_eligible = refund_eligible
+        booking.refund_eligible = refund_amount > 0
         booking.cancellation_fee = cancellation_fee
         booking.refund_amount = refund_amount
         booking.refund_record_created = refund_record_created
@@ -1303,7 +1358,10 @@ def update_rental_booking_status(
             )
 
         # Safe expiry check for pending bookings being confirmed
-        if status_data.status == "confirmed" and booking.expires_at and booking.expires_at <= current_time:
+        if status_data.status == "confirmed" and (
+            booking.pickup_at <= current_time
+            or (booking.expires_at is not None and booking.expires_at <= current_time)
+        ):
             booking.status = "expired"
             booking_ref = (
                 db.query(BookingReference)
@@ -1332,10 +1390,12 @@ def update_rental_booking_status(
             )
 
         previous = booking.status
+        if status_data.status == "active":
+            verify_rental_handover_driver(db, booking, vehicle)
         booking.status = status_data.status
         record_native_event(
             db, booking, "rental_vehicle", provider.id, previous, booking.status,
-            current_user.id, booking.user_id,
+            current_user.id, booking.user_id, notify=False,
         )
 
         # Sync BookingReference
@@ -1360,6 +1420,8 @@ def update_rental_booking_status(
                 notification_type="rental_booking_confirmed",
                 link_url=f"/traveler/rental-bookings/{booking.id}",
             )
+        elif booking.status == "active":
+            notify_rental_pickup(db, booking, vehicle)
         elif booking.status == "completed":
             create_notification(
                 db=db,
@@ -1413,7 +1475,7 @@ def parse_inspection_helmet_info(notes: str | None, vehicle: RentalVehicle) -> V
         sizes_m = re.search(r"sizes=([^,\]]+(?:,\s*[^,\]]+)*?)(?:,\s*condition|$)", content, re.IGNORECASE)
         sizes = [s.strip() for s in sizes_m.group(1).split(",") if s.strip()] if sizes_m else None
         cond_m = re.search(r"condition=([^,\]]+)", content, re.IGNORECASE)
-        cond = cond_m.group(1).strip() if cond_m else "Good"
+        cond = cond_m.group(1).strip() if cond_m else None
         return VehicleHelmetInfo(
             helmet_provided=count > 0,
             helmet_count=count,
@@ -1430,6 +1492,14 @@ def parse_inspection_helmet_info(notes: str | None, vehicle: RentalVehicle) -> V
         requires_helmet=True,
         notes="No helmet data recorded during inspection.",
     )
+
+
+def return_acknowledgement_timestamp(
+    inspection_type: str, value: datetime | None,
+) -> datetime | None:
+    if inspection_type == "return" and value is not None:
+        return normalize_utc(value).replace(tzinfo=timezone.utc)
+    return value
 
 
 @router.get(
@@ -1488,7 +1558,7 @@ def get_booking_inspections(
             for ev in (getattr(insp, "condition_evidence", None) or [])
         ]
         helmets = parse_inspection_helmet_info(insp.notes, vehicle) if vehicle else None
-        is_ack = bool(insp.customer_signature and insp.customer_signature.strip())
+        is_ack = insp.acknowledged_at is not None
 
         results.append(
             RentalInspectionResponse(
@@ -1501,6 +1571,7 @@ def get_booking_inspections(
                 inspected_by=insp.inspected_by,
                 customer_signature=insp.customer_signature,
                 is_acknowledged=is_ack,
+                acknowledged_at=return_acknowledgement_timestamp(insp.inspection_type, insp.acknowledged_at),
                 notes=insp.notes,
                 helmets=helmets,
                 fuel_policy=fuel_policy,
@@ -1571,7 +1642,7 @@ def get_booking_inspection_detail(
         for ev in (getattr(insp, "condition_evidence", None) or [])
     ]
     helmets = parse_inspection_helmet_info(insp.notes, vehicle) if vehicle else None
-    is_ack = bool(insp.customer_signature and insp.customer_signature.strip())
+    is_ack = insp.acknowledged_at is not None
     fuel_policy = "not_applicable" if vehicle and (vehicle.vehicle_type == "bicycle" or (vehicle.fuel_type and vehicle.fuel_type.lower() == "electric")) else "same_to_same"
 
     return RentalInspectionResponse(
@@ -1584,6 +1655,7 @@ def get_booking_inspection_detail(
         inspected_by=insp.inspected_by,
         customer_signature=insp.customer_signature,
         is_acknowledged=is_ack,
+        acknowledged_at=return_acknowledgement_timestamp(insp.inspection_type, insp.acknowledged_at),
         notes=insp.notes,
         helmets=helmets,
         fuel_policy=fuel_policy,
@@ -1605,13 +1677,26 @@ def acknowledge_handover_inspection(
     current_user: Annotated[User, Depends(get_current_user)],
     request: Request = None,
 ):
-    """
-    Authenticates traveler acknowledgement of vehicle condition at digital handover.
-    - Rule 14 & 15: Strictly enforces that only the booking traveler can acknowledge.
-    - Rule 16: Prevents duplicate acknowledgements (409 Conflict).
-    - Rule 17 & 18: Preserves inspection timestamps, mileage, fuel, and stores cryptographic signature in customer_signature.
-    - Persists audit trail in dbo.booking_status_history.
-    """
+    return acknowledge_rental_inspection(booking_id, inspection_id, payload, db, current_user, request, "pickup")
+
+
+@router.post(
+    "/{booking_id}/inspections/{inspection_id}/acknowledge-return",
+    response_model=TravelerInspectionAcknowledgementResponse,
+    summary="Traveler digital acknowledgement of vehicle condition at return",
+)
+def acknowledge_return_inspection(
+    booking_id: int,
+    inspection_id: int,
+    payload: TravelerInspectionAcknowledgementRequest,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    request: Request,
+):
+    return acknowledge_rental_inspection(booking_id, inspection_id, payload, db, current_user, request, "return")
+
+
+def acknowledge_rental_inspection(booking_id, inspection_id, payload, db, current_user, request, inspection_type):
     booking = db.get(RentalBooking, booking_id)
     if not booking:
         raise HTTPException(
@@ -1626,6 +1711,7 @@ def acknowledge_handover_inspection(
             detail="Only the traveler associated with this booking can acknowledge the inspection checklist.",
         )
 
+    lock_rental_vehicle(db, booking.vehicle_id)
     insp = (
         db.query(RentalInspection)
         .filter(
@@ -1640,17 +1726,18 @@ def acknowledge_handover_inspection(
             detail="Inspection checklist not found for this booking",
         )
 
-    if insp.inspection_type != "pickup":
+    label = "handover" if inspection_type == "pickup" else "return"
+    if insp.inspection_type != inspection_type:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only pickup handover inspection checklists can be acknowledged by traveler.",
+            detail=f"Only {'pickup handover' if inspection_type == 'pickup' else 'return'} inspection checklists can be acknowledged by traveler.",
         )
 
     # Rule 16: Prevent duplicate acknowledgements
-    if insp.customer_signature and insp.customer_signature.strip():
+    if insp.acknowledged_at is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Vehicle handover inspection has already been acknowledged.",
+            detail=f"Vehicle {label} inspection has already been acknowledged.",
         )
 
     if not payload.agreed_to_condition:
@@ -1664,7 +1751,9 @@ def acknowledge_handover_inspection(
     digest = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
     sig_token = f"SIG:SHA256:{digest[:32]}|BY:{payload.signature_name.strip()}|AT:{now.isoformat()}"
 
-    insp.customer_signature = sig_token
+    recorded_signature = insp.customer_signature
+    if not recorded_signature:
+        insp.customer_signature = sig_token
     insp.acknowledged_at = now
     if request and hasattr(request, "client") and request.client:
         insp.acknowledgement_ip = request.client.host
@@ -1678,13 +1767,23 @@ def acknowledge_handover_inspection(
         )
         .first()
     )
+    if recorded_signature and booking_ref is None:
+        booking_ref = BookingReference(
+            module_type="rental_vehicle", target_booking_id=booking.id,
+            provider_profile_id=booking.vehicle.provider_id, user_id=booking.user_id,
+            booking_reference=f"RB-{booking.id}-{uuid.uuid4().hex[:8].upper()}",
+            total_price=booking.total_price, currency=booking.currency,
+            booking_status=booking.status, payment_status=booking.payment_status,
+        )
+        db.add(booking_ref)
+        db.flush()
     if booking_ref:
         status_history = BookingStatusHistory(
             booking_reference_id=booking_ref.id,
             from_status=booking.status,
             to_status=booking.status,
             changed_by=current_user.id,
-            notes=f"Traveler digital handover acknowledgement: {sig_token}",
+            notes=f"Traveler digital {label} acknowledgement: {sig_token}",
         )
         db.add(status_history)
 
@@ -1696,9 +1795,9 @@ def acknowledge_handover_inspection(
         inspection_id=insp.id,
         inspection_type=insp.inspection_type,
         is_acknowledged=True,
-        customer_signature=insp.customer_signature,
-        acknowledged_at=now,
-        message=f"Handover condition successfully acknowledged by {payload.signature_name.strip()}.",
+        customer_signature=sig_token,
+        acknowledged_at=return_acknowledgement_timestamp(inspection_type, now),
+        message=f"{label.capitalize()} condition successfully acknowledged by {payload.signature_name.strip()}.",
     )
 
 
@@ -1981,6 +2080,14 @@ def get_booking_incident(
 # CONFIRM VEHICLE HANDOVER
 # ==========================================
 
+def notify_rental_pickup(db, booking, vehicle):
+    create_notification(
+        db, booking.user_id, f"Rental Booking #{booking.id} Picked Up",
+        f"Handover for {vehicle.vehicle_name} is complete.",
+        "rental_booking_active", f"/traveler/rental-bookings/{booking.id}",
+    )
+
+
 @router.post(
     "/{booking_id}/handover",
     response_model=RentalBookingResponse,
@@ -2072,7 +2179,12 @@ def confirm_rental_handover(
                 detail="Cannot handover vehicle before booking start date",
             )
 
+        verify_rental_handover_driver(db, booking, vehicle)
+        previous = booking.status
         booking.status = "in_progress"
+        record_native_event(db, booking, "rental_vehicle", provider.id, previous,
+                            booking.status, current_user.id, booking.user_id, notify=False)
+        notify_rental_pickup(db, booking, vehicle)
 
         db.commit()
         db.refresh(booking)
@@ -2172,8 +2284,15 @@ def confirm_rental_return(
                 detail=f"Cannot return booking with status '{booking.status}'. Booking must be 'in_progress'",
             )
 
+        previous = booking.status
         booking.status = "completed"
-
+        record_native_event(db, booking, "rental_vehicle", provider.id, previous,
+                            booking.status, current_user.id, booking.user_id, notify=False)
+        create_notification(
+            db, booking.user_id, f"Rental Booking #{booking.id} Completed",
+            f"Return of {vehicle.vehicle_name} is complete.",
+            "rental_booking_completed", f"/traveler/rental-bookings/{booking.id}",
+        )
         db.commit()
         db.refresh(booking)
 

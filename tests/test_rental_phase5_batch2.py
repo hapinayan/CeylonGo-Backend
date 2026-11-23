@@ -263,6 +263,10 @@ def test_tuktuk_booking_succeeds_when_agreement_accepted_and_passenger_count_val
     data = resp.json()
     assert data["self_drive_agreement_accepted"] is True
     assert data["passenger_count"] == 2
+    history_item = next(item for item in client.get("/api/v1/rental-bookings/me").json()["items"]
+                        if item["id"] == data["id"])
+    assert history_item["passenger_count"] == 2
+    assert history_item["self_drive_agreement_accepted"] is True
     assert data["status"] == "pending"
 
 
@@ -332,6 +336,11 @@ def test_get_rental_booking_retrieves_persisted_agreement_and_passengers(isolate
     assert create_resp.status_code == 201
     booking_id = create_resp.json()["id"]
 
+    db.expire_all()
+    stored = db.get(RentalBooking, booking_id)
+    assert stored.passenger_count == 2
+    assert stored.self_drive_agreement_accepted is True
+
     # Retrieve booking details
     get_resp = client.get(f"/api/v1/rental-bookings/{booking_id}")
     assert get_resp.status_code == 200
@@ -339,6 +348,18 @@ def test_get_rental_booking_retrieves_persisted_agreement_and_passengers(isolate
     assert data["id"] == booking_id
     assert data["self_drive_agreement_accepted"] is True
     assert data["passenger_count"] == 2
+
+    stored.passenger_count = None
+    stored.self_drive_agreement_accepted = None
+    db.commit()
+    legacy = client.get(f"/api/v1/rental-bookings/{booking_id}")
+    assert legacy.status_code == 200
+    assert legacy.json()["passenger_count"] == 2
+    assert legacy.json()["self_drive_agreement_accepted"] is True
+    assert not db.is_modified(stored)
+    db.refresh(stored)
+    assert stored.passenger_count is None
+    assert stored.self_drive_agreement_accepted is None
 
 
 # ==============================================================================
@@ -450,6 +471,37 @@ def test_tuktuk_dynamic_seating_capacity_4seater(isolated_db_session, seed_batch
     resp_exceed = client.post("/api/v1/rental-bookings", json=payload_exceed)
     assert resp_exceed.status_code == 400
     assert "exceeds vehicle passenger capacity of 3" in resp_exceed.json()["detail"].lower()
+
+
+def test_tuktuk_capacity_is_consistent_in_discovery_detail_quote_and_booking(isolated_db_session, seed_batch2_data):
+    db = isolated_db_session
+    vehicle = seed_batch2_data["tuktuk_3s"]
+    client = make_test_client(db, current_user=seed_batch2_data["traveler"])
+    now = datetime.now(timezone.utc)
+    dates = {
+        "pickup_at": (now + timedelta(days=2)).isoformat(),
+        "return_at": (now + timedelta(days=3)).isoformat(),
+    }
+    response = client.get("/api/v1/rental-vehicles?vehicle_type=tuk_tuk")
+    assert response.status_code == 200, response.text
+    listing = next(item for item in response.json()["items"] if item["id"] == vehicle.id)
+    detail = client.get(f"/api/v1/rental-vehicles/{vehicle.id}")
+    quote = client.post(f"/api/v1/rental-vehicles/{vehicle.id}/calculate-quote", json=dates)
+    assert detail.status_code == quote.status_code == 200
+    for payload in (listing, detail.json(), quote.json()):
+        assert payload["seating_capacity"] == 3
+        assert payload["min_passengers"] == 1
+        assert payload["max_passengers"] == 2
+
+    vehicle.seating_capacity = 6
+    db.commit()
+    assert client.get(f"/api/v1/rental-vehicles/{vehicle.id}").json()["max_passengers"] is None
+    rejected = client.post("/api/v1/rental-bookings", json={
+        **dates, "vehicle_id": vehicle.id, "passenger_count": 1,
+        "self_drive_agreement_accepted": True,
+    })
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "Tuk-tuk seating capacity must be verified before booking"
 
 
 def test_bike_and_bicycle_compatibility_without_agreement(isolated_db_session, seed_batch2_data):
@@ -604,6 +656,22 @@ def test_expired_vehicle_insurance_information(isolated_db_session, seed_batch2_
     assert insurance["insurance_status"] == "expired"
 
 
+def test_verified_document_without_expiry_does_not_claim_current_insurance(isolated_db_session, seed_batch2_data):
+    db = isolated_db_session
+    vehicle = seed_batch2_data["tuktuk_3s"]
+    db.add(RentalVehicleDocument(
+        vehicle_id=vehicle.id, document_type="insurance_certificate", document_number="INS-TEST",
+        file_reference="private/insurance.pdf", is_verified=True,
+    ))
+    db.commit()
+    response = make_test_client(db).get(f"/api/v1/rental-vehicles/{vehicle.id}")
+    assert response.status_code == 200
+    insurance = response.json()["insurance"]
+    assert insurance["insurance_status"] == "unverified"
+    assert insurance["is_insured"] is False
+    assert "private/insurance.pdf" not in response.text
+
+
 def test_not_provided_vehicle_insurance_information(isolated_db_session, seed_batch2_data):
     """AR-12: Vehicle with no insurance certificate returns insurance_status='not_provided'."""
     db = isolated_db_session
@@ -699,6 +767,77 @@ def test_admin_verification_synchronizes_traveler_insurance_and_quote(isolated_d
     assert tuktuk_item["insurance_status"] == "verified"
 
 
+def test_insurance_policy_window_and_owner_metadata(isolated_db_session, seed_batch2_data):
+    db = isolated_db_session
+    vehicle_id = seed_batch2_data["tuktuk_3s"].id
+    owner = make_test_client(db, current_user=seed_batch2_data["provider_user"])
+    traveler = make_test_client(db, current_user=seed_batch2_data["traveler"])
+    admin = make_test_client(db, admin_user=seed_batch2_data["admin_user"])
+    document_path = f"/api/v1/rental-vehicles/{vehicle_id}/documents"
+    detail_path = f"/api/v1/rental-vehicles/{vehicle_id}"
+    today = date.today()
+    policy = {
+        "document_type": "insurance_certificate",
+        "document_url": "secure/rentals/future-policy.pdf",
+        "insurance_policy_number": "POLICY-9287",
+        "insurance_provider": "Test insurer",
+        "insurance_effective_date": (today + timedelta(days=1)).isoformat(),
+        "expiry_date": (today + timedelta(days=31)).isoformat(),
+        "insurance_exclusions": "Off-road use",
+        "coverage_amount": "50000.00",
+    }
+    # The seeded traveler has an approved rental KYC profile but owns no vehicle.
+    denied_write = traveler.post(document_path, json=policy)
+    assert denied_write.status_code == 404
+    assert denied_write.json()["detail"] == "Rental vehicle not found or not owned by you"
+    invalid = owner.post(document_path, json={**policy, "expiry_date": today.isoformat()})
+    assert invalid.status_code == 422
+    future = owner.post(document_path, json=policy)
+    assert future.status_code == 201, future.text
+    assert future.json()["document_url"] == policy["document_url"]
+    denied_read = traveler.get(document_path)
+    assert denied_read.status_code == 404
+    assert policy["document_url"] not in denied_read.text
+    traveler_profile = db.query(ProviderProfile).filter_by(user_id=seed_batch2_data["traveler"].id).one()
+    traveler_profile.approval_status = "pending"
+    db.commit()
+    assert traveler.post(document_path, json=policy).status_code == 403
+    assert traveler.get(document_path).status_code == 403
+    admin_path = f"/api/v1/admin/rentals/documents/{future.json()['id']}/verify"
+    assert admin.post(admin_path, json={"decision": "approved"}).status_code == 200
+    future_detail = traveler.get(detail_path)
+    assert future_detail.status_code == 200, future_detail.text
+    summary = future_detail.json()["insurance"]
+    assert summary["insurance_status"] == "not_yet_effective"
+    assert summary["is_insured"] is False
+    assert summary["evidence_verified"] is False
+    assert summary["effective_date"] == policy["insurance_effective_date"]
+    assert summary["expiry_date"] == policy["expiry_date"]
+    assert summary["coverage_amount"] is None
+    assert summary["deductible_amount"] is None
+    assert summary["insurance_provider"] is None
+    assert summary["exclusions"] is None
+    assert policy["document_url"] not in future_detail.text
+    assert policy["insurance_policy_number"] not in future_detail.text
+
+    current = owner.post(document_path, json={
+        **policy, "insurance_effective_date": today.isoformat(), "expiry_date": today.isoformat(),
+    })
+    assert current.status_code == 201, current.text
+    assert admin.post(f"/api/v1/admin/rentals/documents/{current.json()['id']}/verify",
+                      json={"decision": "approved"}).status_code == 200
+    extra = owner.post(document_path, json=policy)
+    assert extra.status_code == 201
+    result = traveler.get(detail_path)
+    summary = result.json()["insurance"]
+    assert summary["insurance_status"] == "verified"
+    assert summary["effective_date"] == summary["expiry_date"] == today.isoformat()
+    assert summary["exclusions"] == "Off-road use"
+    assert Decimal(summary["coverage_amount"]) == Decimal("50000.00")
+    assert summary["evidence_verified"] is True
+    assert policy["document_url"] not in result.text and policy["insurance_policy_number"] not in result.text
+
+
 def test_insurance_schema_fidelity_guard(isolated_db_session, seed_batch2_data):
     """AR-12: Schema fidelity guard - verify no invented coverage amounts, deductibles, or policy clauses exist."""
     db = isolated_db_session
@@ -730,6 +869,9 @@ def test_insurance_schema_fidelity_guard(isolated_db_session, seed_batch2_data):
         "coverage_amount",
         "deductible_amount",
         "insurance_provider",
+        "effective_date",
+        "exclusions",
+        "evidence_verified",
     }
     assert set(insurance_data.keys()) == expected_fields
 

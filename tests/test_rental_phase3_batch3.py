@@ -38,11 +38,13 @@ from app.models.rental_booking import RentalBooking
 from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import (
     BookingReference,
+    BookingStatusHistory,
     Notification,
     PaymentTransaction,
 )
 from app.models.user import Base, User
 from app.routers.auth import get_current_user
+from app.routers import rental_providers
 from app.routers.rental_locations import router as rental_locations_router
 from app.routers.rental_providers import router as rental_providers_router
 from app.routers.rental_vehicles import router as rental_vehicles_router
@@ -401,7 +403,8 @@ def test_reject_provider_booking_success(isolated_db_session, seed_test_data):
     assert booking1.cancellation_reason == "Vehicle booked for private family emergency"
 
 
-def test_accept_expired_booking_rejected(isolated_db_session, seed_test_data):
+@pytest.mark.parametrize("elapsed_pickup", [False, True], ids=["elapsed-hold", "past-pickup-without-hold"])
+def test_accept_expired_booking_rejected(isolated_db_session, seed_test_data, elapsed_pickup):
     """SP-11: Expired pending booking cannot be accepted; marks status as expired."""
     db = isolated_db_session
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -410,7 +413,11 @@ def test_accept_expired_booking_rejected(isolated_db_session, seed_test_data):
 
     # Artificially expire booking 1 hold
     booking1 = db.get(RentalBooking, 1)
-    booking1.expires_at = now - timedelta(minutes=5)
+    if elapsed_pickup:
+        booking1.pickup_at = now - timedelta(minutes=5)
+        booking1.expires_at = None
+    else:
+        booking1.expires_at = now - timedelta(minutes=5)
     db.commit()
 
     resp = client1.post("/api/v1/provider/rentals/bookings/1/accept")
@@ -470,7 +477,7 @@ def test_get_provider_booking_history_filters_and_pagination(isolated_db_session
 # SP-13: DIGITAL VEHICLE HANDOVER TESTS
 # ==============================================================================
 
-def test_record_vehicle_handover_success_and_lifecycle(isolated_db_session, seed_test_data):
+def test_record_vehicle_handover_success_and_lifecycle(isolated_db_session, seed_test_data, monkeypatch):
     """SP-13: Provider records pickup inspection; transitions booking to 'active'."""
     db = isolated_db_session
     user1 = seed_test_data["prov_user1"]
@@ -492,17 +499,26 @@ def test_record_vehicle_handover_success_and_lifecycle(isolated_db_session, seed
         ],
     }
 
+    invalid = client1.post("/api/v1/provider/rentals/bookings/3/handover", json={
+        **payload, "evidence": [{**payload["evidence"][0], "file_url": "file:///private.jpg"}],
+    })
+    assert invalid.status_code == 422
+    assert db.get(RentalBooking, 3).status == "confirmed"
+
     # Booking 3 is confirmed -> handover succeeds
+    monkeypatch.setattr(rental_providers, "utc_now", lambda: datetime(2090, 12, 5, 3, 30))
     resp = client1.post("/api/v1/provider/rentals/bookings/3/handover", json=payload)
     assert resp.status_code == 200
     data = resp.json()
     assert data["booking_id"] == 3
     assert data["status"] == "active"
+    assert data["handover_completed_at"] == "2090-12-05T03:30:00Z"
     insp = data["inspection"]
     assert insp["odometer_reading"] == 12500
     assert insp["fuel_level_percent"] == 100
     assert insp["customer_signature"] == "SIG-ALICE-HANDOVER-99238"
     assert len(insp["evidence"]) == 1
+    assert insp["evidence"][0]["created_at"]
 
     # Verify DB booking status
     booking3 = db.get(RentalBooking, 3)
@@ -630,7 +646,7 @@ def test_record_cash_payment_success_and_audit(isolated_db_session, seed_test_da
     tx = db.query(PaymentTransaction).filter(PaymentTransaction.gateway_name == "cash_on_pickup").first()
     assert tx is not None
     assert tx.amount == Decimal("5000.00")
-    assert tx.payment_status == "success"
+    assert tx.payment_status == "paid"
 
     # Attempting to record cash on already fully paid booking raises 409 Conflict
     resp_dup = client1.post("/api/v1/provider/rentals/bookings/3/record-cash", json=cash_payload)
@@ -648,6 +664,86 @@ def test_record_cash_overpayment_rejected(isolated_db_session, seed_test_data):
     resp = client1.post("/api/v1/provider/rentals/bookings/3/record-cash", json={"amount": "6000.00"})
     assert resp.status_code == 422
     assert "exceeds outstanding booking balance" in resp.json()["detail"]
+
+
+def test_partial_cash_receipts_replay_and_use_remaining_balance(isolated_db_session, seed_test_data):
+    db = isolated_db_session
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+    route = "/api/v1/provider/rentals/bookings/3/record-cash"
+    key = {"Idempotency-Key": "register-slip-1"}
+    first = client.post(route, headers=key, json={"amount": "3000.00"})
+    assert first.status_code == 200, first.text
+    assert first.json()["payment_status"] == "partially_paid"
+    replay = client.post(route, headers=key, json={"amount": "3000.00"})
+    assert replay.status_code == 200, replay.text
+    receipt_id = first.json()["gateway_transaction_id"]
+    assert isinstance(receipt_id, str) and receipt_id
+    assert replay.json()["gateway_transaction_id"] == receipt_id
+    assert replay.json()["amount_received"] == first.json()["amount_received"]
+    assert client.post(route, headers=key, json={"amount": "2000.00"}).status_code == 409
+    assert client.post(route, json={"amount": "2000.01"}).status_code == 422
+    final = client.post(route, headers={"Idempotency-Key": "register-slip-2"}, json={"amount": "2000.00"})
+    assert final.status_code == 200
+    assert final.json()["payment_status"] == "paid"
+    final_receipt_id = final.json()["gateway_transaction_id"]
+    assert final_receipt_id != receipt_id
+
+    booking = db.get(RentalBooking, 3)
+    reference = db.query(BookingReference).filter_by(
+        module_type="rental_vehicle", target_booking_id=booking.id,
+    ).one()
+    receipts = db.query(PaymentTransaction).filter_by(
+        booking_reference_id=reference.id, gateway_name="cash_on_pickup",
+    )
+    audit = db.query(BookingStatusHistory).filter_by(booking_reference_id=reference.id)
+    notifications = db.query(Notification).filter_by(
+        user_id=booking.user_id, notification_type="rental_payment_received",
+        link_url=f"/traveler/rental-bookings/{booking.id}",
+    )
+    assert receipts.count() == audit.count() == notifications.count() == 2
+    assert booking.payment_status == reference.payment_status == "paid"
+    expected_receipts = {receipt_id: Decimal("3000.00"), final_receipt_id: Decimal("2000.00")}
+    assert {row.gateway_transaction_id: row.amount for row in receipts} == expected_receipts
+    assert booking.total_price == sum(expected_receipts.values()) == Decimal("5000.00")
+
+    replay_after_final = client.post(route, headers=key, json={"amount": "3000.00"})
+    assert replay_after_final.status_code == 200, replay_after_final.text
+    replayed_receipt = replay_after_final.json()
+    assert replayed_receipt["gateway_transaction_id"] == receipt_id
+    assert replayed_receipt["amount_received"] == first.json()["amount_received"]
+    assert replayed_receipt["payment_status"] == "paid"
+
+    conflict = client.post(route, headers=key, json={"amount": "2000.00"})
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "Idempotency key already used for a different amount"
+    assert receipts.count() == audit.count() == notifications.count() == 2
+    ledger_after = {row.gateway_transaction_id: row.amount for row in receipts}
+    assert ledger_after == expected_receipts
+    db.refresh(booking)
+    db.refresh(reference)
+    assert booking.payment_status == reference.payment_status == "paid"
+    assert booking.total_price == sum(ledger_after.values()) == Decimal("5000.00")
+
+
+def test_cash_collection_rejects_inconsistent_booking_reference(isolated_db_session, seed_test_data):
+    db = isolated_db_session
+    booking = db.get(RentalBooking, 3)
+    reference = db.query(BookingReference).filter_by(
+        module_type="rental_vehicle", target_booking_id=booking.id,
+    ).one()
+    reference.user_id = seed_test_data["prov_user1"].id
+    db.commit()
+    client = make_test_client(db, current_user=seed_test_data["prov_user1"])
+
+    response = client.post(
+        "/api/v1/provider/rentals/bookings/3/record-cash",
+        json={"amount": "1000.00"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "Rental booking reference requires reconciliation before cash collection"
+    assert db.get(RentalBooking, 3).payment_status == "unpaid"
+    assert db.query(PaymentTransaction).filter_by(gateway_name="cash_on_pickup").count() == 0
 
 
 def test_cross_provider_cash_recording_blocked(isolated_db_session, seed_test_data):

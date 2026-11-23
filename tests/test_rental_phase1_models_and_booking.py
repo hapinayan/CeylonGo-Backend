@@ -12,12 +12,15 @@ to ensure zero modifications to CeylonGoDB in compliance with fail-closed guards
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.schema import CreateTable
 
 import app.models as models
 from app.models.user import Base, User
@@ -25,6 +28,7 @@ from app.models.provider_profile import ProviderProfile
 from app.models.rental_vehicle import RentalVehicle
 from app.models.rental_booking import RentalBooking
 from app.models.rental import (
+    RentalAgeRule,
     RentalLocation,
     RentalRatePlan,
     RentalVehicleImage,
@@ -39,11 +43,40 @@ from app.models.rental import (
 from app.database.connection import get_db
 from app.routers.auth import get_current_user
 from app.routers.rental_bookings import router as rental_bookings_router
+from scripts.migrate import discover_migrations
 
 
 # ==============================================================================
 # SECTION 1: ORM Model Schema Alignment Tests (Master Database Doc V1.0)
 # ==============================================================================
+
+def test_new_rental_migrations_match_mssql_model_contracts():
+    inventory = discover_migrations(Path(__file__).resolve().parents[1] / "migrations")
+    migrations = {migration.version: migration for migration in inventory}
+    for version, model, expected in (
+        ("044", RentalBooking, {
+            "passenger_count INT": "passenger_count INTEGER",
+            "self_drive_agreement_accepted BIT": "self_drive_agreement_accepted BIT",
+            "CK_rental_bookings_passenger_count": "CK_rental_bookings_passenger_count",
+        }),
+        ("045", RentalVehicle, {"helmet_condition NVARCHAR(100)": "helmet_condition NVARCHAR(100)"}),
+        ("045", RentalVehicleDocument, {
+            "insurance_effective_date DATE": "insurance_effective_date DATE",
+            "insurance_exclusions NVARCHAR(1000)": "insurance_exclusions NVARCHAR(1000)",
+            "CK_rental_vehicle_docs_insurance_dates": "CK_rental_vehicle_docs_insurance_dates",
+        }),
+        ("046", RentalAgeRule, {
+            "CREATE TABLE dbo.rental_age_rules": "CREATE TABLE rental_age_rules",
+            "CK_rental_age_rules_minimum_age": "CK_rental_age_rules_minimum_age",
+            "CK_rental_age_rules_vehicle_type": "CK_rental_age_rules_vehicle_type",
+        }),
+    ):
+        sql_server_ddl = str(CreateTable(model.__table__).compile(dialect=mssql.dialect()))
+        migration = migrations[version]
+        for migration_clause, model_clause in expected.items():
+            assert any(migration_clause in batch for batch in migration.batches)
+            assert model_clause in sql_server_ddl
+
 
 def test_rental_booking_orm_columns():
     """Verify RentalBooking has all 21 columns and correct types matching Master Doc p. 60."""

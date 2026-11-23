@@ -839,7 +839,7 @@ def test_fail_closed_ar11_foreign_tuk_tuk_missing_idp_or_recognition(isolated_db
         },
     )
     assert resp.status_code == 403
-    assert "require an International Driving Permit (IDP) and Sri Lankan recognition permit endorsement" in resp.json()["detail"]
+    assert "require an approved International Driving Permit (IDP) or Sri Lankan recognition permit" in resp.json()["detail"]
 
 
 def test_ar11_domestic_sri_lanka_tuk_tuk_booking_permitted_with_valid_license(isolated_db_session, seed_phase6_data):

@@ -302,6 +302,7 @@ def test_ar03_structured_helmet_availability_provider_crud_and_public_details(is
             "helmet_count": 2,
             "helmets_included": True,
             "helmet_sizes": "M, L",
+            "helmet_condition": "Clean, light cosmetic wear",
             "security_deposit": "12000.00",
             "fuel_policy": "full_to_full",
         },
@@ -312,6 +313,7 @@ def test_ar03_structured_helmet_availability_provider_crud_and_public_details(is
     assert veh_data["helmet_count"] == 2
     assert veh_data["helmets_included"] is True
     assert veh_data["helmet_sizes"] == "M, L"
+    assert veh_data["helmet_condition"] == "Clean, light cosmetic wear"
     assert veh_data["security_deposit"] == "12000.00"
     assert veh_data["fuel_policy"] == "full_to_full"
 
@@ -323,6 +325,7 @@ def test_ar03_structured_helmet_availability_provider_crud_and_public_details(is
     assert found["helmet_count"] == 2
     assert found["helmets_included"] is True
     assert found["helmet_sizes"] == "M, L"
+    assert found["helmet_condition"] == veh_data["helmet_condition"]
     assert found["security_deposit"] == "12000.00"
     assert found["fuel_policy"] == "full_to_full"
 
@@ -339,6 +342,7 @@ def test_ar03_structured_helmet_availability_provider_crud_and_public_details(is
     assert h_info["helmet_provided"] is True
     assert h_info["helmet_count"] == 2
     assert set(h_info["helmet_sizes"]) == {"M", "L"}
+    assert h_info["helmet_condition"] == veh_data["helmet_condition"]
     assert h_info["requires_helmet"] is True
     assert "Provided with 2 helmet(s)" in h_info["notes"]
 
@@ -730,7 +734,7 @@ def test_ar11_foreign_tuk_tuk_blocked_when_recognition_permit_missing(isolated_d
         },
     )
     assert resp_book.status_code == 403
-    assert "require an International Driving Permit (IDP) and Sri Lankan recognition permit endorsement" in resp_book.json()["detail"]
+    assert "require an approved International Driving Permit (IDP) or Sri Lankan recognition permit" in resp_book.json()["detail"]
 
 
 # ==============================================================================

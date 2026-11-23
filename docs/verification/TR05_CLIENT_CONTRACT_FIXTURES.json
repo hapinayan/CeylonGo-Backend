@@ -1,0 +1,139 @@
+{
+  "scope": "Synthetic request examples and response projections for Angular and Flutter acceptance",
+  "cases": [
+    {
+      "id": "current-category-catalogue",
+      "requirements": ["T-03"],
+      "method": "get",
+      "route": "/api/v1/rental-vehicles/categories",
+      "status": 200,
+      "response": [{"category": "bike"}, {"category": "bicycle"}, {"category": "tuk_tuk"}],
+      "check": "Render server identifiers. Five-category coverage requires the approved catalogue."
+    },
+    {
+      "id": "daily-rate-search-and-sponsorship",
+      "requirements": ["T-02", "T-19"],
+      "method": "get",
+      "route": "/api/v1/rental-vehicles",
+      "status": 200,
+      "query": {"district": "Galle", "vehicle_type": "tuk_tuk", "min_price": "3000.00", "max_price": "5000.00", "pickup_at": "2090-12-05T09:00:00+05:30", "return_at": "2090-12-06T09:00:00+05:30"},
+      "response": {"total": 1, "items": [{"id": 42, "is_sponsored": true, "price_per_day": "4000.00", "seating_capacity": 3, "min_passengers": 1, "max_passengers": 2}]},
+      "check": "Preserve both timestamps and display the sponsored label only when is_sponsored is true."
+    },
+    {
+      "id": "pickup-map-point",
+      "requirements": ["T-06"],
+      "method": "get",
+      "route": "/api/v1/rental-vehicles/{vehicle_id}/locations",
+      "status": 200,
+      "response": [{"id": 14, "location_name": "Synthetic pickup point", "latitude": "6.053500", "longitude": "80.221000"}],
+      "check": "Render the returned pickup coordinates and label together."
+    },
+    {
+      "id": "quote-capacity",
+      "requirements": ["X-09", "X-10"],
+      "method": "post",
+      "route": "/api/v1/rental-vehicles/{vehicle_id}/calculate-quote",
+      "status": 200,
+      "body": {"pickup_at": "2090-12-05T09:00:00+05:30", "return_at": "2090-12-06T09:00:00+05:30"},
+      "response": {"vehicle_id": 42, "seating_capacity": 3, "min_passengers": 1, "max_passengers": 2},
+      "check": "Use server passenger bounds in the booking form and keep the displayed total seats distinct."
+    },
+    {
+      "id": "future-insurance",
+      "requirements": ["X-12"],
+      "method": "get",
+      "route": "/api/v1/rental-vehicles/{vehicle_id}",
+      "status": 200,
+      "response": {"insurance": {"insurance_status": "not_yet_effective", "is_insured": false, "evidence_verified": false, "effective_date": "2090-12-05", "expiry_date": "2091-12-05", "coverage_amount": null, "exclusions": null}},
+      "check": "Show the future policy state. Never render a private file reference or infer active cover."
+    },
+    {
+      "id": "age-rule-admin",
+      "requirements": ["X-02"],
+      "method": "put",
+      "route": "/api/v1/admin/rentals/policies/minimum-age/{vehicle_type}",
+      "status": 200,
+      "body": {"minimum_age": 20},
+      "response": {"vehicle_type": "bicycle", "minimum_age": 20, "requires_verified_dob": true},
+      "check": "Example override only. The UI must use the server result and handle a permission failure."
+    },
+    {
+      "id": "traveler-payment-alert",
+      "requirements": ["T-18"],
+      "method": "get",
+      "route": "/api/v1/notifications",
+      "status": 200,
+      "response": {"items": [{"id": 55, "notification_type": "payment_success", "link_url": "/traveler/rental-bookings/42", "is_read": false}]},
+      "check": "Navigate to the authenticated traveler's booking. Keep the other recipient's alerts separate."
+    },
+    {
+      "id": "return-acknowledgement",
+      "requirements": ["X-06", "P-14"],
+      "method": "post",
+      "route": "/api/v1/rental-bookings/{booking_id}/inspections/{inspection_id}/acknowledge-return",
+      "status": 200,
+      "body": {"agreed_to_condition": true, "signature_name": "Synthetic Traveler"},
+      "response": {"booking_id": 42, "inspection_id": 17, "inspection_type": "return", "is_acknowledged": true, "acknowledged_at": "2090-12-06T05:00:00Z"},
+      "check": "Show authenticated acknowledgement after success. A provider-recorded signature alone is not the same event."
+    },
+    {
+      "id": "rental-checkout",
+      "requirements": ["T-11"],
+      "method": "post",
+      "route": "/api/v1/payments/rental/bookings/{booking_id}/initiate",
+      "status": 200,
+      "response": {"booking_id": 42, "booking_reference": "RB-SYNTHETIC-42", "order_id": "RB-SYNTHETIC-42", "amount": "4000.00", "currency": "LKR"},
+      "check": "Use the server checkout order, amount, currency and hash. Use the authorized sandbox for live callback acceptance."
+    },
+    {
+      "id": "rental-cancellation-reservation",
+      "requirements": ["T-14"],
+      "method": "patch",
+      "route": "/api/v1/rental-bookings/{booking_id}/cancel",
+      "status": 200,
+      "response": {"id": 42, "status": "cancelled", "cancellation_fee": "0.00", "refund_amount": "4000.00", "refund_eligible": true, "refund_record_created": true, "currency": "LKR"},
+      "check": "Display a reservation for refund review. Do not display the funds as returned without separate execution evidence."
+    },
+    {
+      "id": "rental-promotion-checkout",
+      "requirements": ["P-17", "A-07"],
+      "method": "post",
+      "route": "/api/v1/provider/rentals/promotions/campaigns/{campaign_id}/payments/initiate",
+      "status": 200,
+      "response": {"booking_id": 19, "booking_reference": "AD-RENTAL-19-SYNTHETIC", "order_id": "AD-RENTAL-19-SYNTHETIC", "amount": "5000.00", "currency": "LKR"},
+      "check": "Here booking_id identifies the campaign. A browser return does not activate the campaign."
+    },
+    {
+      "id": "provider-handover",
+      "requirements": ["P-13", "X-03", "X-09"],
+      "method": "post",
+      "route": "/api/v1/provider/rentals/bookings/{booking_id}/handover",
+      "status": 200,
+      "body": {"odometer_reading": 23000, "fuel_level_percent": 65, "helmet_count": 1, "helmet_sizes": ["M"]},
+      "response": {"booking_id": 42, "status": "active", "handover_completed_at": "2090-12-05T03:30:00Z"},
+      "check": "Show the completed handover and keep the provider inspection separate from the traveller acknowledgement."
+    },
+    {
+      "id": "provider-settlement-summary",
+      "requirements": ["P-16", "X-13"],
+      "method": "get",
+      "route": "/api/v1/provider/rentals/settlements",
+      "status": 200,
+      "response": {"provider_id": 12, "online_paid_amount": "4000.00", "cash_paid_amount": "1000.00", "online_refund_reserved_amount": "500.00", "security_deposits_held": "2000.00", "currency": "LKR"},
+      "check": "Display online receipts, cash receipts, reserved refunds and held deposits as separate amounts."
+    },
+    {
+      "id": "partial-cash-replay",
+      "requirements": ["T-12", "P-15", "X-13"],
+      "method": "post",
+      "route": "/api/v1/provider/rentals/bookings/{booking_id}/record-cash",
+      "status": 200,
+      "headers": {"Idempotency-Key": "synthetic-collection-17"},
+      "body": {"amount": "1000.00"},
+      "response": {"booking_id": 42, "amount_received": "1000.00", "payment_status": "partially_paid"},
+      "capture_response_fields": ["gateway_transaction_id"],
+      "check": "Capture the opaque server receipt ID and the amount. Use a new key for a distinct collection that completes the balance. Replaying the original key and amount returns the original receipt ID and amount with payment_status paid, reflecting the current booking state. A successful replay creates no additional collection."
+    }
+  ]
+}

@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 import math
 import mimetypes
 import os
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -263,37 +264,46 @@ def get_license_document_file(
         os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "rental_docs"),
     )
 
-    clean_filename = os.path.basename(filename)
-    target_path = os.path.join(storage_base, clean_filename)
-
-    real_base = os.path.realpath(storage_base)
-    real_target = os.path.realpath(target_path)
-
-    if not real_target.startswith(real_base):
+    if filename != filename.rstrip(" .") or any(char in filename for char in "/\\:") or any(ord(char) < 32 for char in filename):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid document path reference.",
         )
 
-    # Access control: file must belong to user or requester must be admin
-    eligibility = (
+    real_base = Path(storage_base).resolve()
+    real_target = (real_base / filename).resolve()
+    if not real_target.is_relative_to(real_base):
+        raise HTTPException(400, "Invalid document path reference.")
+
+    local_references = {
+        filename,
+        f"uploads/{filename}",
+        f"/uploads/{filename}",
+        f"/api/v1/rental-eligibility/document/{filename}",
+    }
+    matches = (
         db.query(RentalEligibilityCheck)
         .filter(
             or_(
-                RentalEligibilityCheck.license_front_image.like(f"%{clean_filename}%"),
-                RentalEligibilityCheck.license_back_image.like(f"%{clean_filename}%"),
+                RentalEligibilityCheck.license_front_image.in_(local_references),
+                RentalEligibilityCheck.license_back_image.in_(local_references),
+                RentalEligibilityCheck.recognition_permit_document_url.in_(local_references),
             )
         )
-        .first()
+        .all()
     )
-
-    if not eligibility:
+    owner_ids = {
+        match.user_id for match in matches
+        if local_references.intersection((match.license_front_image, match.license_back_image,
+                                          match.recognition_permit_document_url))
+    }
+    if len(owner_ids) != 1:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document record not found.",
         )
 
-    is_owner = eligibility.user_id == current_user.id
+    is_owner = current_user.id in owner_ids
     is_authorized_admin = (
         is_admin_role(current_user.role)
         and resolve_canonical_admin_role(current_user.role) in ("super_admin", "operations_admin")
@@ -304,24 +314,25 @@ def get_license_document_file(
             detail="You are not authorized to access this driving credential.",
         )
 
-    if not os.path.exists(real_target) or not os.path.isfile(real_target):
+    if not real_target.is_file():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Physical document file not found.",
         )
 
-    mime_type, _ = mimetypes.guess_type(real_target)
+    mime_type, _ = mimetypes.guess_type(str(real_target))
     headers = {
         "Cache-Control": "private, no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0",
-        "Content-Disposition": f'inline; filename="{clean_filename}"',
     }
 
     return FileResponse(
         real_target,
         media_type=mime_type or "application/octet-stream",
         headers=headers,
+        filename=filename,
+        content_disposition_type="inline",
     )
 
 

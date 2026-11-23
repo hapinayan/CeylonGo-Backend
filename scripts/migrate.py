@@ -39,6 +39,10 @@ ALLOWED_INTEGRATION_TARGET_VERSIONS: frozenset[str] = frozenset({
     "040",
     "041",
     "042",
+    "043",
+    "044",
+    "045",
+    "046",
 })
 
 
@@ -818,6 +822,39 @@ def cmd_status(config: DatabaseConfig, migrations_dir: Path) -> int:
         conn.close()
 
 
+def authorize_isolated_migration(config: DatabaseConfig) -> bool:
+    if config.integration_opt_in is None and config.database.strip().casefold() != "ceylongodb_integrationtest":
+        return False
+    from app.core.database_guard import (
+        ARTISAN_INTEGRATION_ALIAS,
+        DatabaseSafetyError,
+        normalize_server_name,
+        verify_safe_integration_target,
+    )
+
+    opt_in = config.integration_opt_in if config.integration_opt_in is not None else os.getenv("RUN_SQLSERVER_INTEGRATION_TESTS")
+    verify_safe_integration_target(config.server, config.database, opt_in)
+    if normalize_server_name(config.server) != ARTISAN_INTEGRATION_ALIAS.lower() or config.user or config.password:
+        raise DatabaseSafetyError("Integration rehearsal requires the approved Windows-authenticated target.")
+    return True
+
+
+def verify_migration_connection(conn, config: DatabaseConfig, isolated: bool) -> str:
+    database = verify_target_database(conn, config.database)
+    if isolated:
+        from app.core.database_guard import verify_connected_server_identity
+
+        verify_connected_server_identity(conn, server_alias=config.server)
+    return database
+
+
+def require_isolated_migration_ceiling(target_version: str | None) -> None:
+    if target_version not in ALLOWED_INTEGRATION_TARGET_VERSIONS:
+        from app.core.database_guard import DatabaseSafetyError
+
+        raise DatabaseSafetyError("Integration rehearsal requires an explicitly approved migration ceiling (037-046).")
+
+
 def cmd_validate(config: DatabaseConfig | None, migrations_dir: Path, check_db: bool = True) -> int:
     """
     Validates migration file integrity, batch parsing, sequential numbering,
@@ -834,10 +871,16 @@ def cmd_validate(config: DatabaseConfig | None, migrations_dir: Path, check_db: 
         print(f"  [OK] {m.filename} -> {len(m.batches)} batch(es) parsed successfully.")
 
     if check_db and config:
+        isolated = authorize_isolated_migration(config)
         conn = get_connection(config)
         try:
-            verify_target_database(conn, config.database)
+            verify_migration_connection(conn, config, isolated)
             applied = get_applied_migrations(conn)
+            if isolated:
+                available = {migration.version: migration.filename for migration in migrations}
+                for version, record in applied.items():
+                    if available.get(version) != record.filename:
+                        raise MigrationError(f"Migration {version} ledger filename is missing or does not match disk.")
             mismatches: list[str] = []
             for m in migrations:
                 if m.version in applied:
@@ -863,10 +906,15 @@ def cmd_validate(config: DatabaseConfig | None, migrations_dir: Path, check_db: 
 
 def cmd_plan(config: DatabaseConfig, migrations_dir: Path, target_version: str | None = None) -> int:
     """Performs a dry-run plan showing pending migrations and statements without modifying the database."""
+    isolated = authorize_isolated_migration(config)
+    if isolated:
+        require_isolated_migration_ceiling(target_version)
     migrations = discover_migrations(migrations_dir)
+    if isolated and not any(migration.version == target_version for migration in migrations):
+        raise MigrationError(f"Approved migration target {target_version} is missing from disk.")
     conn = get_connection(config)
     try:
-        current_db = verify_target_database(conn, config.database)
+        current_db = verify_migration_connection(conn, config, isolated)
         applied = get_applied_migrations(conn)
 
         pending = [m for m in migrations if m.version not in applied]
@@ -980,49 +1028,27 @@ def cmd_upgrade(
         print("Pass '--yes' to confirm applying pending migrations to the database.")
         return 1
 
-    isolated = config.integration_opt_in is not None or (
-        config.database.strip().casefold() == "ceylongodb_integrationtest"
-    )
+    isolated = authorize_isolated_migration(config)
     if isolated:
-        from app.core.database_guard import (
-            ARTISAN_INTEGRATION_ALIAS,
-            DatabaseSafetyError,
-            normalize_server_name,
-            verify_connected_server_identity,
-            verify_safe_integration_target,
-        )
-
-        effective_opt_in = (
-            config.integration_opt_in
-            if config.integration_opt_in is not None
-            else os.getenv("RUN_SQLSERVER_INTEGRATION_TESTS")
-        )
-        verify_safe_integration_target(
-            config.server, config.database, effective_opt_in
-        )
-        if (
-            normalize_server_name(config.server) != ARTISAN_INTEGRATION_ALIAS.lower()
-            or config.user
-            or config.password
-            or target_version not in ALLOWED_INTEGRATION_TARGET_VERSIONS
-        ):
-            raise DatabaseSafetyError(
-                "Integration rehearsal requires the approved Windows-authenticated target "
-                "and an explicitly approved migration ceiling (037-042)."
-            )
+        require_isolated_migration_ceiling(target_version)
 
     migrations = discover_migrations(migrations_dir)
+    if isolated and not any(migration.version == target_version for migration in migrations):
+        raise MigrationError(f"Approved migration target {target_version} is missing from disk.")
     conn = get_connection(config)
     try:
-        current_db = verify_target_database(conn, config.database)
-        if isolated:
-            verify_connected_server_identity(conn, server_alias=config.server)
+        current_db = verify_migration_connection(conn, config, isolated)
 
         with migration_lock(conn):
             if not isolated:
                 ensure_schema_migrations_table(conn)
             applied = get_applied_migrations(conn)
-            min_verified = 38 if target_version in {"039", "040", "041", "042"} else 36
+            min_verified = 36
+            if isolated:
+                if int(target_version) >= 43:
+                    min_verified = 42
+                elif int(target_version) >= 39:
+                    min_verified = 38
             expected_set = {f"{v:03d}" for v in range(1, min_verified + 1)}
             if isolated and not expected_set <= applied.keys():
                 raise MigrationError(
@@ -1079,6 +1105,15 @@ def cmd_upgrade(
                     "dbo.eco_promotion_event_receipts",
                     "dbo.eco_promotion_attributions",
                 ],
+                "046": ["dbo.rental_age_rules"],
+            }
+            pending_columns_map = {
+                "043": {"dbo.users": ("auth_version",)},
+                "044": {"dbo.rental_bookings": ("passenger_count", "self_drive_agreement_accepted")},
+                "045": {
+                    "dbo.rental_vehicles": ("helmet_condition",),
+                    "dbo.rental_vehicle_documents": ("insurance_effective_date", "insurance_exclusions"),
+                },
             }
             untracked_conflicts: list[str] = []
             for m in pending:
@@ -1086,10 +1121,19 @@ def cmd_upgrade(
                     for tbl in pending_tables_map[m.version]:
                         if _table_exists(cursor, tbl):
                             untracked_conflicts.append(f"Table '{tbl}' already exists in database, but migration {m.version} is pending.")
+                if isolated:
+                    for table_name, column_names in pending_columns_map.get(m.version, {}).items():
+                        for column_name in column_names:
+                            if _col_exists(cursor, table_name, column_name):
+                                untracked_conflicts.append(
+                                    f"Column '{table_name}.{column_name}' already exists in database, "
+                                    f"but migration {m.version} is pending."
+                                )
             if untracked_conflicts:
                 for conf in untracked_conflicts:
                     print(f"  [CONFLICT] {conf}")
-                raise MigrationError("Existing untracked tables detected. Explicit reconciliation required before upgrading.")
+                conflict_kind = "schema objects" if any(c.startswith("Column ") for c in untracked_conflicts) else "tables"
+                raise MigrationError(f"Existing untracked {conflict_kind} detected. Explicit reconciliation required before upgrading.")
 
             print(f"\nStarting upgrade of '{current_db}' ({len(pending)} pending migrations)...")
 

@@ -1,6 +1,6 @@
 """
 Targeted Live SQL Server Integration Tests for CeylonGo Rental Module 09.
-Executed against isolated staging database: CeylonGoDB_Staging on (localdb)\\CeylonGoStaging.
+Requires the explicitly opted-in, Windows-authenticated integration database.
 
 Verifies:
 1. ORM mapped query compilation on actual SQL Server (zero error 207).
@@ -19,13 +19,22 @@ Verifies:
 import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from uuid import uuid4
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database_guard import verify_safe_integration_database
+from app.core.database_guard import (
+    ARTISAN_INTEGRATION_ALIAS,
+    ARTISAN_INTEGRATION_DATABASE,
+    DatabaseSafetyError,
+    create_safe_sqlserver_test_engine,
+    normalize_server_name,
+)
 from app.models.rental import (
+    RentalAgeRule,
     RentalEligibilityCheck,
     RentalInspection,
     RentalVehicleDocument,
@@ -38,10 +47,15 @@ from app.models.user import User
 
 @pytest.fixture(scope="function")
 def staging_db_session():
-    """Provides a live database session connected to CeylonGoDB_Staging on (localdb)\\CeylonGoStaging."""
-    server = os.getenv("DB_SERVER", r"(localdb)\CeylonGoStaging")
-    db_name = os.getenv("CEYLONGO_RENTAL_TEST_DB", "CeylonGoDB_Staging")
-    verify_safe_integration_database(db_name, {"CeylonGoDB_Staging", "CeylonGoDB_MergeTest"})
+    """Connect only to the explicitly configured integration server/database pair."""
+    server = os.getenv("DB_SERVER")
+    db_name = os.getenv("CEYLONGO_RENTAL_TEST_DB")
+    if (
+        normalize_server_name(server) != ARTISAN_INTEGRATION_ALIAS.lower()
+        or db_name != ARTISAN_INTEGRATION_DATABASE
+        or os.getenv("RUN_SQLSERVER_INTEGRATION_TESTS") != "1"
+    ):
+        raise DatabaseSafetyError("Explicit approved SQL Server rental integration target and opt-in required.")
     driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
     trust_cert = os.getenv("DB_TRUST_CERTIFICATE", "yes")
 
@@ -56,11 +70,15 @@ def staging_db_session():
         },
     )
 
-    engine = create_engine(db_url, pool_pre_ping=True, connect_args={"timeout": 5})
+    engine = create_safe_sqlserver_test_engine(
+        db_url.render_as_string(), {ARTISAN_INTEGRATION_DATABASE},
+        pool_pre_ping=True, connect_args={"timeout": 5},
+    )
     try:
         with engine.connect() as connection:
             outer = connection.begin()
-            assert connection.scalar(text("SELECT DB_NAME()")) == db_name
+            if connection.scalar(text("SELECT DB_NAME()")) != db_name:
+                raise DatabaseSafetyError("Connected rental integration database does not match the approved target.")
             connection.exec_driver_sql("SET LOCK_TIMEOUT 8000")
             try:
                 with Session(
@@ -77,49 +95,21 @@ def staging_db_session():
 
 @pytest.fixture(scope="function")
 def setup_staging_seed_data(staging_db_session):
-    """Seeds baseline records (User, Provider) in CeylonGoDB_Staging for test isolation."""
+    """Seed unique synthetic actors in the guarded transaction."""
     db = staging_db_session
-
-    # 1. Seed or retrieve test user
-    user = db.query(User).filter(User.email == "staging_traveler@ceylongo.test").first()
-    if not user:
-        user = User(
-            full_name="Staging Traveler",
-            email="staging_traveler@ceylongo.test",
-            role="traveler",
-            is_active=True,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    # 2. Seed or retrieve provider user & profile
-    prov_user = db.query(User).filter(User.email == "staging_provider@ceylongo.test").first()
-    if not prov_user:
-        prov_user = User(
-            full_name="Staging Provider",
-            email="staging_provider@ceylongo.test",
-            role="provider",
-            is_active=True,
-        )
-        db.add(prov_user)
-        db.commit()
-        db.refresh(prov_user)
-
-    provider = db.query(ProviderProfile).filter(ProviderProfile.user_id == prov_user.id).first()
-    if not provider:
-        provider = ProviderProfile(
-            user_id=prov_user.id,
-            business_name="Staging Rentals Ltd",
-            provider_type="rental",
-            approval_status="approved",
-            phone="0771234567",
-            district="Colombo",
-        )
-        db.add(provider)
-        db.commit()
-        db.refresh(provider)
-
+    fixture_id = uuid4().hex
+    user = User(full_name="Staging Traveler", email=f"tr05-traveler-{fixture_id}@example.test",
+                role="traveler", is_active=True)
+    prov_user = User(full_name="Staging Provider", email=f"tr05-provider-{fixture_id}@example.test",
+                     role="provider", is_active=True)
+    db.add_all([user, prov_user])
+    db.flush()
+    provider = ProviderProfile(
+        user_id=prov_user.id, business_name="Staging Rentals Ltd", provider_type="rental",
+        approval_status="approved", phone="0771234567", district="Colombo",
+    )
+    db.add(provider)
+    db.commit()
     return {"user": user, "provider": provider}
 
 
@@ -143,6 +133,8 @@ def test_sqlserver_orm_compilation_all_models(staging_db_session):
 
     documents = db.query(RentalVehicleDocument).limit(5).all()
     assert isinstance(documents, list)
+    assert isinstance(db.query(RentalBooking).limit(5).all(), list)
+    assert isinstance(db.query(RentalAgeRule).limit(5).all(), list)
 
 
 # =============================================================================
@@ -332,21 +324,28 @@ def test_sqlserver_ar06_inspection_acknowledgement(staging_db_session, setup_sta
 # 7. AR-07: Late Return Lateness & Grace Period Calculation
 # =============================================================================
 
-def test_sqlserver_ar07_late_return_logic():
-    """Verifies late return billable hour formula with 60-minute deducted grace period."""
-    import math
-
-    def calculate_billable_late_hours(lateness_minutes: int) -> int:
-        lateness_seconds = lateness_minutes * 60
-        deducted_seconds = max(0, lateness_seconds - 3600)
-        return math.ceil(deducted_seconds / 3600)
-
-    # Test cases matching approved policy
-    assert calculate_billable_late_hours(45) == 0   # Within 60m grace
-    assert calculate_billable_late_hours(60) == 0   # Exactly at 60m grace
-    assert calculate_billable_late_hours(90) == 1   # 30m past grace -> 1 hour
-    assert calculate_billable_late_hours(120) == 1  # 60m past grace -> 1 hour
-    assert calculate_billable_late_hours(121) == 2  # 61m past grace -> 2 hours
+def test_sqlserver_ar07_return_timestamps_round_trip(staging_db_session, setup_staging_seed_data):
+    db = staging_db_session
+    vehicle = RentalVehicle(provider_id=setup_staging_seed_data["provider"].id,
+                            vehicle_type="bike", vehicle_name="Late return fixture", price_per_day=1000)
+    db.add(vehicle)
+    db.flush()
+    scheduled = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    delay = timedelta(minutes=60, seconds=1)
+    user_id = setup_staging_seed_data["user"].id
+    booking = RentalBooking(vehicle_id=vehicle.id, user_id=user_id,
+                            pickup_at=scheduled - timedelta(days=1), return_at=scheduled,
+                            total_price=1000, status="completed")
+    db.add(booking)
+    db.flush()
+    inspection = RentalInspection(booking_id=booking.id, inspection_type="return", inspected_by=user_id,
+                                  odometer_reading=100, fuel_level_percent=50, cleanliness_status="clean",
+                                  created_at=scheduled + delay)
+    db.add(inspection)
+    db.commit()
+    db.refresh(booking)
+    db.refresh(inspection)
+    assert inspection.created_at - booking.return_at == delay
 
 
 # =============================================================================
@@ -421,30 +420,38 @@ def test_sqlserver_ar12_structured_insurance_storage(staging_db_session, setup_s
 # 10. Live SQL Server CHECK Constraints & Data Integrity
 # =============================================================================
 
-def test_sqlserver_check_constraints_enforcement(staging_db_session):
+def test_sqlserver_check_constraints_enforcement(staging_db_session, setup_staging_seed_data):
     """Verifies that live SQL Server active check constraints reject invalid values."""
     db = staging_db_session
 
-    # 1. Invalid fuel policy
-    with pytest.raises(Exception) as exc_info:
-        db.execute(text("INSERT INTO dbo.rental_vehicles (provider_id, vehicle_type, vehicle_name, price_per_day, fuel_policy) VALUES (1, 'bike', 'Invalid Fuel', 1000, 'unlimited_fuel');"))
-        db.commit()
-    db.rollback()
-    assert "CK_rental_vehicles_fuel_policy" in str(exc_info.value) or "CHECK constraint" in str(exc_info.value)
+    provider_id = setup_staging_seed_data["provider"].id
+    for field, invalid in (("fuel_policy", "unlimited_fuel"),
+                           ("helmet_count", -5), ("security_deposit", Decimal("-100.00"))):
+        with pytest.raises(IntegrityError, match=f"CK_rental_vehicles_{field}"):
+            with db.begin_nested():
+                db.add(RentalVehicle(provider_id=provider_id, vehicle_type="bike",
+                                     vehicle_name="Constraint fixture", price_per_day=1000, **{field: invalid}))
+                db.flush()
 
-    # 2. Negative helmet count
-    with pytest.raises(Exception) as exc_info:
-        db.execute(text("INSERT INTO dbo.rental_vehicles (provider_id, vehicle_type, vehicle_name, price_per_day, helmet_count) VALUES (1, 'bike', 'Negative Helmets', 1000, -5);"))
-        db.commit()
-    db.rollback()
-    assert "CK_rental_vehicles_helmet_count" in str(exc_info.value) or "CHECK constraint" in str(exc_info.value)
-
-    # 3. Negative security deposit
-    with pytest.raises(Exception) as exc_info:
-        db.execute(text("INSERT INTO dbo.rental_vehicles (provider_id, vehicle_type, vehicle_name, price_per_day, security_deposit) VALUES (1, 'bike', 'Negative Deposit', 1000, -100.00);"))
-        db.commit()
-    db.rollback()
-    assert "CK_rental_vehicles_security_deposit" in str(exc_info.value) or "CHECK constraint" in str(exc_info.value)
+    vehicle = RentalVehicle(provider_id=provider_id, vehicle_type="bike",
+                            vehicle_name="Valid constraint fixture", price_per_day=1000)
+    db.add(vehicle)
+    db.flush()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with pytest.raises(IntegrityError, match="CK_rental_bookings_passenger_count"):
+        with db.begin_nested():
+            db.add(RentalBooking(vehicle_id=vehicle.id, user_id=setup_staging_seed_data["user"].id,
+                                 pickup_at=now, return_at=now + timedelta(days=1),
+                                 total_price=1000, passenger_count=0))
+            db.flush()
+    with pytest.raises(IntegrityError, match="CK_rental_vehicle_docs_insurance_dates"):
+        with db.begin_nested():
+            db.add(RentalVehicleDocument(
+                vehicle_id=vehicle.id, document_type="insurance_certificate",
+                file_reference="synthetic-insurance.pdf", expiry_date=now.date(),
+                insurance_effective_date=now.date() + timedelta(days=1),
+            ))
+            db.flush()
 
 
 # =============================================================================

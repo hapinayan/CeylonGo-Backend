@@ -1,0 +1,140 @@
+TR05 local verification evidence
+
+Full local regression
+
+Latest user-supplied regression result | 2,429 passed, 52 skipped,
+77 warnings, 0 failed, 331.12 seconds, successful exit. The rental SQL
+Server staging module was excluded. Batch 10 records the supplied result
+and did not rerun pytest or produce a JUnit report. Skipped cases remain
+unverified by this run. The warning count is retained as reported.
+
+Historical full local regression
+
+Both console observations report 2,420 passed, 52 skipped and 77 warnings.
+The user-supplied console observation reports 449.26 seconds. The separately
+captured pytest output reports 447.43 seconds and exit code 0. The elapsed
+times differ by 1.83 seconds. The available evidence does not establish the
+reason. No matching JUnit artifact was identified during the evidence audit.
+The captured run used the existing offline wrapper and excluded
+tests/test_rental_sqlserver_staging.py. Batch 5 did not rerun pytest.
+
+Local automated verification
+
+The counts below come from the recorded targeted batch outputs. They are
+suite totals, and test selections can overlap. The acceptance CSV retains
+the earlier JUnit references as historical evidence.
+
+Batch 1, T-06 / P-09 | 120 passed
+Supplied booking hubs must be active and provider-owned. Invalid selections
+produce no booking, reference or notification. Omitted selections retain the
+vehicle default. Public hub lists exclude inactive hubs and vehicle-specific
+results exclude a foreign hub even if it was historically set as primary.
+Source: app/routers/rental_bookings.py:836; app/routers/rental_locations.py:27;
+app/routers/rental_vehicles.py:798.
+Tests: tests/test_rental_phase2_batch2.py::test_booking_accepts_owned_hubs_and_defaults;
+tests/test_rental_phase2_batch2.py::test_booking_rejects_invalid_hubs_without_writes;
+tests/test_rental_phase2_batch1.py::test_get_rental_locations_public_and_district_filter;
+tests/test_rental_phase2_batch1.py::test_get_vehicle_locations;
+tests/test_rental_phase2_batch1.py::test_vehicle_locations_exclude_foreign_historical_primary.
+
+Batch 2, A-03 | 29 passed, 1 skipped
+The admin file reader rejects resolved escapes and preserves authorized
+legacy basename access and response security headers. The deterministic
+resolved-target case and real Windows junction case passed. The real file
+symlink case was skipped because the local filesystem could not create the
+link. The skip remains an evidence limitation for real file symlinks.
+Source: app/routers/admin_rentals.py:827.
+Tests: tests/test_rental_phase4_batch1.py::test_document_file_streams_valid_legacy_references;
+tests/test_rental_phase4_batch1.py::test_document_file_rejects_finance_admin;
+tests/test_rental_phase4_batch1.py::test_document_file_rejects_missing_record;
+tests/test_rental_phase4_batch1.py::test_document_file_access_security_and_path_traversal;
+tests/test_rental_phase4_batch1.py::test_document_file_rejects_resolved_target_outside_root;
+tests/test_rental_phase4_batch1.py::test_document_file_rejects_filesystem_link_escape[junction];
+tests/test_rental_phase4_batch1.py::test_document_file_rejects_filesystem_link_escape[symlink].
+
+Batch 3, P-14 / X-06 | 18 passed
+Return acknowledgement POST, list GET and detail GET emit the same explicit
+UTC value. Naive UTC storage, null values, access checks and duplicate
+rejection are covered.
+Source: app/routers/rental_bookings.py:1497.
+Tests: tests/test_rental_phase5_batch3.py::test_return_inspection_cannot_be_acknowledged_via_handover_endpoint;
+tests/test_rental_phase5_batch3.py::test_return_acknowledgement_timestamp_normalizes_equivalent_values.
+
+Batch 4, P-15 / X-13 | 19 passed
+With the booking fully paid by a later collection, replay returns the
+original opaque receipt ID and collected amount with the current paid
+status. The replay adds no receipt, audit or notification and leaves the
+ledger and balance intact. A different amount with the same key returns 409.
+Source: app/routers/rental_providers.py:2075 and :2171.
+Test: tests/test_rental_phase3_batch3.py::test_partial_cash_receipts_replay_and_use_remaining_balance.
+Client expectations: TR05_CLIENT_CONTRACT_FIXTURES.json:127 and
+TR05_STAGING_RUNBOOK.txt:158.
+
+Batch 9, P-09 | 101 passed, 0 failed, 0 skipped
+Provider DELETE deactivates a hub referenced by either booking location
+field or by a vehicle. Unreferenced hubs still hard-delete. Historical
+references remain readable. Provider PATCH rejects explicit null values for
+location_name, district, city and is_active with 422 before mutation.
+Omitted fields and nullable address and coordinate fields retain their
+existing behavior. SQLite foreign keys were enabled for the hub integrity
+cases. The affected suite reported one Starlette deprecation warning.
+Source: app/routers/rental_providers.py:1274 and :1322;
+app/schemas/rental_provider.py:347; migrations/026_extend_rental_module.sql:463.
+Tests in tests/test_rental_phase3_batch2.py
+  test_update_and_safe_delete_location
+  test_delete_booking_referenced_hub_preserves_history[pickup-only]
+  test_delete_booking_referenced_hub_preserves_history[return-only]
+  test_delete_booking_referenced_hub_preserves_history[both]
+  test_patch_location_rejects_explicit_null_without_mutation
+  test_patch_location_preserves_omitted_fields_and_clears_nullable_fields
+  test_provider_cannot_update_or_delete_foreign_hub
+
+The reference check and hard delete are separate operations. A reference
+added concurrently can cause persistence failure. Enforced foreign keys
+protect the existing reference. Independent-connection SQL Server
+verification of the delete-versus-booking race remains pending.
+
+Visibility contract decision, T-06 / P-09
+
+The public vehicle-specific hub route requires an approved vehicle and
+returns active hubs owned by its provider. Discovery and booking apply the
+broader public_rental predicate, which also checks vehicle availability,
+provider eligibility and the active owned default hub when one is assigned.
+Product and the API owner need to decide whether direct hub lookup is an
+approval-only informational endpoint or must follow the full publication
+predicate. They should specify the expected response for an approved
+vehicle that fails publication, including HTTP status and whether any hubs
+are returned. No shared-hub exception was found in the documented contract.
+References: app/routers/rental_vehicles.py:798; app/core/publication.py:103.
+The separate legacy provider hub write path accepts active-state changes,
+while the map-oriented path uses inactive review. Product and the API
+owner still need to decide whether to align those workflows.
+References: app/routers/rental_providers.py:1242 and :1274;
+app/routers/rental_vehicles.py:100 and :109.
+
+Integration acceptance and policy approval
+
+Local test evidence covers application behaviors and mounted API projections.
+Integration acceptance remains pending for DBA-authorized isolated SQL Server
+preflight and migration approval through 046, persistence and concurrent
+writers, and authorized PayHere checkout, signed callbacks, reconciliation
+and refund execution evidence. Angular and Flutter builds and test accounts
+are needed for maps, UTC parsing and cash retries. Document acceptance needs
+the approved storage topology and deployed access checks.
+
+Policy approvals remain open for catalogue and mappings, cancellation fees,
+provider evidence, licence classes and permits, seating and solo use,
+inspection evidence ownership and retention, scheduled reminders, and
+late-return rate snapshots. See TR05_FINAL_BLOCKERS.txt,
+TR05_POLICY_DECISIONS.txt, TR05_STAGING_RUNBOOK.txt and
+TR05_PAYHERE_SANDBOX_CHECKLIST.txt. The local evidence establishes no
+production readiness or production sign-off.
+
+Git verification and artifact inventory
+
+Batch 9 recorded git diff --check passing. Batch 10 checks whitespace, CSV
+structure, requirement IDs, existing status classifications and updated
+test references. See TR05_BACKEND_LOCAL_FREEZE_REPORT.txt for the conditional
+freeze scope. The root-level verificationTR05_FINAL_BLOCKERS.txt
+contains diff-stat output. The separate docs/verification/TR05_FINAL_BLOCKERS.txt
+contains the external release gates. Both artifacts were preserved.

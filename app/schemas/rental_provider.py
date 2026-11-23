@@ -19,7 +19,10 @@ Covers:
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from urllib.parse import unquote, urlsplit
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.rental_capacity import valid_tuk_tuk_seating_capacity
 
 VehicleType = Literal["bike", "bicycle", "tuk_tuk"]
 VehicleStatus = Literal["available", "unavailable", "retired"]
@@ -76,6 +79,7 @@ class ProviderVehicleCreate(BaseModel):
     helmet_count: int | None = Field(default=0, ge=0)
     helmets_included: bool | None = Field(default=False)
     helmet_sizes: str | None = Field(default=None, max_length=100)
+    helmet_condition: str | None = Field(default=None, max_length=100)
     security_deposit: Decimal | None = Field(default=None, ge=Decimal("0.00"))
     fuel_policy: str | None = Field(default="same_to_same", max_length=30)
 
@@ -91,7 +95,7 @@ class ProviderVehicleCreate(BaseModel):
             if fuel not in ("none", "electric", "pedal", "n/a"):
                 raise ValueError("Bicycles must have fuel_type as 'none', 'pedal', or 'electric'")
         elif vtype == "tuk_tuk":
-            if seats < 3 or seats > 4:
+            if not valid_tuk_tuk_seating_capacity(seats):
                 raise ValueError("Tuk-tuks must have a legal passenger seating capacity between 3 and 4")
         elif vtype == "bike":
             if seats > 2:
@@ -119,6 +123,7 @@ class ProviderVehicleUpdate(BaseModel):
     helmet_count: int | None = Field(default=None, ge=0)
     helmets_included: bool | None = None
     helmet_sizes: str | None = Field(default=None, max_length=100)
+    helmet_condition: str | None = Field(default=None, max_length=100)
     security_deposit: Decimal | None = Field(default=None, ge=Decimal("0.00"))
     fuel_policy: str | None = Field(default=None, max_length=30)
 
@@ -134,7 +139,7 @@ class ProviderVehicleUpdate(BaseModel):
             if fuel is not None and fuel not in ("none", "electric", "pedal", "n/a"):
                 raise ValueError("Bicycles must have fuel_type as 'none', 'pedal', or 'electric'")
         elif vtype == "tuk_tuk":
-            if seats is not None and (seats < 3 or seats > 4):
+            if seats is not None and not valid_tuk_tuk_seating_capacity(seats):
                 raise ValueError("Tuk-tuks must have a legal passenger seating capacity between 3 and 4")
         elif vtype == "bike":
             if seats is not None and seats > 2:
@@ -176,6 +181,7 @@ class ProviderVehicleListItem(BaseModel):
     helmet_count: int | None = None
     helmets_included: bool | None = None
     helmet_sizes: str | None = None
+    helmet_condition: str | None = None
     security_deposit: Decimal | None = None
     fuel_policy: str | None = None
     created_at: datetime
@@ -208,6 +214,7 @@ class ProviderVehicleDetailResponse(BaseModel):
     helmet_count: int | None = None
     helmets_included: bool | None = None
     helmet_sizes: str | None = None
+    helmet_condition: str | None = None
     security_deposit: Decimal | None = None
     fuel_policy: str | None = None
     primary_image_url: str | None = None
@@ -346,6 +353,13 @@ class ProviderLocationUpdate(BaseModel):
     longitude: Decimal | None = Field(default=None, ge=Decimal("-180.0"), le=Decimal("180.0"))
     is_active: bool | None = None
 
+    @field_validator("location_name", "district", "city", "is_active")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("Field cannot be null")
+        return value
+
 
 class ProviderLocationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -458,6 +472,20 @@ class ProviderEvidenceItem(BaseModel):
     file_url: str = Field(..., min_length=5, max_length=1000, description="Photo or video URL of vehicle condition")
     area_of_vehicle: str = Field(..., min_length=2, max_length=50, description="Area inspected (e.g. front_bumper, odometer, fuel_gauge)")
     description: str | None = Field(default=None, max_length=500)
+
+    @field_validator("file_url")
+    @classmethod
+    def validate_evidence_reference(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("Evidence reference must be a relative path or HTTPS URL")
+        parsed = urlsplit(value)
+        path = unquote(parsed.path)
+        if not path or "\\" in path or path.startswith("//") or ".." in path.split("/"):
+            raise ValueError("Invalid evidence path")
+        if parsed.scheme or parsed.netloc:
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None:
+                raise ValueError("Evidence reference must be a relative path or HTTPS URL")
+        return value
 
 
 class ProviderEvidenceResponse(BaseModel):
@@ -632,6 +660,8 @@ class ProviderSettlementsSummaryResponse(BaseModel):
     confirmed_payments: Decimal = Decimal("0.00")
     online_paid_amount: Decimal = Decimal("0.00")
     cash_paid_amount: Decimal = Decimal("0.00")
+    online_refund_reserved_amount: Decimal = Decimal("0.00")
+    security_deposits_held: Decimal = Decimal("0.00")
     platform_commission: Decimal = Decimal("0.00")
     commission_policy_note: str = Field(
         default="Platform commission is computed strictly from verified settlement records in accordance with platform policy. No unverified commission rates are applied."

@@ -305,7 +305,7 @@ def test_get_provider_application_details(client: TestClient, db_session: Sessio
     assert "C:\\" not in res.text
 
 
-@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism", "rental"])
 def test_secure_identity_document_viewing(client: TestClient, db_session: Session, provider_type):
     admin = create_user(db_session, "admin_doc@ceylongo.com", role="admin")
     user = create_user(db_session, "prov_doc@ceylongo.com", role="provider")
@@ -358,7 +358,7 @@ def test_secure_identity_document_viewing(client: TestClient, db_session: Sessio
 # ==============================================================================
 
 
-@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism", "rental"])
 def test_approve_provider_success(client: TestClient, db_session: Session, mock_smtp, provider_type):
     admin = create_user(db_session, "admin_app@ceylongo.com", role="admin", full_name="Super Admin")
     user = create_user(db_session, "prov_app@ceylongo.com", role="provider", full_name="Kamal Silva")
@@ -433,7 +433,7 @@ def test_approve_provider_missing_documents_blocked(client: TestClient, db_sessi
 # ==============================================================================
 
 
-@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism"])
+@pytest.mark.parametrize("provider_type", ["homestay", "eco_tourism", "rental"])
 def test_reject_provider_success(client: TestClient, db_session: Session, mock_smtp, provider_type):
     admin = create_user(db_session, "admin_rej@ceylongo.com", role="admin")
     user = create_user(db_session, "prov_rej@ceylongo.com", role="provider", full_name="Saman Perera")

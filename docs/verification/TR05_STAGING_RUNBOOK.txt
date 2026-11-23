@@ -1,0 +1,173 @@
+TR-05 Vehicle Rental acceptance runbook
+
+Scope and authorization
+
+This runbook describes a future, separately authorized rehearsal. The offline
+audit did not connect to SQL Server, apply migrations, use PayHere sandbox, or
+run Angular or Flutter. Use synthetic data only. Record the commit and local
+diff, approved server/database identity, reviewer, date, and exact results.
+
+The guarded runner and rental staging fixture both require Windows
+authentication, the allowlisted localhost\SQLEXPRESS alias and verified
+server identity, and CeylonGoDB_IntegrationTest. Obtain explicit authorization
+for that isolated database and the migration write operation. Do not point
+this rehearsal at a different database, alternate server, or production.
+Use a fresh PowerShell session without DB_USER or DB_PASSWORD configured.
+
+Migration and schema preflight
+
+1. Confirm Python 3.12.10, pinned dependencies, and offline evidence. Inspect
+   the isolated database identity and complete recorded ledger through 042
+   with the DBA. Compare applied filenames and checksums to the local inventory.
+   Confirm no untracked destination columns or tables. Stop on any mismatch.
+2. Obtain a verified backup or disposable database checkpoint before the first
+   write. Migration 043 adds users.auth_version with default zero. It is a
+   predecessor for the rental upgrade, not an alternative to 044. Migrations
+   044 and 045 add nullable metadata and checks without rewriting history.
+   Migration 046 creates a new table with a unique category key. The runner
+   commits each migration separately and rolls back a failed migration and its
+   ledger entry. If a later migration fails, inspect the ledger for earlier
+   successful versions. Reconcile or restore only under separate DBA approval.
+3. Only on the approved target, configure the following from the repo root.
+   Neither setup nor commands belong in an offline pytest run.
+
+   $env:DB_SERVER = 'localhost\SQLEXPRESS'
+   $env:DB_NAME = 'CeylonGoDB_IntegrationTest'
+   $env:CEYLONGO_RENTAL_TEST_DB = $env:DB_NAME
+   $env:DB_DRIVER = 'ODBC Driver 18 for SQL Server'
+   $env:RUN_SQLSERVER_INTEGRATION_TESTS = '1'
+   & .\.venv\Scripts\python.exe scripts/migrate.py plan --target 046
+
+4. Check that the pending plan is precisely the suffix through 046. A verified
+   043 ledger entry is retained and does not cause that migration to run twice.
+   After the checkpoint and explicit write approval, execute the bounded
+   upgrade and validate the resulting ledger.
+
+   & .\.venv\Scripts\python.exe scripts/migrate.py upgrade --target 046 --yes
+   & .\.venv\Scripts\python.exe scripts/migrate.py validate
+
+5. Using read-only catalog inspection on the already verified target, check
+   sys.columns/sys.types/sys.default_constraints for users.auth_version
+   BIGINT NOT NULL DEFAULT 0, rental_bookings.passenger_count INT NULL and
+   self_drive_agreement_accepted BIT NULL, rental_vehicles.helmet_condition
+   NVARCHAR(100) NULL, and rental_vehicle_documents.insurance_effective_date
+   DATE NULL and insurance_exclusions NVARCHAR(1000) NULL. Check
+   sys.check_constraints for trusted, enabled passenger-count, policy-date,
+   age-range and category constraints, and sys.indexes for the unique
+   rental_age_rules.vehicle_type key. Verify 043–046 ledger checksums, unchanged
+   historical party/insurance records, and retained existing constraints.
+6. Run the 11 staging cases with a fresh temp directory. This is the guarded
+   staging module, separate from the offline ODBC-blocking runner.
+
+   & .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q -ra --basetemp=.venv/tr05-sql-approved-run1 --junitxml=.venv/tr05-sql-approved-run1.xml tests/test_rental_sqlserver_staging.py
+
+   Before authorization, use the offline runner with --collect-only on this
+   module. Collection verifies discovery only. Staging cases use unique
+   synthetic actors, check explicitly named constraints, and verify return
+   timestamp precision from persisted rows. The late-fee formula itself is
+   covered by the offline mounted return tests.
+
+Independent-connection acceptance
+
+The existing staging fixture uses an enclosing transaction and savepoints.
+For concurrency use two independent verified connections and synthetic,
+committed setup visible to both, with bounded waits and a barrier. Capture
+each response, both connection identities and the final ledger rows:
+
+* Competing requests for one vehicle and overlapping times yield one booking
+  and one conflict. Adjacent windows both succeed. Repeat booking versus a
+  maintenance block and with an elapsed pending hold.
+* Exercise capture before cancellation and cancellation before capture. Both
+  leave the booking cancelled and reserve a single appropriate refund. A
+  replay adds no capture or refund. A late capture leaves inventory closed to
+  that booking. Verify booking/reference status, transaction, refund and audit
+  rows using a third verified connection.
+* Retry identical cash collection simultaneously with the same Idempotency-Key.
+  Both responses refer to one receipt. Reusing the key with a different amount
+  conflicts. A separate collection cannot exceed the remainder. Cash receipts,
+  online receipts and held deposits reconcile independently.
+* Submit competing approve and reject decisions for the same pending rental
+  refund. Expect one 200 and one 400, one persisted decision, one audit entry
+  and one alert linked to the traveller's rental booking. Verify that an
+  inconsistent synthetic refund linkage returns 409 without an audit entry or
+  alert. Review changes the administrative decision only. Record payment
+  execution evidence separately.
+* Inject a failure before commit in checkout, capture or cancellation and
+  re-read from a new connection. The associated state, ledger and notifications
+  stay atomic. Repeat with a controlled failed migration batch only in a
+  dedicated authorized rehearsal fixture. Compare its ledger and schema against
+  the preceding checkpoint. Archive logs and do not issue cleanup or restore
+  commands without separate authorization.
+
+PayHere sandbox acceptance
+
+Use only an approved sandbox merchant and disposable accounts. Supply
+credentials through the authorized secret channel and keep them out of logs.
+
+PH-01 Checkout. The owning traveler calls POST
+/api/v1/payments/rental/bookings/{booking_id}/initiate. Expect 200 and the same
+server merchant, order, exact amount/currency and notify URL on retry. A second
+traveler receives 403; cash, zero-total, expired and terminal bookings receive
+400. Verify each rejection leaves no new checkout transaction.
+
+PH-02 Capture and replay. Complete the authorized sandbox checkout. The
+merchant callback to POST /api/v1/payments/payhere/notify applies one
+successful capture. Replay yields already_processed, with one captured
+transaction and one booking-specific alert per recipient. Verify a distinct
+booking still produces both alerts. Confirm mismatch rejection for merchant,
+signature, amount and currency, and reject a conflicting recorded identity,
+with no extra ledger rows. Use the approved sandbox tooling for negative cases.
+
+PH-03 Late capture. Initiate an eligible checkout, then cancel or let its
+hold expire before the callback is delivered. Expect requires_reconciliation,
+refund_pending, a single pending refund and no reopened booking. Repeat
+delivery and verify already_processed and no duplicate refund reservation.
+
+PH-04 Campaign. An approved owner calls POST
+/api/v1/provider/rentals/promotions/campaigns/{campaign_id}/payments/initiate
+after editorial approval. Before recorded payment, finance activation through
+POST /api/v1/admin/rentals/promotions/{campaign_id}/review fails and discovery
+never shows a sponsored flag. A verified callback persists one payment.
+Verify authorized activation, half-open campaign windows and the exact
+provider/listing scope. An unrelated or unpublished vehicle remains unlabelled.
+
+PH-05 Refund and reconciliation. Trace the verified capture, cancellation,
+pending refund and settlement view using /api/v1/admin/rentals/payments,
+/api/v1/admin/rentals/refunds and /api/v1/admin/rentals/settlements. Sum the
+held refund reservations against the captured amount, and reconcile provider
+online receipts, cash and deposits independently. Confirm execution only with
+verified sandbox or separately authorized manual settlement evidence.
+Audit-only approval is not a payout. Record unavailable sandbox functions as
+unexecuted rather than substituting offline mocks.
+
+Angular and Flutter acceptance
+
+TR05_CLIENT_CONTRACT_FIXTURES.json supplies synthetic request examples and
+response projections checked against the mounted OpenAPI schema. They are
+fixtures for each client to replay, rather than a client execution result.
+
+* Check discovery, base daily-price filters, date validation, availability,
+  and five-category selection once T-03 product decisions are available.
+* Verify sponsored labels, provider badge, pricing and cancellation disclosure,
+  map/pickup display, and quote/list/detail capacity parity. Exercise a
+  historical booking, minimum-age guidance, and accepted/rejected party sizes.
+* Display current/future/expired insurance, exclusions, dates and coverage,
+  while keeping private evidence and full policy identifiers out of public UI.
+* Navigate booking, payment, pickup and return alerts on each role and client.
+  Verify signed inspection state separately from provider-recorded evidence.
+* Keep the same Idempotency-Key across retries of one cash collection. Use a
+  new key for a distinct collection. Treat the receipt ID as opaque. A replay
+  returns the original receipt ID and collected amount, with payment_status
+  reflecting the booking's current state. After a later collection completes
+  the balance, expect paid when replaying the earlier partial receipt. Verify
+  the replay creates no additional receipt, audit entry or notification and
+  leaves the ledger total and outstanding balance unchanged.
+
+Matrix interpretation
+
+TR05_ACCEPTANCE_MATRIX.csv has one row per source requirement. Its counts are
+matched to explicit testcase names from the final regression JUnit report.
+Offline verified is limited to the listed backend assertions. Integration
+pending identifies a required environment or client check. Policy blocked
+identifies a source decision that prevents full acceptance despite partial
+offline evidence. There is no production sign-off in this runbook.

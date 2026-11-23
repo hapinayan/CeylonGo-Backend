@@ -31,6 +31,7 @@ from app.models.rental_vehicle import RentalVehicle
 from app.models.shared import BookingReference, BookingStatusHistory
 from app.models.user import Base, User
 from app.routers.auth import get_current_user
+from app.routers import rental_bookings
 from app.routers.rental_bookings import router as rental_bookings_router
 from app.routers.rental_providers import router as rental_providers_router
 from app.routers.rental_vehicles import router as rental_vehicles_router
@@ -740,6 +741,7 @@ def test_duplicate_acknowledgement_prevented_with_409(isolated_db_session, seed_
         fuel_level_percent=90,
         cleanliness_status="clean",
         customer_signature="SIG:SHA256:11223344|BY:Kasun Silva|AT:2026-11-19T10:00:00",
+        acknowledged_at=now,
     )
     db.add(inspection)
     db.commit()
@@ -842,8 +844,10 @@ def test_acknowledgement_fails_when_traveler_does_not_agree(isolated_db_session,
     assert "must agree to the inspected vehicle condition" in resp.json()["detail"].lower()
 
 
-def test_return_inspection_cannot_be_acknowledged_via_handover_endpoint(isolated_db_session, seed_batch3_data):
-    """AR-06: Handover acknowledgement endpoint only accepts pickup inspections."""
+def test_return_inspection_cannot_be_acknowledged_via_handover_endpoint(
+    isolated_db_session, seed_batch3_data, monkeypatch,
+):
+    """AR-06: Return acknowledgement preserves ownership and UTC across reads."""
     db = isolated_db_session
     traveler = seed_batch3_data["traveler"]
     bike = seed_batch3_data["bike_with_helmets"]
@@ -867,6 +871,7 @@ def test_return_inspection_cannot_be_acknowledged_via_handover_endpoint(isolated
         odometer_reading=8600,
         fuel_level_percent=90,
         cleanliness_status="clean",
+        customer_signature="PROVIDER-RECORDED-PAPER-RECEIPT",
     )
     db.add(inspection)
     db.commit()
@@ -882,3 +887,47 @@ def test_return_inspection_cannot_be_acknowledged_via_handover_endpoint(isolated
     )
     assert resp.status_code == 400
     assert "only pickup handover inspection checklists can be acknowledged" in resp.json()["detail"].lower()
+    return_path = f"/api/v1/rental-bookings/{booking.id}/inspections/{inspection.id}/acknowledge-return"
+    inspection_path = return_path.removesuffix("/acknowledge-return")
+    list_path = f"/api/v1/rental-bookings/{booking.id}/inspections"
+    other_client = make_test_client(db, current_user=seed_batch3_data["traveler_other"])
+    assert other_client.get(list_path).status_code == 403
+    assert other_client.get(inspection_path).status_code == 403
+    assert other_client.post(return_path, json=ack_payload).status_code == 403
+    detail_before = client.get(inspection_path)
+    list_before = client.get(list_path)
+    assert detail_before.status_code == list_before.status_code == 200
+    for result in (detail_before.json(), list_before.json()[0]):
+        assert result["is_acknowledged"] is False
+        assert result["acknowledged_at"] is None
+    acknowledgement_time = datetime(2090, 12, 6, 5)
+    monkeypatch.setattr(rental_bookings, "utc_now", lambda: acknowledgement_time)
+    returned = client.post(return_path, json=ack_payload)
+    assert returned.status_code == 200, returned.text
+    assert returned.json()["inspection_type"] == "return"
+    assert returned.json()["acknowledged_at"] == "2090-12-06T05:00:00Z"
+    db.refresh(inspection)
+    assert inspection.acknowledged_at == acknowledgement_time
+    assert returned.json()["customer_signature"].startswith("SIG:SHA256:")
+    detail_after = client.get(inspection_path)
+    list_after = client.get(list_path)
+    assert detail_after.status_code == list_after.status_code == 200
+    for result in (detail_after.json(), list_after.json()[0]):
+        assert result["is_acknowledged"] is True
+        assert result["acknowledged_at"] == returned.json()["acknowledged_at"]
+        assert result["customer_signature"] == "PROVIDER-RECORDED-PAPER-RECEIPT"
+    assert db.query(BookingStatusHistory).filter(
+        BookingStatusHistory.notes.contains(returned.json()["customer_signature"]),
+    ).count() == 1
+    assert client.post(return_path, json=ack_payload).status_code == 409
+
+
+def test_return_acknowledgement_timestamp_normalizes_equivalent_values():
+    naive_utc = datetime(2090, 12, 6, 5)
+    offset_time = datetime(2090, 12, 6, 10, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    expected = naive_utc.replace(tzinfo=timezone.utc)
+
+    for timestamp in (naive_utc, expected, offset_time):
+        result = rental_bookings.return_acknowledgement_timestamp("return", timestamp)
+        assert result.isoformat() == expected.isoformat()
+    assert rental_bookings.return_acknowledgement_timestamp("pickup", naive_utc) is naive_utc

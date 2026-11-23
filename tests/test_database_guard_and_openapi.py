@@ -5,7 +5,10 @@ Verifies fail-closed database safety enforcement and API route/operation uniquen
 """
 
 from decimal import Decimal
+import json
+from pathlib import Path
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.core.database_guard import (
@@ -228,8 +231,9 @@ def test_guard_authorizes_only_the_correct_artisan_alias_and_database():
     ],
 )
 def test_failed_artisan_identity_prevents_migration_mutation(
-    monkeypatch, tmp_path, database, server, machine, instance,
+    monkeypatch, database, server, machine, instance,
 ):
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     from scripts import migrate
@@ -249,7 +253,8 @@ def test_failed_artisan_identity_prevents_migration_mutation(
         integration_opt_in="1",
     )
     with pytest.raises((DatabaseSafetyError, migrate.TargetDatabaseMismatchError)):
-        migrate.cmd_upgrade(cfg, tmp_path, target_version="038", confirmed=True)
+        inventory = Path(__file__).resolve().parents[1] / "migrations"
+        migrate.cmd_upgrade(cfg, inventory, target_version="038", confirmed=True)
     lock.assert_not_called()
     connection.commit.assert_not_called()
     connection.close.assert_called_once()
@@ -321,6 +326,84 @@ def test_openapi_operation_ids_are_strictly_unique():
         assert required_path in paths, f"Missing required API endpoint: {required_path}"
 
     assert len(paths) >= 48, f"Expected at least 48 production API paths, found {len(paths)}"
+
+
+def test_cash_collection_preflight_allows_idempotency_key():
+    origin = "http://localhost:4200"
+    response = TestClient(app).options(
+        "/api/v1/provider/rentals/bookings/42/record-cash",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,idempotency-key",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["Access-Control-Allow-Origin"] == origin
+    allowed_headers = response.headers["Access-Control-Allow-Headers"].lower().split(",")
+    assert "idempotency-key" in {header.strip() for header in allowed_headers}
+
+
+def test_tr05_client_fixture_projections_match_mounted_openapi():
+    fixture = Path(__file__).resolve().parents[1] / "docs/verification/TR05_CLIENT_CONTRACT_FIXTURES.json"
+    cases = json.loads(fixture.read_text(encoding="utf-8"))["cases"]
+    schema = app.openapi()
+
+    json_types = {
+        "object": (dict,),
+        "array": (list,),
+        "string": (str,),
+        "integer": (int,),
+        "number": (int, float),
+        "boolean": (bool,),
+        "null": (type(None),),
+    }
+
+    def assert_projection(value, contract, *, require_fields=False):
+        if "$ref" in contract:
+            contract = schema["components"]["schemas"][contract["$ref"].rsplit("/", 1)[-1]]
+        if "anyOf" in contract:
+            for candidate in contract["anyOf"]:
+                try:
+                    assert_projection(value, candidate, require_fields=require_fields)
+                except AssertionError:
+                    continue
+                return
+            raise AssertionError(f"{value!r} does not match any schema in {contract['anyOf']}")
+        kind = contract.get("type")
+        if kind in json_types:
+            assert type(value) in json_types[kind], f"Expected {kind}, got {value!r}"
+        if "enum" in contract:
+            assert value in contract["enum"]
+        if "const" in contract:
+            assert value == contract["const"]
+        if isinstance(value, list):
+            for item in value:
+                assert_projection(item, contract["items"], require_fields=require_fields)
+        elif isinstance(value, dict):
+            if require_fields:
+                assert set(contract.get("required", ())) <= value.keys()
+            for key, item in value.items():
+                assert key in contract["properties"], f"Unexpected fixture field {key!r}"
+                assert_projection(item, contract["properties"][key], require_fields=require_fields)
+
+    assert len({case["id"] for case in cases}) == len(cases)
+    for case in cases:
+        operation = schema["paths"][case["route"]][case["method"]]
+        parameters = {(item["in"], item["name"].lower()) for item in operation.get("parameters", [])}
+        for location, field in (("query", "query"), ("header", "headers")):
+            assert all((location, key.lower()) in parameters for key in case.get(field, {}))
+        if "body" in case:
+            assert_projection(
+                case["body"], operation["requestBody"]["content"]["application/json"]["schema"],
+                require_fields=True,
+            )
+        response = operation["responses"][str(case["status"])]
+        response_schema = response["content"]["application/json"]["schema"]
+        assert_projection(case["response"], response_schema)
+        for field in case.get("capture_response_fields", []):
+            assert field not in case["response"]
+            assert_projection({field: "opaque-example"}, response_schema)
 
 
 def extract_all_route_endpoints(app_instance):

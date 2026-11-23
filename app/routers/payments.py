@@ -63,6 +63,7 @@ from app.schemas.tour_guide import TourGuidePaymentPrepareResponse
 from app.services.booking_expiration import expire_single_booking
 from app.services.guide_payments import handle_guide_callback
 from app.services.payhere_bookings import capture_amount, checkout_response, lock_capture
+from app.services.rental_promotions import RENTAL_CAMPAIGN_MODULES, capture_rental_promotion
 from app.services.tour_guide_phase5 import (
     handle_tour_guide_advertising_payment_callback,
 )
@@ -338,6 +339,10 @@ def handle_advertising_payment_callback(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Advertising payment order reference '{order_id}' not found",
         )
+    if ad_payment.campaign and ad_payment.campaign.target_module in RENTAL_CAMPAIGN_MODULES:
+        return capture_rental_promotion(
+            db, ad_payment, ad_payment.campaign, payment_id, payhere_amount, payhere_currency, status_code,
+        )
 
     # 1. Verify amount & currency
     received_amt = Decimal(payhere_amount).quantize(Decimal("0.01"))
@@ -453,17 +458,21 @@ def initiate_rental_booking_payment(
     lock_booking_resource(db, f"rental_vehicle_booking_{rental_booking.vehicle_id}")
     db.refresh(rental_booking)
 
-    if rental_booking.status in ("cancelled", "rejected", "expired", "completed"):
+    if rental_booking.payment_method != "online":
+        raise HTTPException(400, "Rental booking must use online payment")
+    if not rental_checkout_open(rental_booking, datetime.now(timezone.utc).replace(tzinfo=None)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot initiate payment for rental booking with status '{rental_booking.status}'",
         )
 
-    if rental_booking.payment_status == "paid":
+    if rental_booking.payment_status not in ("unpaid", "pending", "failed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This rental booking has already been paid",
         )
+    if rental_booking.total_price <= 0:
+        raise HTTPException(400, "Rental checkout requires a positive payment amount")
 
     vehicle = rental_booking.vehicle or db.get(RentalVehicle, rental_booking.vehicle_id)
     if not vehicle:
@@ -497,14 +506,17 @@ def initiate_rental_booking_payment(
         )
         db.add(booking_ref)
         db.flush()
-
-    rental_booking.payment_method = "online"
+    elif not matches_rental_payment_reference(booking_ref, rental_booking, vehicle):
+        raise HTTPException(409, "Rental checkout reference does not match the booking")
 
     # Upsert pending PaymentTransaction
     tx = (
         db.query(PaymentTransaction)
         .filter(
             PaymentTransaction.booking_reference_id == booking_ref.id,
+            PaymentTransaction.user_id == rental_booking.user_id,
+            PaymentTransaction.gateway_name == "payhere",
+            PaymentTransaction.payment_method == "online",
             PaymentTransaction.payment_status == "pending",
         )
         .first()
@@ -524,20 +536,22 @@ def initiate_rental_booking_payment(
         tx.amount = rental_booking.total_price
         tx.currency = rental_booking.currency or "LKR"
 
-    db.commit()
-
     order_id = booking_ref.booking_reference
-    checkout_hash = payhere_service.generate_checkout_hash(
-        order_id=order_id,
-        amount=rental_booking.total_price,
-        currency=rental_booking.currency or "LKR",
-    )
+    try:
+        checkout_hash = payhere_service.generate_checkout_hash(
+            order_id=order_id,
+            amount=rental_booking.total_price,
+            currency=rental_booking.currency or "LKR",
+        )
+    except Exception:
+        db.rollback()
+        raise
 
     name_parts = (current_user.full_name or "Traveler").split(" ", 1)
     first_name = name_parts[0]
     last_name = name_parts[1] if len(name_parts) > 1 else "Traveler"
 
-    return PaymentInitiateResponse(
+    response = PaymentInitiateResponse(
         booking_id=rental_booking.id,
         booking_reference=order_id,
         merchant_id=payhere_service.merchant_id,
@@ -555,6 +569,8 @@ def initiate_rental_booking_payment(
         cancel_url=payhere_service.cancel_url,
         notify_url=payhere_service.notify_url,
     )
+    db.commit()
+    return response
 
 
 # ==========================================
@@ -582,6 +598,26 @@ def initiate_tour_guide_booking_payment(
 # 2. PAYHERE WEBHOOK / NOTIFICATION LISTENER
 # ==========================================
 
+def rental_checkout_open(booking, now):
+    if booking.status not in ("pending", "confirmed") or booking.pickup_at <= now:
+        return False
+    return (
+        booking.status == "confirmed"
+        or booking.expires_at is None
+        or booking.expires_at > now
+    )
+
+
+def matches_rental_payment_reference(reference, booking, vehicle):
+    return (
+        vehicle is not None
+        and reference.user_id == booking.user_id
+        and reference.provider_profile_id == vehicle.provider_id
+        and reference.total_price == booking.total_price
+        and reference.currency == (booking.currency or "LKR")
+    )
+
+
 def _handle_rental_capture(db, ref, payment_id, raw_amount, currency, status_code):
     booking = db.get(RentalBooking, ref.target_booking_id)
     if booking is None:
@@ -592,21 +628,39 @@ def _handle_rental_capture(db, ref, payment_id, raw_amount, currency, status_cod
     lock_booking_resource(db, f"rental_vehicle_booking_{booking.vehicle_id}")
     db.refresh(booking)
     db.refresh(ref)
-    if ref.user_id != booking.user_id or amount != booking.total_price or currency != (booking.currency or "LKR"):
+    if (
+        not matches_rental_payment_reference(ref, booking, booking.vehicle)
+        or amount != booking.total_price
+        or currency != (booking.currency or "LKR")
+    ):
         raise HTTPException(400, "Payment does not match rental booking")
-    if booking.payment_status in ("paid", "refund_pending", "refunded"):
-        return {"status": "already_processed"}
-    tx = db.scalar(select(PaymentTransaction).where(
+    attempts = select(PaymentTransaction).where(
         PaymentTransaction.booking_reference_id == ref.id,
         PaymentTransaction.user_id == booking.user_id,
         PaymentTransaction.gateway_name == "payhere",
+        PaymentTransaction.payment_method == "online",
+    )
+    captured = db.scalar(attempts.where(
+        PaymentTransaction.payment_status.in_(CAPTURED),
+    ).order_by(PaymentTransaction.id).limit(1))
+    if captured is not None:
+        if status_code == "2" and payment_id.casefold() != (captured.gateway_transaction_id or "").casefold():
+            raise HTTPException(409, "Rental checkout already has a verified transaction")
+        return {"status": "already_processed"}
+    tx = db.scalar(attempts.where(
+        PaymentTransaction.payment_status.in_(("pending", "failed")),
+        PaymentTransaction.amount == amount,
+        PaymentTransaction.currency == currency,
     ).order_by(PaymentTransaction.id.desc()).limit(1))
+    already_paid = booking.payment_status not in ("unpaid", "pending", "failed")
+    if status_code != "2":
+        if tx is None or already_paid or status_code not in ("-1", "-2"):
+            return {"status": "ignored"}
+        tx.payment_status = "failed"
+        db.commit()
+        return {"status": "ok", "payment_status": "failed"}
     if tx is None:
-        tx = PaymentTransaction(
-            booking_reference_id=ref.id, user_id=booking.user_id,
-            gateway_name="payhere", payment_method="online", amount=amount, currency=currency,
-        )
-        db.add(tx)
+        raise HTTPException(409, "No matching rental checkout attempt")
     tx.gateway_transaction_id = payment_id
     if status_code == "2":
         tx.payment_status = capture_status(db)
@@ -615,15 +669,22 @@ def _handle_rental_capture(db, ref, payment_id, raw_amount, currency, status_cod
         tx.commission_rate = Decimal("10.00")
         tx.commission_amount = (amount * Decimal("0.10")).quantize(Decimal("0.01"))
         tx.provider_payable_amount = amount - tx.commission_amount
-        if booking.status in ("cancelled", "rejected", "expired"):
+        if already_paid or booking.payment_method != "online" or not rental_checkout_open(booking, tx.paid_at):
+            previous_status = booking.status
+            tx.commission_amount = Decimal("0.00")
+            tx.commission_rate = Decimal("0.00")
+            tx.provider_payable_amount = Decimal("0.00")
             db.flush()
             db.add(PaymentRefund(
                 payment_transaction_id=tx.id, amount=amount, currency=currency,
                 refund_status="pending", refund_reason="Verified late rental capture requires reconciliation.",
             ))
-            booking.payment_status = ref.payment_status = "refund_pending"
+            if not already_paid:
+                booking.payment_status = ref.payment_status = "refund_pending"
+            if booking.status == "pending" and not rental_checkout_open(booking, tx.paid_at):
+                booking.status = ref.booking_status = "expired"
             record_booking_status_change(
-                db, ref.id, booking.status, booking.status, None,
+                db, ref.id, previous_status, booking.status, None,
                 notes="Late PayHere rental capture queued for reconciliation",
             )
             db.commit()
@@ -634,15 +695,13 @@ def _handle_rental_capture(db, ref, payment_id, raw_amount, currency, status_cod
             db, ref.id, booking.status, booking.status, None,
             notes="PayHere rental payment confirmed",
         )
-        create_notification(db, booking.user_id, "Rental Payment Successful!",
+        create_notification(db, booking.user_id, f"Rental #{booking.id} Payment Successful",
                             "Your online rental payment was received.", "payment_success",
-                            f"/rentals/bookings/{booking.id}")
+                            f"/traveler/rental-bookings/{booking.id}")
         if booking.vehicle and booking.vehicle.provider:
-            create_notification(db, booking.vehicle.provider.user_id, "Rental Payment Received",
+            create_notification(db, booking.vehicle.provider.user_id, f"Rental #{booking.id} Payment Received",
                                 "An online rental payment was received.", "payment_received",
                                 f"/provider/rentals/bookings/{booking.id}")
-    elif status_code in ("-1", "-2"):
-        tx.payment_status = "failed"
     db.commit()
     return {"status": "ok", "payment_status": "paid" if tx.payment_status in CAPTURED else tx.payment_status}
 
@@ -1004,8 +1063,20 @@ async def payhere_webhook_listener(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ):
-    form_data = await request.form()
-    return handle_payhere_callback(form_data=dict(form_data), db=db)
+    try:
+        async with request.form() as form_data:
+            fields = (
+                "merchant_id", "order_id", "payment_id", "payhere_amount",
+                "payhere_currency", "status_code", "md5sig",
+            )
+            for field in fields:
+                values = form_data.getlist(field)
+                if len(values) > 1 or any(not isinstance(value, str) for value in values):
+                    raise HTTPException(400, "Invalid PayHere notification field")
+            return handle_payhere_callback(form_data=dict(form_data), db=db)
+    except Exception:
+        db.rollback()
+        raise
 
 
 # ==========================================

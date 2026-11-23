@@ -93,7 +93,7 @@ def create_reference(db, native, module, provider_id, buyer_id, amount):
     return reference
 
 
-def record_native_event(db, row, module, provider_id, old, new, actor, recipient):
+def record_native_event(db, row, module, provider_id, old, new, actor, recipient, *, notify=True):
     ref = db.scalar(
         select(BookingReference)
         .where(
@@ -122,7 +122,10 @@ def record_native_event(db, row, module, provider_id, old, new, actor, recipient
     else:
         ref.booking_status = new
         ref.payment_status = row.payment_status
-    save_event(db, ref, old, new, actor, recipient, new)
+    if notify:
+        save_event(db, ref, old, new, actor, recipient, new)
+    else:
+        record_booking_status_change(db, ref.id, old, new, actor, notes=new)
 
 
 def change_activity_booking(db, provider, booking_id, action, reason):

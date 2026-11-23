@@ -1,0 +1,17 @@
+# Fresh DB 05 ? Cutover and rollback
+
+## Recommended cutover proposal
+
+Rehearse first with a named isolated staging candidate and a different restore target. Use temporary names such as CeylonGoDB_Academic_MVP_Stage and CeylonGoDB_PreMVP_<UTC>. Check that proposed names are vacant. Neither name nor any existing test database is preapproved. Keep the original catalog intact under an archive name during an authorized swap. The final application catalog name is CeylonGoDB.
+
+1. Pin legacy and fresh app builds, exact DB identities, deploy settings, backup verification evidence, retention policy, operational owners, window, RTO and RPO. Confirm dependencies including SQL Agent, jobs, workers, leases, open connections, legacy financial callbacks, logins/users, rights, synonyms and reports. Rehearse both swap and recovery. SQL Server name changes and deployment steps are separate operations and require an explicit freeze.
+2. With distinct maintenance approval, stop or quiesce writers, workers, and client entry points. Verify no writer/session will resume. Record end-state manifests and verify the final recovery point. Capture legacy name, database ID/GUID and candidate name, ID/GUID. Only after separate authorization, handle any blocking sessions under a verified operator plan.
+3. With explicit cutover approval, rename the legacy database to the reserved archive name, verify source identity and recovery evidence, then rename the candidate to CeylonGoDB and validate identity, permissions, catalog and bootstrap ledger from the approved principal. The namespace swap is not assumed atomic. Stop at any failed step and restore namespace consistency according to the approved rollback path. Do not restore over either database.
+4. Deploy the fresh app profile while general writes remain gated. Run authorized read-only smoke tests for authentication/profile reads, discovery and Admin queues; use write verification only if separately authorized against the named candidate and isolated scope. Check exact target and deployment configuration. After explicit go-live decision, enable writers and monitor booking/capacity, payment mode, errors and workers. Prevent legacy writers from using the fresh catalog.
+5. Retain the prior catalog, backups and screenshots/manifests for the agreed protection window. Cleanup is optional, reviewed individually and separately approved.
+
+## Rollback decision
+
+Before live writes, quiesce fresh services, verify both database IDs, preserve the candidate under a distinct approved name, reverse the original namespace and restore the pinned legacy app/configuration only after rollback authorization. Validate original identities and smoke tests before lifting the freeze. If either rename failed halfway, use actual observed names and IDs and stop until the recovery operator approves the next move. If the original catalog is unavailable, restore verified media to a new isolated target and validate it before requesting any production-name operation.
+
+After live writes, freeze again and preserve a separately approved recovery point for the candidate. Reconcile new users, bookings, demo records and state changes before switching back. Accept either explicitly approved loss within RPO or a reviewed transfer and reconciliation. Replay is not presumed safe or automatic. Fail closed on unresolved financial callbacks, incompatible state, permissions, backup failure, or missing data. No automatic reset or deletion.

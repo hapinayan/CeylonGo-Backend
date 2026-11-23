@@ -1,0 +1,21 @@
+# DB-02 Stage 01 revised MVP schema
+
+**59 mapped tables** is the recommended reuse-first planning floor for native Activity Adventure and a single Admin role. It includes the 49 from DB-01, eight additional tables observed outside the legacy Eco and finance-admin cases, and their FK closure. **72** is the broader observed compatibility floor when those legacy cases are included. Neither count is a proven deployable minimum. Keep the full schema for unchanged routes until further evidence is available. Counts exclude the migration ledger and physical objects outside the mapper inventory.
+
+## Exact table sets
+
+- DB-01 retained: activities, activity_booking_participants, activity_bookings, activity_images, activity_slots, admin_audit_logs, booking_references, booking_status_history, community_comments, community_hashtags, community_post_hashtags, community_post_likes, community_post_media, community_posts, community_reports, community_saved_posts, community_user_profiles, eco_experiences, homestay_amenities, homestay_availability_blocks, homestay_bookings, homestay_images, homestays, listing_references, notifications, password_resets, payment_transactions, provider_email_otps, provider_profiles, provider_registration_authorizations, provider_registration_drafts, rental_availability_blocks, rental_bookings, rental_eligibility_checks, rental_locations, rental_rate_plans, rental_vehicle_images, rental_vehicles, reviews, tour_guide_availability, tour_guide_bookings, tour_guide_credentials, tour_guide_images, tour_guide_languages, tour_guide_packages, tour_guide_service_areas, tour_guide_verifications, tour_guides, users
+- Observed native-profile additions: advertising_payments, artisan_listings, eco_experience_images, eco_promotion_attributions, homestay_promotions, promotion_campaigns, promotion_events, rental_vehicle_documents
+- Additional FK anchors: eco_promotion_packages, eco_sponsored_promotions
+- Further tables from legacy Eco and finance Admin and their FK closure: eco_age_limits, eco_availability_slots, eco_cancellation_policies, eco_evidences, eco_practices, eco_promotion_analytics, eco_reservations, eco_safety_rules, eco_season_restrictions, eco_verifications, eco_wishlists, payment_refunds, provider_settlements
+
+Homestay reads promotions and advertising. Rental and Guide catalogs read campaigns. Guide booking and cash handling reach promotions and attribution. Map traverses Artisan and Eco images. Rental discovery reads documents and motorized vehicle approval requires verified license and insurance evidence. Map, payment and booking dependencies must be isolated and tested before reducing the set. The shared demo payment contract and transient AI planner still require implementation evidence.
+
+## Candidate and unresolved disposition
+
+- 12 of 37 candidates blocked by observed SQL or FK closure. Directly observed: advertising_payments, artisan_listings, eco_promotion_analytics, eco_promotion_attributions, eco_sponsored_promotions, eco_wishlists, homestay_promotions, payment_refunds, promotion_campaigns, promotion_events, provider_settlements. FK closure only: eco_promotion_packages.
+- 25 remaining candidates lack sufficient retirement evidence: ai_action_audit, ai_chat_messages, ai_chat_sessions, ai_pending_actions, artisan_business_hours, artisan_business_images, artisan_product_favorites, artisan_product_images, artisan_reservations, community_follows, eco_promotion_event_receipts, eco_refund_reconciliations, eco_sponsorship_captures, promotion_packages, promotions, rental_condition_evidence, rental_deposits, rental_incidents, rental_inspections, showcase_items, travel_plan_days, travel_plan_items, travel_plans, travel_preferences, wishlists.
+- 11 of 13 originally unresolved tables were observed: eco_age_limits, eco_availability_slots, eco_cancellation_policies, eco_evidences, eco_experience_images, eco_practices, eco_reservations, eco_safety_rules, eco_season_restrictions, eco_verifications, rental_vehicle_documents.
+- Unresolved without observed SQL: eco_cancellation_snapshots, eco_slot_clearances. Preserve policy snapshots, clearance and other verification records pending evidence. Confirm native Eco cancellation, availability, approval and safety obligations before narrowing Adventure.
+
+No deletion or exclusion from live schema is approved.

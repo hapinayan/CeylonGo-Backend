@@ -117,7 +117,15 @@ def test_03_password_reset_flow():
     # Request reset
     r_req = client.post("/api/auth/password-reset/request", json={"email": "reset.user@ceylongo.lk"})
     assert r_req.status_code == 200
-    raw_token = r_req.json()["reset_token_demo"]
+    assert "If an account exists" in r_req.json()["message"]
+    assert "reset_token_demo" not in r_req.json()
+
+    # For testing confirm workflow, generate token via service directly
+    db = TestingSessionLocal()
+    from app.services.mvp_services import MVPAuthService
+    from app.schemas.mvp import PasswordResetRequest
+    raw_token = MVPAuthService.request_password_reset(db, PasswordResetRequest(email="reset.user@ceylongo.lk"), send_email=False)
+    db.close()
 
     # Confirm reset
     r_conf = client.post(

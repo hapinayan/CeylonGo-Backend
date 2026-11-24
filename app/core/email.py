@@ -130,8 +130,9 @@ def build_password_reset_email_message(
 
 def send_password_reset_email(
     to_email: str,
-    token: str,
+    token: str | None = None,
     user_name: str | None = None,
+    reset_url: str | None = None,
 ) -> bool:
     """
     Send a password reset email via configured SMTP.
@@ -148,8 +149,10 @@ def send_password_reset_email(
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
     timeout = get_smtp_timeout()
-    reset_url = build_password_reset_url(token)
-    msg = build_password_reset_email_message(to_email, reset_url, user_name)
+    final_reset_url = reset_url or (build_password_reset_url(token) if token else None)
+    if not final_reset_url:
+        return False
+    msg = build_password_reset_email_message(to_email, final_reset_url, user_name)
 
     try:
         server_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP

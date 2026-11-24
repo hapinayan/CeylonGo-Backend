@@ -12,6 +12,29 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 # ============================================================================
 # 1. Authentication & Users
 # ============================================================================
+class CheckEmailRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+
+
+class CheckEmailResponse(BaseModel):
+    email: str
+    is_registered: bool
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str = Field(..., min_length=10)
+
+
+class GenericMessageResponse(BaseModel):
+    message: str
+
+
+class VerifyResetTokenResponse(BaseModel):
+    valid: bool
+    email: str
+    message: str
+
+
 class UserRegisterRequest(BaseModel):
     email: str = Field(..., max_length=254)
     full_name: str = Field(..., min_length=2, max_length=120)

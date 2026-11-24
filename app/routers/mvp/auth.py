@@ -1,34 +1,103 @@
 """
 CeylonGo Academic MVP — Authentication Router
-Endpoints for Traveler, Provider, and Admin Registration, Login, Session Invalidation, and Password Reset.
+Endpoints for Traveler, Provider, and Admin Registration, Login, Session Invalidation, Email Check, Google OAuth, and Password Reset.
 """
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.mvp_security import get_current_mvp_user
+from app.core.rate_limiter import check_email_limiter, forgot_password_limiter, shared_auth_limiter
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPUser
 from app.schemas.mvp import (
+    CheckEmailRequest,
+    CheckEmailResponse,
+    GenericMessageResponse,
+    GoogleAuthRequest,
     PasswordResetConfirm,
     PasswordResetRequest,
     TokenResponse,
     UserLoginRequest,
     UserRegisterRequest,
     UserResponse,
+    VerifyResetTokenResponse,
 )
 from app.services.mvp_services import MVPAuthService
 
 router = APIRouter(prefix="/auth", tags=["MVP Authentication"])
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def rate_limit_check_email(request: Request) -> None:
+    check_email_limiter.check(request)
+
+
+def rate_limit_forgot_password(request: Request) -> None:
+    forgot_password_limiter.check(request)
+
+
+def rate_limit_shared_auth(request: Request) -> None:
+    shared_auth_limiter.check(request)
+
+
+# ============================================================================
+# 1. Email Account Detection (1:1 with Approved Popup Workflow)
+# ============================================================================
+@router.post(
+    "/check-email",
+    response_model=CheckEmailResponse,
+    dependencies=[Depends(rate_limit_check_email)],
+    status_code=status.HTTP_200_OK,
+)
+def check_email(req: CheckEmailRequest, db: Session = Depends(get_mvp_db)):
+    """
+    Check whether an email address is already registered in CeylonGo.
+    Returns: {"email": str, "is_registered": bool}
+    Rate limited to protect against account enumeration.
+    """
+    normalized_email = req.email.strip().lower()
+    is_registered = MVPAuthService.check_email(db, normalized_email)
+    return CheckEmailResponse(email=normalized_email, is_registered=is_registered)
+
+
+# ============================================================================
+# 2. Google OAuth Authentication (GIS Token Verification)
+# ============================================================================
+@router.post(
+    "/google",
+    response_model=TokenResponse,
+    dependencies=[Depends(rate_limit_shared_auth)],
+    status_code=status.HTTP_200_OK,
+)
+def google_auth(req: GoogleAuthRequest, db: Session = Depends(get_mvp_db)):
+    """
+    Authenticate traveler using a verified Google Identity Services ID token.
+    Automatically provisions new traveler account if email is new.
+    """
+    token, user = MVPAuthService.login_with_google(db, req.id_token)
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+# ============================================================================
+# 3. Standard Registration, Login & Session Management
+# ============================================================================
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit_shared_auth)],
+)
 def register(req: UserRegisterRequest, db: Session = Depends(get_mvp_db)):
     user = MVPAuthService.register_user(db, req)
     return user
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(rate_limit_shared_auth)],
+    status_code=status.HTTP_200_OK,
+)
 def login(req: UserLoginRequest, db: Session = Depends(get_mvp_db)):
     token, user = MVPAuthService.login_user(db, req)
     return {"access_token": token, "token_type": "bearer", "user": user}
@@ -45,13 +114,66 @@ def logout(current_user: MVPUser = Depends(get_current_mvp_user), db: Session = 
     return {"message": "Successfully logged out. All existing sessions invalidated."}
 
 
-@router.post("/password-reset/request", status_code=status.HTTP_200_OK)
+# ============================================================================
+# 4. Password Recovery & Reset Flow (Email-based, Single-Use Expiring Tokens)
+# ============================================================================
+@router.post(
+    "/forgot-password",
+    response_model=GenericMessageResponse,
+    dependencies=[Depends(rate_limit_forgot_password)],
+    status_code=status.HTTP_200_OK,
+)
+@router.post(
+    "/password-reset/request",
+    response_model=GenericMessageResponse,
+    dependencies=[Depends(rate_limit_forgot_password)],
+    status_code=status.HTTP_200_OK,
+)
 def request_password_reset(req: PasswordResetRequest, db: Session = Depends(get_mvp_db)):
-    token = MVPAuthService.request_password_reset(db, req)
-    return {"message": "Password reset instructions generated.", "reset_token_demo": token}
+    """
+    Initiates password recovery. Dispatches reset link via SMTP when configured.
+    Returns generic anti-enumeration response and never exposes tokens in production.
+    """
+    MVPAuthService.request_password_reset(db, req, send_email=True)
+    return {
+        "message": "If an account exists with this email address, password reset instructions have been sent."
+    }
 
 
-@router.post("/password-reset/confirm", status_code=status.HTTP_200_OK)
+@router.get(
+    "/verify-reset-token",
+    response_model=VerifyResetTokenResponse,
+    status_code=status.HTTP_200_OK,
+)
+def verify_reset_token(token: str = Query(..., min_length=10), db: Session = Depends(get_mvp_db)):
+    """
+    Verify single-use reset token validity and expiration without consuming it.
+    """
+    user = MVPAuthService.verify_reset_token(db, token)
+    return {
+        "valid": True,
+        "email": user.email,
+        "message": "Password reset token is valid.",
+    }
+
+
+@router.post(
+    "/reset-password",
+    response_model=GenericMessageResponse,
+    dependencies=[Depends(rate_limit_shared_auth)],
+    status_code=status.HTTP_200_OK,
+)
+@router.post(
+    "/password-reset/confirm",
+    response_model=GenericMessageResponse,
+    dependencies=[Depends(rate_limit_shared_auth)],
+    status_code=status.HTTP_200_OK,
+)
 def confirm_password_reset(req: PasswordResetConfirm, db: Session = Depends(get_mvp_db)):
+    """
+    Resets user password, increments credential_version and auth_version to invalidate prior sessions.
+    """
     MVPAuthService.confirm_password_reset(db, req)
-    return {"message": "Password successfully updated. Please log in with your new password."}
+    return {
+        "message": "Password successfully updated. Please log in with your new password."
+    }

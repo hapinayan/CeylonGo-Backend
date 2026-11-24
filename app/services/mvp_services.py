@@ -68,6 +68,17 @@ from app.schemas.mvp import (
 # ============================================================================
 class MVPAuthService:
     @staticmethod
+    def check_email(db: Session, email: str) -> bool:
+        normalized_email = email.strip().lower()
+        if not normalized_email or "@" not in normalized_email or len(normalized_email) > 254:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid email address format.",
+            )
+        user = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
+        return user is not None
+
+    @staticmethod
     def register_user(db: Session, req: UserRegisterRequest) -> MVPUser:
         normalized_email = req.email.strip().lower()
         existing = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
@@ -120,6 +131,49 @@ class MVPAuthService:
         return token, user
 
     @staticmethod
+    def login_with_google(db: Session, id_token: str) -> tuple[str, MVPUser]:
+        from app.core.google_auth import verify_google_id_token
+        google_payload = verify_google_id_token(id_token)
+        google_email = google_payload["email"]
+        google_name = google_payload["full_name"]
+
+        user = db.query(MVPUser).filter(func.lower(MVPUser.email) == google_email).first()
+        now = datetime.now(timezone.utc)
+
+        if user:
+            if not user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account is suspended or inactive.",
+                )
+        else:
+            # Create new traveler account with secure unguessable random password
+            user = MVPUser(
+                email=google_email,
+                full_name=google_name,
+                phone=None,
+                hashed_password=hash_password(secrets.token_urlsafe(32)),
+                role="traveler",
+                is_active=True,
+                auth_version=0,
+                credential_version=0,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        token = create_mvp_access_token(
+            user_id=user.id,
+            email=user.email,
+            role=user.role,
+            auth_version=user.auth_version,
+            credential_version=user.credential_version,
+        )
+        return token, user
+
+    @staticmethod
     def invalidate_sessions(db: Session, user: MVPUser) -> None:
         """Increments auth_version to invalidate all currently issued JWTs."""
         user.auth_version += 1
@@ -127,17 +181,17 @@ class MVPAuthService:
         db.commit()
 
     @staticmethod
-    def request_password_reset(db: Session, req: PasswordResetRequest) -> str:
+    def request_password_reset(db: Session, req: PasswordResetRequest, send_email: bool = True) -> str:
         normalized_email = req.email.strip().lower()
         user = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
         if not user:
-            # Return demo token anyway to prevent account enumeration
+            # Return demo/dummy token to prevent timing side-channels and account enumeration
             return secrets.token_urlsafe(32)
 
         raw_token = secrets.token_urlsafe(32)
         token_hash = hash_binary_token(raw_token)
         now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(hours=1)
+        expires_at = now + timedelta(minutes=30)
 
         reset = MVPPasswordReset(
             user_id=user.id,
@@ -147,7 +201,52 @@ class MVPAuthService:
         )
         db.add(reset)
         db.commit()
+
+        if send_email:
+            try:
+                from app.core.email import (
+                    build_password_reset_url,
+                    is_smtp_configured,
+                    send_password_reset_email,
+                )
+                if is_smtp_configured():
+                    reset_url = build_password_reset_url(raw_token)
+                    send_password_reset_email(
+                        to_email=user.email,
+                        reset_url=reset_url,
+                        user_name=user.full_name,
+                    )
+            except Exception:
+                pass
+
         return raw_token
+
+    @staticmethod
+    def verify_reset_token(db: Session, token: str) -> MVPUser:
+        token_hash = hash_binary_token(token)
+        now = datetime.now(timezone.utc)
+        reset = (
+            db.query(MVPPasswordReset)
+            .filter(
+                MVPPasswordReset.token_hash == token_hash,
+                MVPPasswordReset.used_at.is_(None),
+                MVPPasswordReset.expires_at > now,
+            )
+            .first()
+        )
+        if not reset:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid, expired, or previously used password reset token.",
+            )
+
+        user = db.query(MVPUser).filter(MVPUser.id == reset.user_id).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User associated with token not found.",
+            )
+        return user
 
     @staticmethod
     def confirm_password_reset(db: Session, req: PasswordResetConfirm) -> None:

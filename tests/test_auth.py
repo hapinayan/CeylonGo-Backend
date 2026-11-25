@@ -33,6 +33,7 @@ from tests.access_tokens import create_fixture_access_token as create_access_tok
 from app.database.connection import get_db
 from app.main import app
 from app.models.password_reset import PasswordReset
+from app.models.traveler_email_challenge import TravelerEmailChallenge
 from app.models.user import Base, User
 from app.routers import auth
 from app.schemas.auth import ResetPasswordRequest
@@ -63,7 +64,9 @@ TestingSessionLocal = sessionmaker(
 @pytest.fixture(autouse=True)
 def setup_test_db():
     Base.metadata.create_all(bind=test_engine)
+    TravelerEmailChallenge.__table__.create(test_engine)
     yield
+    TravelerEmailChallenge.__table__.drop(test_engine)
     Base.metadata.drop_all(bind=test_engine)
 
 
@@ -139,7 +142,7 @@ def client(db_session):
 # ==========================================
 
 
-def test_register_success(client: TestClient):
+def test_register_success(client: TestClient, verify_traveler_signup):
     payload = {
         "full_name": "  Test Traveler  ",
         "email": "Traveler@Example.com",
@@ -147,10 +150,10 @@ def test_register_success(client: TestClient):
     }
     response = client.post("/api/v1/auth/register", json=payload)
 
-    assert response.status_code == 201
-    data = response.json()
-    assert data["message"] == "Account registered successfully"
-    user = data["user"]
+    verify_traveler_signup(client, response)
+    login = client.post("/api/v1/auth/login", json=payload)
+    assert login.status_code == 200
+    user = login.json()["user"]
     assert user["full_name"] == "Test Traveler"
     assert user["email"] == "traveler@example.com"
     assert user["role"] == "traveler"
@@ -159,14 +162,14 @@ def test_register_success(client: TestClient):
     assert "created_at" in user
 
 
-def test_register_duplicate_email(client: TestClient):
+def test_register_duplicate_email(client: TestClient, verify_traveler_signup):
     payload = {
         "full_name": "Test Traveler",
         "email": "duplicate@example.com",
         "password": "TestPassword123!",
     }
     first_response = client.post("/api/v1/auth/register", json=payload)
-    assert first_response.status_code == 201
+    verify_traveler_signup(client, first_response)
 
     second_response = client.post(
         "/api/v1/auth/register",
@@ -313,14 +316,14 @@ def test_login_inactive_account(client: TestClient, db_session):
 # ==========================================
 
 
-def test_password_stored_as_argon2_hash(client: TestClient, db_session):
+def test_password_stored_as_argon2_hash(client: TestClient, db_session, verify_traveler_signup):
     payload = {
         "full_name": "Argon Test User",
         "email": "argon@example.com",
         "password": "PlainSecretPassword123!",
     }
     response = client.post("/api/v1/auth/register", json=payload)
-    assert response.status_code == 201
+    verify_traveler_signup(client, response)
 
     saved_user = (
         db_session.query(User).filter(User.email == "argon@example.com").first()
@@ -357,7 +360,7 @@ def test_jwt_payload_contents(client: TestClient, db_session):
     assert exp_datetime > datetime.now(UTC)
 
 
-def test_responses_never_expose_passwords(client: TestClient, db_session):
+def test_responses_never_expose_passwords(client: TestClient, verify_traveler_signup):
     # Registration response check
     reg_response = client.post(
         "/api/v1/auth/register",
@@ -367,10 +370,7 @@ def test_responses_never_expose_passwords(client: TestClient, db_session):
             "password": "SecurePassword123!",
         },
     )
-    assert reg_response.status_code == 201
-    reg_data = reg_response.json()
-    assert "password" not in reg_data["user"]
-    assert "password_hash" not in reg_data["user"]
+    verify_traveler_signup(client, reg_response)
     assert "password" not in reg_response.text
     assert "SecurePassword123!" not in reg_response.text
 

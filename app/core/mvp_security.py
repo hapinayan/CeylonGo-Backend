@@ -15,9 +15,17 @@ from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, verify_password, get_jwt_secret_key, get_jwt_algorithm
 from app.database.mvp_session import get_mvp_db
-from app.models.mvp import MVPUser
+from app.models.mvp import MVPProviderProfile, MVPUser
 
 http_bearer = HTTPBearer(auto_error=False)
+
+
+def require_approved_provider(db: Session, user: MVPUser) -> MVPProviderProfile:
+    profile = db.query(MVPProviderProfile).filter_by(user_id=user.id).first()
+    if not profile or profile.verification_status != "approved":
+        state = profile.verification_status if profile else "pending"
+        raise HTTPException(403, f"Provider application status: {state}.")
+    return profile
 
 def create_mvp_access_token(
     user_id: int,
@@ -92,6 +100,8 @@ def get_current_mvp_user(
             detail="Credentials have been updated. Please log in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if user.role == "provider":
+        require_approved_provider(db, user)
     return user
 
 def require_mvp_role(*allowed_roles: str):

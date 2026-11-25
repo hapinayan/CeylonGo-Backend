@@ -8,6 +8,8 @@ from decimal import Decimal
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
+from app.schemas.auth import RegisterRequest
+
 
 # ============================================================================
 # 1. Authentication & Users
@@ -41,6 +43,17 @@ class UserRegisterRequest(BaseModel):
     phone: str | None = Field(None, max_length=32)
     password: str = Field(..., min_length=6, max_length=128)
     role: Literal["traveler", "provider", "admin"] = "traveler"
+
+
+class TravelerRegisterRequest(RegisterRequest):
+    full_name: str = Field(min_length=2, max_length=120)
+    phone: str | None = Field(None, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    role: Literal["traveler"] = "traveler"
+
+
+class NonTravelerRegisterRequest(UserRegisterRequest):
+    role: Literal["provider", "admin"]
 
 
 class UserLoginRequest(BaseModel):
@@ -121,13 +134,9 @@ class ProviderDocumentResponse(BaseModel):
     created_at: datetime
 
 
-class EmailChallengeRequest(BaseModel):
-    email: str
-
-
 class EmailChallengeVerify(BaseModel):
-    email: str
-    code: str
+    email: EmailStr = Field(max_length=254)
+    code: str = Field(pattern=r"^[0-9]{6}$")
 
 
 # ============================================================================

@@ -41,25 +41,20 @@ def setup_database():
     MVPBase.metadata.drop_all(bind=test_engine)
 
 
-def test_01_bike_rental_vertical_and_pay_at_location():
+def test_01_bike_rental_vertical_and_pay_at_location(verify_traveler_signup, seed_mvp_account):
     # 1. Register provider
-    client.post(
-        "/api/auth/register",
-        json={"email": "bike.rentals@ceylongo.lk", "full_name": "Saman Kumara", "password": "BikePass123!", "role": "provider"},
+    seed_mvp_account(
+        TestingSessionLocal, email="bike.rentals@ceylongo.lk", name="Saman Kumara",
+        password="BikePass123!", role="provider",
+        business=("Galle Fort Scooters", "+94912233445", "Galle"),
     )
     p_token = client.post("/api/auth/login", json={"email": "bike.rentals@ceylongo.lk", "password": "BikePass123!"}).json()["access_token"]
     p_headers = {"Authorization": f"Bearer {p_token}"}
 
-    client.post(
-        "/api/providers/register",
-        json={"business_name": "Galle Fort Scooters", "phone": "+94912233445", "district": "Galle"},
-        headers=p_headers,
-    )
-
     # 2. Register Admin & approve provider
-    client.post(
-        "/api/auth/register",
-        json={"email": "admin2@ceylongo.lk", "full_name": "Admin 2", "password": "AdminPass123!", "role": "admin"},
+    seed_mvp_account(
+        TestingSessionLocal, email="admin2@ceylongo.lk", name="Admin 2",
+        password="AdminPass123!", role="admin",
     )
     a_token = client.post("/api/auth/login", json={"email": "admin2@ceylongo.lk", "password": "AdminPass123!"}).json()["access_token"]
     a_headers = {"Authorization": f"Bearer {a_token}"}
@@ -102,10 +97,11 @@ def test_01_bike_rental_vertical_and_pay_at_location():
     client.post(f"/api/admin/listings/{bike_listing_id}/decision", json={"approval_status": "approved"}, headers=a_headers)
 
     # 6. Traveler books bike
-    client.post(
+    reg = client.post(
         "/api/auth/register",
         json={"email": "traveler.amara@ceylongo.lk", "full_name": "Amara Fernando", "password": "Password123!", "role": "traveler"},
     )
+    verify_traveler_signup(client, reg, "/api/auth")
     t_token = client.post("/api/auth/login", json={"email": "traveler.amara@ceylongo.lk", "password": "Password123!"}).json()["access_token"]
     t_headers = {"Authorization": f"Bearer {t_token}"}
 

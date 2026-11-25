@@ -14,6 +14,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    FetchedValue,
     ForeignKey,
     Integer,
     LargeBinary,
@@ -90,6 +91,7 @@ class MVPPasswordReset(MVPBase):
 # ============================================================================
 class MVPProviderProfile(MVPBase):
     __tablename__ = "provider_profiles"
+    __mapper_args__ = {"eager_defaults": False}
     __table_args__ = (
         UniqueConstraint("user_id", name="uq_provider_profiles_user_id"),
         CheckConstraint(
@@ -108,6 +110,9 @@ class MVPProviderProfile(MVPBase):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     decided_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(Unicode(500), nullable=True)
+    registration_details: Mapped[str | None] = mapped_column(
+        Unicode(), deferred=True, server_default=FetchedValue(), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

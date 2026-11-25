@@ -16,9 +16,12 @@ def hash_provider_otp(email: str, otp: str) -> str:
 
     Protects against precomputed dictionary/rainbow attacks and prevents raw OTP storage.
     """
+    return hash_otp_message(f"{email.strip().lower()}:{otp.strip()}")
+
+
+def hash_otp_message(message: str) -> str:
     secret = get_jwt_secret_key().encode()
-    message = f"{email.strip().lower()}:{otp.strip()}".encode()
-    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+    return hmac.new(secret, message.encode(), hashlib.sha256).hexdigest()
 
 
 def verify_provider_otp(email: str, otp: str, stored_hash: str) -> bool:

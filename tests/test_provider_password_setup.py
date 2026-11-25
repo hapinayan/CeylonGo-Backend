@@ -505,18 +505,22 @@ def test_provider_me_unauthenticated_or_unapproved_blocked(client: TestClient, d
 # ==============================================================================
 
 
-def test_traveler_registration_and_login_preserved(client: TestClient):
-    # Traveler registration
-    res_reg = client.post(
-        "/api/v1/auth/register",
-        json={"full_name": "New Traveler", "email": "brand_new_traveler@ceylongo.com", "password": "Password123!"},
+def test_existing_traveler_login_preserved(client: TestClient, db_session: Session):
+    db_session.add(
+        User(
+            full_name="Existing Traveler",
+            email="existing_traveler@ceylongo.com",
+            password_hash=hash_password("Password123!"),
+            role="traveler",
+            is_active=True,
+        )
     )
-    assert res_reg.status_code == 201
+    db_session.commit()
 
     # Traveler login
     res_login = client.post(
         "/api/v1/auth/login",
-        json={"email": "brand_new_traveler@ceylongo.com", "password": "Password123!"},
+        json={"email": "existing_traveler@ceylongo.com", "password": "Password123!"},
     )
     assert res_login.status_code == 200
     assert "access_token" in res_login.json()

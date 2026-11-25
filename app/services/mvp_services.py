@@ -14,7 +14,10 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.core.mvp_security import hash_binary_token, hash_password, verify_password, create_mvp_access_token
+from app.core.mvp_security import (
+    create_mvp_access_token, hash_binary_token, hash_password,
+    require_approved_provider, verify_password,
+)
 from app.models.mvp import (
     MVPAdminAuditLog,
     MVPAvailabilitySlot,
@@ -30,7 +33,6 @@ from app.models.mvp import (
     MVPListingMedia,
     MVPPasswordReset,
     MVPProviderDocument,
-    MVPProviderEmailChallenge,
     MVPProviderProfile,
     MVPUser,
 )
@@ -43,8 +45,6 @@ from app.schemas.mvp import (
     BookingCreateRequest,
     BookingStatusUpdateRequest,
     CommentCreateRequest,
-    EmailChallengeRequest,
-    EmailChallengeVerify,
     InventoryUnitCreate,
     ItineraryDayPlan,
     ItineraryRequest,
@@ -59,8 +59,8 @@ from app.schemas.mvp import (
     ProviderRegisterRequest,
     SimulatedPaymentRequest,
     UserLoginRequest,
-    UserRegisterRequest,
 )
+from app.services.mvp_provider_otp import PASSWORD_UNSET
 
 
 # ============================================================================
@@ -79,42 +79,21 @@ class MVPAuthService:
         return user is not None
 
     @staticmethod
-    def register_user(db: Session, req: UserRegisterRequest) -> MVPUser:
-        normalized_email = req.email.strip().lower()
-        existing = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A user with this email address already exists.",
-            )
-
-        now = datetime.now(timezone.utc)
-        user = MVPUser(
-            email=normalized_email,
-            full_name=req.full_name.strip(),
-            phone=req.phone.strip() if req.phone else None,
-            hashed_password=hash_password(req.password),
-            role=req.role,
-            is_active=True,
-            auth_version=0,
-            credential_version=0,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user
-
-    @staticmethod
-    def login_user(db: Session, req: UserLoginRequest) -> tuple[str, MVPUser]:
+    def login_user(db: Session, req: UserLoginRequest, *,
+                   provider_only: bool = False) -> tuple[str, MVPUser]:
         normalized_email = req.email.strip().lower()
         user = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
-        if not user or not verify_password(req.password, user.hashed_password):
+        if (
+            not user or (provider_only and user.role != "provider")
+            or user.hashed_password == PASSWORD_UNSET
+            or not verify_password(req.password, user.hashed_password)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password",
             )
+        if user.role == "provider":
+            require_approved_provider(db, user)
         if not user.is_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -141,6 +120,8 @@ class MVPAuthService:
         now = datetime.now(timezone.utc)
 
         if user:
+            if user.role != "traveler":
+                raise HTTPException(403, "Google login is available for traveler accounts.")
             if not user.is_active:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -184,7 +165,11 @@ class MVPAuthService:
     def request_password_reset(db: Session, req: PasswordResetRequest, send_email: bool = True) -> str:
         normalized_email = req.email.strip().lower()
         user = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
-        if not user:
+        if not user or (
+            user.role == "provider" and (
+                not user.is_active or user.hashed_password == PASSWORD_UNSET
+            )
+        ):
             # Return demo/dummy token to prevent timing side-channels and account enumeration
             return secrets.token_urlsafe(32)
 
@@ -303,11 +288,6 @@ class MVPProviderService:
             created_at=now,
             updated_at=now,
         )
-        # Update user role to provider if not already
-        if user.role != "provider" and user.role != "admin":
-            user.role = "provider"
-            user.updated_at = now
-
         db.add(profile)
         db.commit()
         db.refresh(profile)
@@ -356,55 +336,6 @@ class MVPProviderService:
         db.commit()
         db.refresh(doc)
         return doc
-
-    @staticmethod
-    def create_email_challenge(db: Session, req: EmailChallengeRequest) -> str:
-        code = f"{secrets.randbelow(900000) + 100000}"
-        challenge_hash = hashlib.sha256(f"{req.email.lower()}:{code}".encode("utf-8")).digest()
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(minutes=15)
-
-        challenge = MVPProviderEmailChallenge(
-            email=req.email.lower(),
-            challenge_hash=challenge_hash,
-            expires_at=expires_at,
-            attempts=0,
-            created_at=now,
-        )
-        db.add(challenge)
-        db.commit()
-        return code
-
-    @staticmethod
-    def verify_email_challenge(db: Session, req: EmailChallengeVerify) -> bool:
-        now = datetime.now(timezone.utc)
-        challenge = (
-            db.query(MVPProviderEmailChallenge)
-            .filter(
-                MVPProviderEmailChallenge.email == req.email.lower(),
-                MVPProviderEmailChallenge.consumed_at.is_(None),
-                MVPProviderEmailChallenge.expires_at > now,
-            )
-            .order_by(MVPProviderEmailChallenge.id.desc())
-            .first()
-        )
-        if not challenge:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active email challenge found.")
-
-        if challenge.attempts >= 10:
-            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts. Request a new challenge.")
-
-        challenge.attempts += 1
-        expected_hash = hashlib.sha256(f"{req.email.lower()}:{req.code}".encode("utf-8")).digest()
-        if challenge.challenge_hash != expected_hash:
-            db.commit()
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect verification code.")
-
-        challenge.verified_at = now
-        challenge.consumed_at = now
-        db.commit()
-        return True
-
 
 # ============================================================================
 # 3. Listing & Inventory Service
@@ -864,6 +795,8 @@ class MVPAdminService:
         profile = db.query(MVPProviderProfile).filter(MVPProviderProfile.id == provider_id).first()
         if not profile:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider profile not found.")
+        if profile.verification_status == "draft":
+            raise HTTPException(409, "The provider must submit the application before review.")
 
         now = datetime.now(timezone.utc)
         profile.verification_status = req.verification_status

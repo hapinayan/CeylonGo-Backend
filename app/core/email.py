@@ -277,16 +277,31 @@ def send_provider_otp_email(
     Returns False if SMTP is unconfigured or if delivery fails.
     Never exposes credentials or raw OTPs in production logs.
     """
-    if not is_smtp_configured():
-        logger.warning(
-            "SMTP is not configured (SMTP_HOST is missing). Provider OTP email delivery skipped for recipient."
-        )
+    msg = build_provider_otp_email_message(to_email, otp, purpose, user_name)
+    return _send_verification_email(msg)
+
+
+def send_traveler_otp_email(to_email: str, otp: str) -> bool:
+    msg = EmailMessage()
+    msg["Subject"] = "CeylonGo traveler email verification"
+    msg["From"] = f"{get_smtp_from_name()} <{get_smtp_from_email()}>"
+    msg["To"] = to_email
+    msg.set_content(
+        f"Your CeylonGo verification code is {otp}. It expires in 5 minutes.\n"
+        "Enter this code only in the registration session you started. "
+        "If you did not request it, ignore this email."
+    )
+    return _send_verification_email(msg)
+
+
+def _send_verification_email(msg: EmailMessage) -> bool:
+    smtp_host = get_smtp_host()
+    if not smtp_host:
+        logger.warning("SMTP is not configured. Verification email delivery skipped.")
         return False
 
-    smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
     timeout = get_smtp_timeout()
-    msg = build_provider_otp_email_message(to_email, otp, purpose, user_name)
 
     try:
         server_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
@@ -301,13 +316,13 @@ def send_provider_otp_email(
             if username and password:
                 server.login(username, password)
 
-            server.send_message(msg)
-            logger.info("Provider OTP email accepted by SMTP server for %s", to_email)
+            if server.send_message(msg):
+                return False
+            logger.info("Verification email accepted by SMTP server")
             return True
     except (smtplib.SMTPException, OSError, TimeoutError) as exc:
         logger.error(
-            "Failed to send provider OTP email to %s: %s",
-            to_email,
+            "Failed to send verification email: %s",
             exc.__class__.__name__,
         )
         return False

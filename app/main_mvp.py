@@ -25,6 +25,8 @@ from app.routers.mvp import (
     payments_router,
     providers_router,
 )
+from app.routers.mvp.homestays import router as homestays_router
+from app.routers.mvp.listing_management import router as listing_management_router
 
 
 @asynccontextmanager
@@ -79,6 +81,8 @@ def create_mvp_app() -> FastAPI:
         app.include_router(providers_router, prefix=prefix_base)
         app.include_router(listings_router, prefix=prefix_base)
         app.include_router(bookings_router, prefix=prefix_base)
+        app.include_router(homestays_router, prefix=prefix_base)
+        app.include_router(listing_management_router, prefix=prefix_base)
         app.include_router(payments_router, prefix=prefix_base)
         app.include_router(community_router, prefix=prefix_base)
         app.include_router(admin_router, prefix=prefix_base)

@@ -118,7 +118,9 @@ def decide_listing(
     db: Session = Depends(get_mvp_db),
 ):
     listing = MVPAdminService.decide_listing(db, admin, listing_id, req)
-    return listing
+    item = ListingResponse.model_validate(listing)
+    item.approval_status = req.approval_status
+    return item
 
 
 @router.post("/community/posts/{post_id}/moderate")

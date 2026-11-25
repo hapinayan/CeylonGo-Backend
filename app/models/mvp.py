@@ -127,10 +127,11 @@ class MVPProviderProfile(MVPBase):
 # ============================================================================
 class MVPListing(MVPBase):
     __tablename__ = "listings"
+    __mapper_args__ = {"eager_defaults": False}
     __table_args__ = (
         UniqueConstraint("id", "provider_id", name="uq_listings_id_provider"),
-        CheckConstraint("category IN ('homestay', 'bike', 'bicycle', 'adventure', 'guide')", name="ck_listings_category"),
-        CheckConstraint("approval_status IN ('draft', 'pending', 'approved', 'rejected')", name="ck_listings_approval_status"),
+        CheckConstraint("category IN ('homestay', 'bike', 'bicycle', 'adventure', 'guide', 'artisan')", name="ck_listings_category"),
+        CheckConstraint("approval_status IN ('draft', 'pending', 'evidence', 'approved', 'rejected', 'suspended')", name="ck_listings_approval_status"),
         CheckConstraint("is_active = 0 OR approval_status = 'approved'", name="ck_listings_active_requires_approved"),
         CheckConstraint("price >= 0", name="ck_listings_price_nonnegative"),
         CheckConstraint("currency = 'LKR'", name="ck_listings_currency"),
@@ -153,6 +154,9 @@ class MVPListing(MVPBase):
     decided_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(Unicode(500), nullable=True)
+    homestay_metadata: Mapped[str | None] = mapped_column(
+        Unicode(), deferred=True, server_default=FetchedValue(), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -162,11 +166,26 @@ class MVPListing(MVPBase):
     bookings: Mapped[list["MVPBooking"]] = relationship("MVPBooking", back_populates="listing")
 
 
+class MVPHomestayWishlist(MVPBase):
+    __tablename__ = "homestay_wishlist"
+
+    traveler_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id"), primary_key=True
+    )
+    listing_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("listings.id"), primary_key=True
+    )
+    is_saved: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
+
+
 # ============================================================================
 # 5. listing_media
 # ============================================================================
 class MVPListingMedia(MVPBase):
     __tablename__ = "listing_media"
+    __mapper_args__ = {"eager_defaults": False}
     __table_args__ = (
         UniqueConstraint("storage_key", name="uq_listing_media_storage_key"),
         UniqueConstraint("listing_id", "sort_order", name="uq_listing_media_listing_sort"),
@@ -178,6 +197,9 @@ class MVPListingMedia(MVPBase):
     storage_key: Mapped[str] = mapped_column(Unicode(450), nullable=False)
     sort_order: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     alt_text: Mapped[str | None] = mapped_column(Unicode(160), nullable=True)
+    is_visible: Mapped[bool] = mapped_column(
+        Boolean, deferred=True, server_default=text("1"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     listing: Mapped["MVPListing"] = relationship("MVPListing", back_populates="media")
@@ -188,6 +210,7 @@ class MVPListingMedia(MVPBase):
 # ============================================================================
 class MVPInventoryUnit(MVPBase):
     __tablename__ = "inventory_units"
+    __mapper_args__ = {"eager_defaults": False}
     __table_args__ = (
         UniqueConstraint("listing_id", "label", name="uq_inventory_units_listing_label"),
         UniqueConstraint("id", "listing_id", name="uq_inventory_units_id_listing"),
@@ -201,9 +224,20 @@ class MVPInventoryUnit(MVPBase):
     label: Mapped[str] = mapped_column(Unicode(100), nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"), nullable=False)
+    room_metadata: Mapped[str | None] = mapped_column(
+        Unicode(), deferred=True, server_default=FetchedValue(), nullable=True
+    )
 
     listing: Mapped["MVPListing"] = relationship("MVPListing", back_populates="units")
     slots: Mapped[list["MVPAvailabilitySlot"]] = relationship("MVPAvailabilitySlot", back_populates="unit")
+
+
+class MVPListingVerification(MVPBase):
+    __tablename__ = "listing_verification"
+
+    listing_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("listings.id"), primary_key=True)
+    details: Mapped[str] = mapped_column(Unicode(), nullable=False)
+
 
 
 # ============================================================================

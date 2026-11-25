@@ -12,6 +12,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.mvp_security import (
@@ -61,6 +62,7 @@ from app.schemas.mvp import (
     UserLoginRequest,
 )
 from app.services.mvp_provider_otp import PASSWORD_UNSET
+from app.services import mvp_homestay, mvp_listing_verification as verification
 
 
 # ============================================================================
@@ -344,8 +346,10 @@ class MVPListingService:
     @staticmethod
     def create_listing(db: Session, user: MVPUser, req: ListingCreateRequest) -> MVPListing:
         profile = db.query(MVPProviderProfile).filter(MVPProviderProfile.user_id == user.id).first()
-        if not profile:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only registered providers can create listings.")
+        if user.role != "provider" or not profile or profile.verification_status != "approved":
+            raise HTTPException(403, "Only approved providers can create listings")
+        if req.category == "artisan":
+            verification.require_schema(db)
 
         # Coordinate bounds check
         if (req.latitude is not None and req.longitude is None) or (req.latitude is None and req.longitude is not None):
@@ -365,9 +369,8 @@ class MVPListingService:
             longitude=req.longitude,
             price=req.price,
             currency="LKR",
-            approval_status="pending",
+            approval_status="draft",
             is_active=False,  # Active requires approved
-            submitted_at=now,
             created_at=now,
             updated_at=now,
         )
@@ -378,9 +381,10 @@ class MVPListingService:
 
     @staticmethod
     def add_media(db: Session, user: MVPUser, listing_id: int, req: ListingMediaCreate) -> MVPListingMedia:
-        listing = db.query(MVPListing).filter(MVPListing.id == listing_id).first()
-        if not listing:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
+        listing = verification.owned(db, user, listing_id, lock=True)
+        verification.require_editable(listing)
+        if req.storage_key.startswith(verification.PHOTO_PREFIX):
+            raise HTTPException(422, "Hosted photos must use the multipart upload endpoint")
         now = datetime.now(timezone.utc)
         media = MVPListingMedia(
             listing_id=listing.id,
@@ -390,15 +394,17 @@ class MVPListingService:
             created_at=now,
         )
         db.add(media)
-        db.commit()
+        verification.invalidate_review(listing)
+        verification.commit(db)
         db.refresh(media)
         return media
 
     @staticmethod
     def add_inventory_unit(db: Session, user: MVPUser, listing_id: int, req: InventoryUnitCreate) -> MVPInventoryUnit:
-        listing = db.query(MVPListing).filter(MVPListing.id == listing_id).first()
-        if not listing:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
+        listing = verification.owned(db, user, listing_id, lock=True)
+        verification.require_editable(listing)
+        if not req.label.strip() or (listing.category == "homestay" and req.capacity > 50):
+            raise HTTPException(422, "Invalid room label or capacity")
         unit = MVPInventoryUnit(
             listing_id=listing.id,
             provider_id=listing.provider_id,
@@ -407,32 +413,51 @@ class MVPListingService:
             is_active=True,
         )
         db.add(unit)
-        db.commit()
+        verification.commit(db)
         db.refresh(unit)
         return unit
 
     @staticmethod
-    def add_availability_slot(db: Session, listing_id: int, req: AvailabilitySlotCreate) -> MVPAvailabilitySlot:
-        listing = db.query(MVPListing).filter(MVPListing.id == listing_id).first()
-        if not listing:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
+    def add_availability_slot(
+        db: Session, listing_id: int, req: AvailabilitySlotCreate, actor: MVPUser | None = None,
+    ) -> MVPAvailabilitySlot:
+        listing = verification.owned(db, actor, listing_id, lock=True)
+        verification.require_editable(listing)
         unit = db.query(MVPInventoryUnit).filter(MVPInventoryUnit.id == req.unit_id, MVPInventoryUnit.listing_id == listing_id).first()
         if not unit:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory unit not found for this listing.")
 
-        if req.ends_at <= req.starts_at:
+        starts_at, ends_at = req.starts_at, req.ends_at
+        if listing.category == "homestay":
+            if req.capacity > unit.capacity or not unit.is_active:
+                raise HTTPException(422, "Slot capacity must fit an active room")
+            starts_at, ends_at = map(mvp_homestay.utc_naive, (starts_at, ends_at))
+            if not req.is_open and db.query(MVPBooking.id).join(MVPBookingAllocation).join(
+                MVPAvailabilitySlot, MVPAvailabilitySlot.id == MVPBookingAllocation.slot_id
+            ).filter(
+                MVPAvailabilitySlot.unit_id == unit.id,
+                MVPBookingAllocation.released_at.is_(None),
+                MVPBooking.status.in_(("pending", "confirmed", "completed")),
+                MVPBooking.starts_at < ends_at, MVPBooking.ends_at > starts_at,
+            ).first():
+                raise HTTPException(409, "Room already has a booking during these dates")
+        if ends_at <= starts_at:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Slot ends_at must be strictly greater than starts_at.")
 
         slot = MVPAvailabilitySlot(
             unit_id=unit.id,
             listing_id=listing.id,
-            starts_at=req.starts_at,
-            ends_at=req.ends_at,
+            starts_at=starts_at,
+            ends_at=ends_at,
             capacity=req.capacity,
             is_open=req.is_open,
         )
         db.add(slot)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(409, "Availability conflicts with an existing room slot") from None
         db.refresh(slot)
         return slot
 
@@ -444,7 +469,15 @@ class MVPListingService:
         max_price: Decimal | None = None,
         limit: int = 50,
     ) -> list[MVPListing]:
-        q = db.query(MVPListing).filter(MVPListing.is_active == True, MVPListing.approval_status == "approved")
+        q = db.query(MVPListing).filter(
+            MVPListing.is_active == True, MVPListing.approval_status == "approved",
+            MVPListing.provider.has(
+                (MVPProviderProfile.verification_status == "approved")
+                & MVPProviderProfile.user.has(
+                    (MVPUser.role == "provider") & (MVPUser.is_active == True)
+                ),
+            ),
+        )
         if category:
             q = q.filter(MVPListing.category == category)
         if district:
@@ -460,10 +493,12 @@ class MVPListingService:
 class MVPBookingService:
     @staticmethod
     def create_booking(db: Session, traveler: MVPUser, req: BookingCreateRequest) -> MVPBooking:
-        listing = db.query(MVPListing).filter(MVPListing.id == req.listing_id).first()
-        if not listing:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
-        if not listing.is_active or listing.approval_status != "approved":
+        listing = verification.locked_listing(db, req.listing_id)
+        if listing.category == "homestay":
+            return mvp_homestay.book(
+                db, traveler, listing.id, req.starts_at, req.ends_at, req.quantity, req.request_key,
+            )
+        if not listing.is_active or listing.approval_status != "approved" or not verification.provider_eligible(listing):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Listing is not available for booking.")
 
         if req.ends_at <= req.starts_at:
@@ -550,12 +585,28 @@ class MVPBookingService:
 
     @staticmethod
     def update_booking_status(db: Session, actor: MVPUser, booking_id: int, req: BookingStatusUpdateRequest) -> MVPBooking:
-        booking = db.query(MVPBooking).filter(MVPBooking.id == booking_id).first()
+        booking = _locked_booking(db, booking_id)
         if not booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
 
         current = booking.status
         target = req.to_status
+        owns_listing = (
+            actor.role == "provider" and actor.provider_profile
+            and actor.provider_profile.id == booking.listing.provider_id
+        )
+        if not (
+            owns_listing or actor.role == "admin" or
+            (actor.id == booking.traveler_id and target == "cancelled")
+        ):
+            raise HTTPException(403, "Only the host can decide this booking")
+        if booking.listing.category == "homestay":
+            if target == "confirmed" and not any(
+                payment.status in {"unpaid", "demo_succeeded"} for payment in booking.payments
+            ):
+                raise HTTPException(409, "Traveler must select a payment method first")
+            if target == "confirmed":
+                mvp_homestay.validate_confirmation(db, booking)
 
         # Transition validation per ck_booking_status_history_transitions
         allowed_transitions = {
@@ -597,12 +648,57 @@ class MVPBookingService:
 # ============================================================================
 # 5. Payment Service
 # ============================================================================
+def _locked_booking(db: Session, booking_id: int) -> MVPBooking | None:
+    return db.query(MVPBooking).with_hint(
+        MVPBooking, "WITH (UPDLOCK, HOLDLOCK)", dialect_name="mssql"
+    ).filter(MVPBooking.id == booking_id).first()
+
+
+def _homestay_payment(db, booking, req, method, payment_status):
+    attempt_no = getattr(req, "attempt_no", None)
+    previous = sorted(booking.payments, key=lambda item: item.attempt_no)
+    for payment in previous:
+        if payment.request_key == req.request_key:
+            if (payment.method != method or payment.status != payment_status
+                    or (attempt_no is not None and payment.attempt_no != attempt_no)):
+                raise HTTPException(409, "Request key is already used for a different payment")
+            return payment
+    if booking.status != "pending":
+        raise HTTPException(409, "Payment can only be selected for a pending booking")
+    if any(payment.status in {"unpaid", "demo_succeeded"} for payment in previous):
+        raise HTTPException(409, "A payment method has already been selected")
+    next_attempt = previous[-1].attempt_no + 1 if previous else 1
+    if attempt_no is not None and attempt_no != next_attempt:
+        raise HTTPException(409, f"Expected payment attempt number {next_attempt}")
+    now = datetime.now(timezone.utc)
+    payment = MVPBookingPayment(
+        booking_id=booking.id, request_key=req.request_key, attempt_no=next_attempt,
+        request_hash=hashlib.sha256(
+            f"{booking.id}:{req.request_key}:{next_attempt}".encode()
+        ).digest(),
+        method=method, status=payment_status, display_amount=booking.total_amount,
+        currency=booking.currency, created_at=now,
+        resolved_at=now if method == "simulated" else None,
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
 class MVPPaymentService:
     @staticmethod
-    def process_simulated(db: Session, req: SimulatedPaymentRequest) -> MVPBookingPayment:
-        booking = db.query(MVPBooking).filter(MVPBooking.id == req.booking_id).first()
+    def process_simulated(db: Session, req: SimulatedPaymentRequest, traveler: MVPUser) -> MVPBookingPayment:
+        booking = _locked_booking(db, req.booking_id)
         if not booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
+        if booking.traveler_id != traveler.id:
+            raise HTTPException(403, "Only the booking traveler can select payment")
+        if booking.listing.category == "homestay":
+            if "simulate_outcome" not in req.model_fields_set:
+                raise HTTPException(422, "Specify the simulated payment outcome")
+            outcome = "demo_succeeded" if req.simulate_outcome == "success" else "demo_failed"
+            return _homestay_payment(db, booking, req, "simulated", outcome)
 
         # Check single succeeded demo payment constraint
         existing_succeeded = db.query(MVPBookingPayment).filter(
@@ -652,10 +748,14 @@ class MVPPaymentService:
         return payment
 
     @staticmethod
-    def process_at_location(db: Session, req: AtLocationPaymentRequest) -> MVPBookingPayment:
-        booking = db.query(MVPBooking).filter(MVPBooking.id == req.booking_id).first()
+    def process_at_location(db: Session, req: AtLocationPaymentRequest, traveler: MVPUser) -> MVPBookingPayment:
+        booking = _locked_booking(db, req.booking_id)
         if not booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
+        if booking.traveler_id != traveler.id:
+            raise HTTPException(403, "Only the booking traveler can select payment")
+        if booking.listing.category == "homestay":
+            return _homestay_payment(db, booking, req, "at_location", "unpaid")
 
         # Check single unpaid payment constraint
         existing_unpaid = db.query(MVPBookingPayment).filter(
@@ -823,15 +923,31 @@ class MVPAdminService:
 
     @staticmethod
     def decide_listing(db: Session, admin: MVPUser, listing_id: int, req: AdminListingDecision) -> MVPListing:
-        listing = db.query(MVPListing).filter(MVPListing.id == listing_id).first()
-        if not listing:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
+        if admin.role != "admin":
+            raise HTTPException(403, "Administrator required")
+        verification.require_schema(db)
+        listing = verification.locked_listing(db, listing_id)
+        decision = req.approval_status
+        allowed = {
+            "pending": {"approved", "rejected", "more_evidence_required"},
+            "approved": {"suspended"},
+            "suspended": {"approved", "more_evidence_required"},
+        }
+        if decision not in allowed.get(listing.approval_status, set()):
+            raise HTTPException(409, "Invalid listing verification transition")
+        reason = (req.decision_reason or "").strip()
+        if decision != "approved" and not reason:
+            raise HTTPException(422, "Enter a reason or evidence instructions")
+        if decision == "approved":
+            if not verification.provider_eligible(listing):
+                raise HTTPException(409, "Listing provider is no longer eligible")
+            verification.validate_submission(db, listing)
 
         now = datetime.now(timezone.utc)
-        listing.approval_status = req.approval_status
+        listing.approval_status = "evidence" if decision == "more_evidence_required" else decision
         listing.decided_by = admin.id
         listing.decided_at = now
-        listing.decision_reason = req.decision_reason
+        listing.decision_reason = reason or None
         listing.updated_at = now
         if req.approval_status == "approved":
             listing.is_active = True
@@ -846,7 +962,7 @@ class MVPAdminService:
             subject_provider_id=None,
             subject_listing_id=listing.id,
             subject_post_id=None,
-            reason=req.decision_reason or f"Listing set to {req.approval_status}",
+            reason=f"{decision}: {reason or 'Listing approved'}"[:500],
             occurred_at=now,
         )
         db.add(audit)

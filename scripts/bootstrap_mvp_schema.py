@@ -63,6 +63,17 @@ UPGRADES = (
         SCRIPT_DIR / "mvp_upgrades" / "1.0.2_provider_registration_details.sql",
         "27f980efb71da6b4c7616177ff7a7ea482fb7eb7eab511ccf04cb1880501cb6c",
     ),
+    SchemaVersion(
+        "1.0.3",
+        SCRIPT_DIR / "mvp_upgrades" / "1.0.3_homestay_metadata_and_wishlist.sql",
+        "f8762aae4b96f5b948c7cc66992fea30873dd73adcae5e7b7dacba9a5fa6a8b4",
+        "dbo.homestay_wishlist",
+    ),
+    SchemaVersion(
+        "1.0.4", SCRIPT_DIR / "mvp_upgrades" / "1.0.4_listing_verification.sql",
+        "d58a794b9bf53402a0d1c535f0a292128bccdfe82758b50db9e992c02547faf6",
+        "dbo.listing_verification",
+    ),
 )
 
 

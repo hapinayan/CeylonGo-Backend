@@ -155,6 +155,7 @@ class ListingMediaResponse(BaseModel):
     storage_key: str
     sort_order: int
     alt_text: str | None = None
+    image_url: str | None = None
 
 
 class InventoryUnitCreate(BaseModel):
@@ -192,15 +193,18 @@ class AvailabilitySlotResponse(BaseModel):
     is_open: bool
 
 
+ServiceCategory = Literal["homestay", "bike", "bicycle", "adventure", "guide", "artisan"]
+
+
 class ListingCreateRequest(BaseModel):
-    category: Literal["homestay", "bike", "bicycle", "adventure", "guide"]
-    title: str = Field(..., min_length=3, max_length=160)
-    description: str = Field(..., min_length=10, max_length=2000)
-    district: str = Field(..., min_length=2, max_length=80)
-    locality: str = Field(..., min_length=2, max_length=100)
-    latitude: Decimal | None = None
-    longitude: Decimal | None = None
-    price: Decimal = Field(..., ge=0)
+    category: ServiceCategory
+    title: str = Field("", max_length=160)
+    description: str = Field("", max_length=2000)
+    district: str = Field("", max_length=80)
+    locality: str = Field("", max_length=100)
+    latitude: Decimal | None = Field(None, ge=-90, le=90, decimal_places=6)
+    longitude: Decimal | None = Field(None, ge=-180, le=180, decimal_places=6)
+    price: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     currency: Literal["LKR"] = "LKR"
 
 
@@ -337,8 +341,8 @@ class AdminProviderDecision(BaseModel):
 
 
 class AdminListingDecision(BaseModel):
-    approval_status: Literal["approved", "rejected"]
-    decision_reason: str | None = Field(None, max_length=500)
+    approval_status: Literal["approved", "rejected", "more_evidence_required", "suspended"]
+    decision_reason: str | None = Field(None, max_length=460)
 
 
 class AdminModerationRequest(BaseModel):

@@ -62,3 +62,38 @@ def seed_mvp_account():
             db.commit()
 
     return seed
+
+
+@pytest.fixture
+def submit_mvp_listing(monkeypatch, tmp_path):
+    from io import BytesIO
+
+    from PIL import Image
+
+    monkeypatch.setenv("PROVIDER_UPLOAD_DIR", str(tmp_path))
+    image = BytesIO()
+    Image.new("RGB", (4, 4)).save(image, "PNG")
+
+    def submit(client, headers, listing_id, *, homestay=False):
+        url = f"/api/provider/listings/{listing_id}"
+        payload = {"latitude": "6.8667", "longitude": "81.0466"}
+        if homestay:
+            payload.update({
+                "province": "Uva", "address": "Ella Road 12", "house_rules": "No smoking",
+                "check_in_time": "14:00", "check_out_time": "10:00", "contact": "0771234567",
+                "metadata": {"property_type": "cottage"},
+            })
+        changed = client.patch(url, headers=headers, json=payload)
+        assert changed.status_code == 200, changed.text
+        if not homestay:
+            changed = client.put(url + "/evidence", headers=headers,
+                                 json={"notes": "Academic fixture verification explanation"})
+            assert changed.status_code == 200, changed.text
+        uploaded = client.post(url + "/photos", headers=headers,
+                               files={"file": ("property.png", image.getvalue(), "image/png")})
+        assert uploaded.status_code == 201, uploaded.text
+        submitted = client.post(url + "/submit", headers=headers)
+        assert submitted.status_code == 200, submitted.text
+
+    # Fixtures that share a module-scoped database also retain their uploaded files.
+    return submit

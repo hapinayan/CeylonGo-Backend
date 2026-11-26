@@ -270,7 +270,7 @@ def test_forgot_password_generic_anti_enumeration():
     assert res_registered.json()["message"] == res_unregistered.json()["message"]
 
 
-def test_verify_and_confirm_password_reset():
+def test_verify_and_confirm_password_reset(verify_traveler_signup):
     db = TestingSessionLocal()
     reg = client.post(
         "/api/v1/auth/register",
@@ -281,7 +281,7 @@ def test_verify_and_confirm_password_reset():
             "role": "traveler",
         },
     )
-    assert reg.status_code == 201
+    verify_traveler_signup(client, reg)
 
     # Request reset token via service for test isolation
     raw_token = MVPAuthService.request_password_reset(

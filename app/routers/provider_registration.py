@@ -167,7 +167,7 @@ def validate_and_save_image(
     Deletes superseded files safely. Never exposes raw server paths.
     """
     try:
-        content = file.file.read()
+        content = file.file.read(MAX_IMAGE_SIZE_BYTES + 1)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

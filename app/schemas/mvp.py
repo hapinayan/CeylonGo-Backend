@@ -3,10 +3,12 @@ CeylonGo Academic MVP — Pydantic Request & Response Schemas
 Type-safe API contracts for Traveler, Provider, Admin, Listings, Bookings, Payments, Community, and AI Itinerary.
 """
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
+
+from app.schemas.auth import RegisterRequest
 
 
 # ============================================================================
@@ -41,6 +43,17 @@ class UserRegisterRequest(BaseModel):
     phone: str | None = Field(None, max_length=32)
     password: str = Field(..., min_length=6, max_length=128)
     role: Literal["traveler", "provider", "admin"] = "traveler"
+
+
+class TravelerRegisterRequest(RegisterRequest):
+    full_name: str = Field(min_length=2, max_length=120)
+    phone: str | None = Field(None, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+    role: Literal["traveler"] = "traveler"
+
+
+class NonTravelerRegisterRequest(UserRegisterRequest):
+    role: Literal["provider", "admin"]
 
 
 class UserLoginRequest(BaseModel):
@@ -121,13 +134,9 @@ class ProviderDocumentResponse(BaseModel):
     created_at: datetime
 
 
-class EmailChallengeRequest(BaseModel):
-    email: str
-
-
 class EmailChallengeVerify(BaseModel):
-    email: str
-    code: str
+    email: EmailStr = Field(max_length=254)
+    code: str = Field(pattern=r"^[0-9]{6}$")
 
 
 # ============================================================================
@@ -146,6 +155,7 @@ class ListingMediaResponse(BaseModel):
     storage_key: str
     sort_order: int
     alt_text: str | None = None
+    image_url: str | None = None
 
 
 class InventoryUnitCreate(BaseModel):
@@ -183,15 +193,18 @@ class AvailabilitySlotResponse(BaseModel):
     is_open: bool
 
 
+ServiceCategory = Literal["homestay", "bike", "bicycle", "adventure", "guide", "artisan"]
+
+
 class ListingCreateRequest(BaseModel):
-    category: Literal["homestay", "bike", "bicycle", "adventure", "guide"]
-    title: str = Field(..., min_length=3, max_length=160)
-    description: str = Field(..., min_length=10, max_length=2000)
-    district: str = Field(..., min_length=2, max_length=80)
-    locality: str = Field(..., min_length=2, max_length=100)
-    latitude: Decimal | None = None
-    longitude: Decimal | None = None
-    price: Decimal = Field(..., ge=0)
+    category: ServiceCategory
+    title: str = Field("", max_length=160)
+    description: str = Field("", max_length=2000)
+    district: str = Field("", max_length=80)
+    locality: str = Field("", max_length=100)
+    latitude: Decimal | None = Field(None, ge=-90, le=90, decimal_places=6)
+    longitude: Decimal | None = Field(None, ge=-180, le=180, decimal_places=6)
+    price: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     currency: Literal["LKR"] = "LKR"
 
 
@@ -232,6 +245,10 @@ class BookingCreateRequest(BaseModel):
     ends_at: datetime
     quantity: int = Field(1, gt=0)
     request_key: str = Field(..., min_length=10, max_length=36)
+    slot_id: int | None = Field(None, gt=0)
+    expected_total: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=2)
+    motorcycle_license_confirmed: bool = False
+    license_valid_until: date | None = None
 
 
 class BookingStatusUpdateRequest(BaseModel):
@@ -253,12 +270,24 @@ class BookingResponse(BaseModel):
     currency: str
     status: str
     created_at: datetime
+    booking_reference: str | None = None
+    slot_id: int | None = None
+    package_id: int | None = None
+    rental_unit_ids: list[int] | None = None
+
+    @field_serializer("starts_at", "ends_at", "created_at")
+    def serialize_booking_time(self, value: datetime) -> datetime:
+        if self.booking_reference and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 # ============================================================================
 # 5. Payments
 # ============================================================================
 class SimulatedPaymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     booking_id: int
     request_key: str = Field(..., min_length=10, max_length=36)
     attempt_no: int = Field(1, ge=1)
@@ -266,6 +295,8 @@ class SimulatedPaymentRequest(BaseModel):
 
 
 class AtLocationPaymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     booking_id: int
     request_key: str = Field(..., min_length=10, max_length=36)
 
@@ -283,6 +314,10 @@ class PaymentResponse(BaseModel):
     currency: str
     created_at: datetime
     resolved_at: datetime | None = None
+
+
+class BookingDetailResponse(BookingResponse):
+    payments: list[PaymentResponse]
 
 
 # ============================================================================
@@ -328,8 +363,8 @@ class AdminProviderDecision(BaseModel):
 
 
 class AdminListingDecision(BaseModel):
-    approval_status: Literal["approved", "rejected"]
-    decision_reason: str | None = Field(None, max_length=500)
+    approval_status: Literal["approved", "rejected", "more_evidence_required", "suspended"]
+    decision_reason: str | None = Field(None, max_length=460)
 
 
 class AdminModerationRequest(BaseModel):

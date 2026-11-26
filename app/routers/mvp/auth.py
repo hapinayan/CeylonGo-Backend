@@ -3,29 +3,38 @@ CeylonGo Academic MVP — Authentication Router
 Endpoints for Traveler, Provider, and Admin Registration, Login, Session Invalidation, Email Check, Google OAuth, and Password Reset.
 """
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.mvp_security import get_current_mvp_user
 from app.core.rate_limiter import check_email_limiter, forgot_password_limiter, shared_auth_limiter
+from app.core.sensitive_route import SensitiveInputRoute
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPUser
+from app.schemas.auth import (
+    TravelerChallengeRequest,
+    TravelerChallengeResponse,
+    TravelerVerifiedResponse,
+    TravelerVerifyEmailRequest,
+)
 from app.schemas.mvp import (
     CheckEmailRequest,
     CheckEmailResponse,
     GenericMessageResponse,
     GoogleAuthRequest,
+    NonTravelerRegisterRequest,
     PasswordResetConfirm,
     PasswordResetRequest,
     TokenResponse,
     UserLoginRequest,
-    UserRegisterRequest,
+    TravelerRegisterRequest,
     UserResponse,
     VerifyResetTokenResponse,
 )
+from app.services import traveler_email_verification as traveler_verification
 from app.services.mvp_services import MVPAuthService
 
-router = APIRouter(prefix="/auth", tags=["MVP Authentication"])
+router = APIRouter(prefix="/auth", tags=["MVP Authentication"], route_class=SensitiveInputRoute)
 
 
 def rate_limit_check_email(request: Request) -> None:
@@ -83,13 +92,48 @@ def google_auth(req: GoogleAuthRequest, db: Session = Depends(get_mvp_db)):
 # ============================================================================
 @router.post(
     "/register",
-    response_model=UserResponse,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(rate_limit_shared_auth)],
+    response_model=TravelerChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
-def register(req: UserRegisterRequest, db: Session = Depends(get_mvp_db)):
-    user = MVPAuthService.register_user(db, req)
-    return user
+def register(
+    req: TravelerRegisterRequest | NonTravelerRegisterRequest,
+    request: Request,
+    db: Session = Depends(get_mvp_db),
+):
+    if isinstance(req, NonTravelerRegisterRequest):
+        raise HTTPException(403, "Use the dedicated provider registration workflow")
+    traveler_verification.rate_limit_send(request)
+    return traveler_verification.start_registration(
+        db,
+        MVPUser,
+        email=req.email,
+        full_name=req.full_name,
+        password=req.password,
+        phone=req.phone.strip() if req.phone else None,
+    )
+
+
+@router.post(
+    "/verify-email",
+    response_model=TravelerVerifiedResponse,
+    dependencies=[Depends(traveler_verification.rate_limit_verify)],
+)
+def verify_traveler_email(
+    req: TravelerVerifyEmailRequest, db: Session = Depends(get_mvp_db)
+):
+    return traveler_verification.verify_registration(db, MVPUser, req)
+
+
+@router.post(
+    "/resend-email-otp",
+    response_model=TravelerChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(traveler_verification.rate_limit_send)],
+)
+def resend_traveler_email_otp(
+    req: TravelerChallengeRequest, db: Session = Depends(get_mvp_db)
+):
+    return traveler_verification.resend_verification(db, MVPUser, req)
 
 
 @router.post(

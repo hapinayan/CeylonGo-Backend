@@ -41,25 +41,22 @@ def setup_database():
     MVPBase.metadata.drop_all(bind=test_engine)
 
 
-def test_01_bike_rental_vertical_and_pay_at_location():
+def test_01_bike_rental_vertical_and_pay_at_location(
+    verify_traveler_signup, seed_mvp_account, submit_mvp_listing
+):
     # 1. Register provider
-    client.post(
-        "/api/auth/register",
-        json={"email": "bike.rentals@ceylongo.lk", "full_name": "Saman Kumara", "password": "BikePass123!", "role": "provider"},
+    seed_mvp_account(
+        TestingSessionLocal, email="bike.rentals@ceylongo.lk", name="Saman Kumara",
+        password="BikePass123!", role="provider",
+        business=("Galle Fort Scooters", "+94912233445", "Galle"),
     )
     p_token = client.post("/api/auth/login", json={"email": "bike.rentals@ceylongo.lk", "password": "BikePass123!"}).json()["access_token"]
     p_headers = {"Authorization": f"Bearer {p_token}"}
 
-    client.post(
-        "/api/providers/register",
-        json={"business_name": "Galle Fort Scooters", "phone": "+94912233445", "district": "Galle"},
-        headers=p_headers,
-    )
-
     # 2. Register Admin & approve provider
-    client.post(
-        "/api/auth/register",
-        json={"email": "admin2@ceylongo.lk", "full_name": "Admin 2", "password": "AdminPass123!", "role": "admin"},
+    seed_mvp_account(
+        TestingSessionLocal, email="admin2@ceylongo.lk", name="Admin 2",
+        password="AdminPass123!", role="admin",
     )
     a_token = client.post("/api/auth/login", json={"email": "admin2@ceylongo.lk", "password": "AdminPass123!"}).json()["access_token"]
     a_headers = {"Authorization": f"Bearer {a_token}"}
@@ -99,13 +96,15 @@ def test_01_bike_rental_vertical_and_pay_at_location():
     )
 
     # 5. Admin approves listing
+    submit_mvp_listing(client, p_headers, bike_listing_id)
     client.post(f"/api/admin/listings/{bike_listing_id}/decision", json={"approval_status": "approved"}, headers=a_headers)
 
     # 6. Traveler books bike
-    client.post(
+    reg = client.post(
         "/api/auth/register",
         json={"email": "traveler.amara@ceylongo.lk", "full_name": "Amara Fernando", "password": "Password123!", "role": "traveler"},
     )
+    verify_traveler_signup(client, reg, "/api/auth")
     t_token = client.post("/api/auth/login", json={"email": "traveler.amara@ceylongo.lk", "password": "Password123!"}).json()["access_token"]
     t_headers = {"Authorization": f"Bearer {t_token}"}
 
@@ -140,7 +139,7 @@ def test_01_bike_rental_vertical_and_pay_at_location():
     assert b_check["status"] == "confirmed"
 
 
-def test_02_adventure_and_tour_guide_verticals():
+def test_02_adventure_and_tour_guide_verticals(submit_mvp_listing):
     p_token = client.post("/api/auth/login", json={"email": "bike.rentals@ceylongo.lk", "password": "BikePass123!"}).json()["access_token"]
     p_headers = {"Authorization": f"Bearer {p_token}"}
     a_token = client.post("/api/auth/login", json={"email": "admin2@ceylongo.lk", "password": "AdminPass123!"}).json()["access_token"]
@@ -162,6 +161,7 @@ def test_02_adventure_and_tour_guide_verticals():
     )
     assert r_adv.status_code == 201
     adv_id = r_adv.json()["id"]
+    submit_mvp_listing(client, p_headers, adv_id)
     client.post(f"/api/admin/listings/{adv_id}/decision", json={"approval_status": "approved"}, headers=a_headers)
 
     # 2. Create Tour Guide Listing (Sigiriya & Dambulla Day Guide)
@@ -180,6 +180,7 @@ def test_02_adventure_and_tour_guide_verticals():
     )
     assert r_guide.status_code == 201
     guide_id = r_guide.json()["id"]
+    submit_mvp_listing(client, p_headers, guide_id)
     client.post(f"/api/admin/listings/{guide_id}/decision", json={"approval_status": "approved"}, headers=a_headers)
 
     # Verify search filters correctly by category

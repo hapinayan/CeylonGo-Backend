@@ -591,16 +591,13 @@ def test_traveler_and_provider_login_flows_remain_unchanged(
     client: TestClient,
     db_session: Session,
 ):
-    # 1. Traveler registration & login
-    reg_res = client.post(
-        "/api/v1/auth/register",
-        json={
-            "full_name": "Regression Traveler",
-            "email": "reg.traveler@ceylongo.com",
-            "password": "TravelerPassword123!",
-        },
+    # 1. Login for an existing traveler
+    _create_user(
+        db_session,
+        email="reg.traveler@ceylongo.com",
+        password="TravelerPassword123!",
+        role="traveler",
     )
-    assert reg_res.status_code == 201
 
     trav_login = client.post(
         "/api/v1/auth/login",

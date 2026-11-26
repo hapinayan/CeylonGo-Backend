@@ -56,7 +56,7 @@ def test_01_health_and_root_endpoints():
     assert res_h.json()["status"] == "healthy"
 
 
-def test_02_traveler_registration_and_authentication():
+def test_02_traveler_registration_and_authentication(verify_traveler_signup):
     # Register traveler
     reg_payload = {
         "email": "traveler.kasun@ceylongo.lk",
@@ -66,11 +66,7 @@ def test_02_traveler_registration_and_authentication():
         "role": "traveler",
     }
     r = client.post("/api/auth/register", json=reg_payload)
-    assert r.status_code == 201, r.text
-    user = r.json()
-    assert user["email"] == "traveler.kasun@ceylongo.lk"
-    assert user["role"] == "traveler"
-    assert user["is_active"] is True
+    verify_traveler_signup(client, r, "/api/auth")
 
     # Duplicate registration rejected
     r_dup = client.post("/api/auth/register", json=reg_payload)
@@ -84,6 +80,9 @@ def test_02_traveler_registration_and_authentication():
     r_login = client.post("/api/auth/login", json=login_payload)
     assert r_login.status_code == 200
     token_data = r_login.json()
+    assert token_data["user"]["email"] == "traveler.kasun@ceylongo.lk"
+    assert token_data["user"]["role"] == "traveler"
+    assert token_data["user"]["is_active"] is True
     assert "access_token" in token_data
     token = token_data["access_token"]
 
@@ -102,9 +101,9 @@ def test_02_traveler_registration_and_authentication():
     assert r_old.status_code == 401
 
 
-def test_03_password_reset_flow():
+def test_03_password_reset_flow(verify_traveler_signup):
     # Register user for reset
-    client.post(
+    reg = client.post(
         "/api/auth/register",
         json={
             "email": "reset.user@ceylongo.lk",
@@ -113,6 +112,7 @@ def test_03_password_reset_flow():
             "role": "traveler",
         },
     )
+    verify_traveler_signup(client, reg, "/api/auth")
 
     # Request reset
     r_req = client.post("/api/auth/password-reset/request", json={"email": "reset.user@ceylongo.lk"})
@@ -149,16 +149,11 @@ def test_03_password_reset_flow():
     assert r_succ.status_code == 200
 
 
-def test_04_provider_onboarding_and_documents():
-    # Register provider user
-    client.post(
-        "/api/auth/register",
-        json={
-            "email": "host.ella@ceylongo.lk",
-            "full_name": "Nimal Silva",
-            "password": "ProviderPass123!",
-            "role": "provider",
-        },
+def test_04_provider_onboarding_and_documents(seed_mvp_account):
+    seed_mvp_account(
+        TestingSessionLocal, email="host.ella@ceylongo.lk", name="Nimal Silva",
+        password="ProviderPass123!", role="provider",
+        business=("Ella View Homestay & Tours", "+94719876543", "Badulla"),
     )
     r_login = client.post(
         "/api/auth/login",
@@ -167,24 +162,7 @@ def test_04_provider_onboarding_and_documents():
     token = r_login.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Register provider profile
-    prof_payload = {
-        "business_name": "Ella View Homestay & Tours",
-        "phone": "+94719876543",
-        "district": "Badulla",
-    }
-    r_prof = client.post("/api/providers/register", json=prof_payload, headers=headers)
-    assert r_prof.status_code == 201
-    profile = r_prof.json()
-    assert profile["verification_status"] == "pending"
-
-    # Email challenge
-    r_ch = client.post("/api/providers/email-challenge/request", json={"email": "host.ella@ceylongo.lk"})
-    assert r_ch.status_code == 200
-    code = r_ch.json()["challenge_code_demo"]
-
-    r_v = client.post("/api/providers/email-challenge/verify", json={"email": "host.ella@ceylongo.lk", "code": code})
-    assert r_v.status_code == 200
+    assert client.get("/api/providers/me", headers=headers).json()["verification_status"] == "approved"
 
     # Document upload: identity document (unit_id must be None)
     dummy_sha = "a" * 64
@@ -214,16 +192,10 @@ def test_04_provider_onboarding_and_documents():
     assert r_doc_fail.status_code == 400
 
 
-def test_05_admin_approval_and_audit_logging():
-    # Register Admin user
-    client.post(
-        "/api/auth/register",
-        json={
-            "email": "admin.system@ceylongo.lk",
-            "full_name": "Chief Admin",
-            "password": "AdminSecurePassword123!",
-            "role": "admin",
-        },
+def test_05_admin_approval_and_audit_logging(seed_mvp_account):
+    seed_mvp_account(
+        TestingSessionLocal, email="admin.system@ceylongo.lk", name="Chief Admin",
+        password="AdminSecurePassword123!", role="admin",
     )
     r_adm = client.post(
         "/api/auth/login",
@@ -250,7 +222,7 @@ def test_05_admin_approval_and_audit_logging():
     assert logs[0]["subject_provider_id"] == 1
 
 
-def test_06_listings_inventory_and_booking_allocations():
+def test_06_listings_inventory_and_booking_allocations(submit_mvp_listing):
     # Login provider
     r_login = client.post(
         "/api/auth/login",
@@ -278,7 +250,7 @@ def test_06_listings_inventory_and_booking_allocations():
     assert r_lst.status_code == 201
     listing = r_lst.json()
     listing_id = listing["id"]
-    assert listing["approval_status"] == "pending"
+    assert listing["approval_status"] == "draft"
     assert listing["is_active"] is False
 
     # 2. Add inventory unit (Deluxe Room, capacity 2)
@@ -291,7 +263,9 @@ def test_06_listings_inventory_and_booking_allocations():
     unit_id = r_unit.json()["id"]
 
     # 3. Add availability slot
-    start_dt = datetime.now(timezone.utc) + timedelta(days=2)
+    start_dt = (datetime.now(timezone.utc) + timedelta(days=2)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
     end_dt = start_dt + timedelta(days=3)
     r_slot = client.post(
         f"/api/listings/{listing_id}/slots",
@@ -305,6 +279,7 @@ def test_06_listings_inventory_and_booking_allocations():
         headers=p_headers,
     )
     assert r_slot.status_code == 201
+    submit_mvp_listing(client, p_headers, listing_id, homestay=True)
 
     # 4. Admin approves listing
     r_adm = client.post(
@@ -354,7 +329,7 @@ def test_06_listings_inventory_and_booking_allocations():
     assert r_book.status_code == 201
     booking = r_book.json()
     assert booking["status"] == "pending"
-    assert float(booking["total_amount"]) == 7500.00
+    assert float(booking["total_amount"]) == 22500.00
     booking_id = booking["id"]
 
     # 7. Overbooking rejection: requesting quantity 2 when remaining capacity is only 1
@@ -401,10 +376,14 @@ def test_06_listings_inventory_and_booking_allocations():
     assert r_pay_succ.status_code == 200
     assert r_pay_succ.json()["status"] == "demo_succeeded"
 
-    # Booking is now confirmed
+    # Host approval is required after the simulated payment.
     r_b_check = client.get(f"/api/bookings/{booking_id}", headers=t_headers)
     assert r_b_check.status_code == 200
-    assert r_b_check.json()["status"] == "confirmed"
+    assert r_b_check.json()["status"] == "pending"
+    decision = client.patch(f"/api/bookings/{booking_id}/status", headers=p_headers,
+                            json={"to_status": "confirmed"})
+    assert decision.status_code == 200, decision.text
+    assert decision.json()["status"] == "confirmed"
 
     # Attempt 3: duplicate success rejected
     r_pay_dup = client.post(

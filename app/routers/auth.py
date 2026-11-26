@@ -36,14 +36,18 @@ from app.schemas.auth import (
     GoogleAuthRequest,
     LoginRequest,
     RegisterRequest,
-    RegisterResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
     TokenResponse,
+    TravelerChallengeRequest,
+    TravelerChallengeResponse,
+    TravelerVerifiedResponse,
+    TravelerVerifyEmailRequest,
     UserResponse,
     VerifyResetTokenResponse,
 )
 from app.schemas.provider_auth import validate_provider_password_strength
+from app.services import traveler_email_verification as traveler_verification
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"], route_class=SensitiveInputRoute)
 logger = logging.getLogger(__name__)
@@ -218,54 +222,47 @@ def check_email(
 
 @router.post(
     "/register",
-    response_model=RegisterResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Register a new traveler account",
+    response_model=TravelerChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(traveler_verification.rate_limit_send)],
+    summary="Start traveler registration and send an email verification code",
 )
 def register(
     request: RegisterRequest,
     db: Annotated[Session, Depends(get_db)],
 ):
-    trimmed_full_name = request.full_name.strip()
-    normalized_email = request.email.strip().lower()
-
-    # Check for existing user by normalized email
-    existing_user = (
-        db.query(User).filter(func.lower(User.email) == normalized_email).first()
-    )
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists",
-        )
-
-    # Hash the password with Argon2
-    hashed_pwd = hash_password(request.password)
-
-    # Always enforce the traveler role on the backend
-    new_user = User(
-        full_name=trimmed_full_name,
-        email=normalized_email,
-        password_hash=hashed_pwd,
-        role="traveler",
-        is_active=True,
+    return traveler_verification.start_registration(
+        db,
+        User,
+        email=request.email,
+        full_name=request.full_name,
+        password=request.password,
     )
 
-    db.add(new_user)
-    try:
-        db.commit()
-        db.refresh(new_user)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists",
-        )
 
-    return RegisterResponse(
-        message="Account registered successfully",
-        user=UserResponse.model_validate(new_user),
-    )
+@router.post(
+    "/verify-email",
+    response_model=TravelerVerifiedResponse,
+    dependencies=[Depends(traveler_verification.rate_limit_verify)],
+)
+def verify_traveler_email(
+    request: TravelerVerifyEmailRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    return traveler_verification.verify_registration(db, User, request)
+
+
+@router.post(
+    "/resend-email-otp",
+    response_model=TravelerChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(traveler_verification.rate_limit_send)],
+)
+def resend_traveler_email_otp(
+    request: TravelerChallengeRequest,
+    db: Annotated[Session, Depends(get_db)],
+):
+    return traveler_verification.resend_verification(db, User, request)
 
 
 @router.post(

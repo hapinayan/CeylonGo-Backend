@@ -19,7 +19,7 @@ class CheckEmailResponse(BaseModel):
 
 class RegisterRequest(BaseModel):
     full_name: str = Field(min_length=2, max_length=150)
-    email: EmailStr
+    email: EmailStr = Field(max_length=254)
     password: str = Field(min_length=8, max_length=128)
 
     @field_validator("full_name")
@@ -57,9 +57,25 @@ class UserResponse(BaseModel):
     created_at: datetime
 
 
-class RegisterResponse(BaseModel):
+class TravelerChallengeRequest(CheckEmailRequest):
+    email: EmailStr = Field(max_length=254)
+    registration_id: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+
+
+class TravelerVerifyEmailRequest(TravelerChallengeRequest):
+    otp: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class TravelerChallengeResponse(BaseModel):
     message: str
-    user: UserResponse
+    email: EmailStr
+    registration_id: str
+    expires_in: int
+    resend_after: int
+
+
+class TravelerVerifiedResponse(BaseModel):
+    message: str
 
 
 class TokenResponse(BaseModel):

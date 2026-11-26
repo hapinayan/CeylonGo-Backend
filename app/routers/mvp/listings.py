@@ -4,7 +4,6 @@ Covers Homestay, Bike/Bicycle, Adventure, and Tour Guide services with units and
 """
 
 from decimal import Decimal
-from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
@@ -20,8 +19,10 @@ from app.schemas.mvp import (
     ListingMediaCreate,
     ListingMediaResponse,
     ListingResponse,
+    ServiceCategory,
 )
 from app.services.mvp_services import MVPListingService
+from app.services import mvp_listing_verification as verification
 
 router = APIRouter(prefix="/listings", tags=["MVP Listings & Inventory"])
 
@@ -38,14 +39,26 @@ def create_listing(
 
 @router.get("", response_model=list[ListingResponse])
 def search_listings(
-    category: Literal["homestay", "bike", "bicycle", "adventure", "guide"] | None = Query(None),
+    category: ServiceCategory | None = Query(None),
     district: str | None = Query(None),
     max_price: Decimal | None = Query(None),
     limit: int = Query(50, le=100),
     db: Session = Depends(get_mvp_db),
 ):
     listings = MVPListingService.search_listings(db, category, district, max_price, limit)
-    return listings
+    enabled = verification.installed(db)
+    return [_public_response(listing, enabled) for listing in listings]
+
+
+def _public_response(listing, enabled):
+    response = ListingResponse.model_validate(listing)
+    visible = {item.id for item in verification.visible_media(listing, enabled)}
+    response.media = [item for item in response.media if item.id in visible]
+    for item in response.media:
+        if item.storage_key.startswith(verification.PHOTO_PREFIX):
+            item.image_url = f"/api/v1/listings/{listing.id}/photos/{item.id}"
+    response.units = [unit for unit in response.units if unit.is_active]
+    return response
 
 
 @router.get("/{listing_id}", response_model=ListingResponse)
@@ -53,7 +66,9 @@ def get_listing_details(listing_id: int, db: Session = Depends(get_mvp_db)):
     listing = db.query(MVPListing).filter(MVPListing.id == listing_id).first()
     if not listing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Listing not found.")
-    return listing
+    if not listing.is_active or listing.approval_status != "approved" or not verification.provider_eligible(listing):
+        raise HTTPException(404, "Published listing not found")
+    return _public_response(listing, verification.installed(db))
 
 
 @router.post("/{listing_id}/media", response_model=ListingMediaResponse, status_code=status.HTTP_201_CREATED)
@@ -85,5 +100,5 @@ def add_availability_slot(
     current_user: MVPUser = Depends(get_current_mvp_user),
     db: Session = Depends(get_mvp_db),
 ):
-    slot = MVPListingService.add_availability_slot(db, listing_id, req)
+    slot = MVPListingService.add_availability_slot(db, listing_id, req, current_user)
     return slot

@@ -1,8 +1,9 @@
 import math
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal
 import hashlib
 from math import ceil
+from app.core.rental_pricing import rental_days
 from typing import Annotated, Literal
 import uuid
 
@@ -863,16 +864,10 @@ def create_rental_booking(
             )
 
         # Calculate rental duration in days
-        duration_seconds = (return_at - pickup_at).total_seconds()
-        rental_days = (
-            Decimal(str(duration_seconds)) / Decimal("86400")
-        ).to_integral_value(rounding=ROUND_CEILING)
-
-        if rental_days < Decimal("1"):
-            rental_days = Decimal("1")
+        duration_days = rental_days(pickup_at, return_at)
 
         # Calculate total price on the server
-        total_price = (vehicle.price_per_day * rental_days).quantize(
+        total_price = (vehicle.price_per_day * duration_days).quantize(
             Decimal("0.01")
         )
 

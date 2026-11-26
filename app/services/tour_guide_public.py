@@ -55,6 +55,7 @@ from app.services.tour_guide_sync import (
     GUIDE_CATEGORY_BY_SLUG,
     classify_package_duration,
     extract_category_slugs,
+    package_subtotal,
     resolve_category_slug,
     validate_currency_code,
 )
@@ -917,13 +918,10 @@ def calculate_tour_guide_price_preview(
         max_group_size = pkg.max_people
         duration_hours = pkg.duration_hours
         currency = pkg.currency
+        subtotal = package_subtotal(unit_price, pricing_type, payload.number_of_people)
         if pricing_type == "per_person":
-            subtotal = (unit_price * Decimal(payload.number_of_people)).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            )
             quantity_description = f"{payload.number_of_people} traveler(s) x {unit_price} {currency}"
         else:
-            subtotal = unit_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             quantity_description = f"Flat group rate (up to {max_group_size} travelers)"
 
     elif payload.rate_type == "hourly":

@@ -244,6 +244,12 @@ def verify_registration(
     try:
         _require_available_email(db, user_model, challenge.email)
         db.add(user)
+        if user_model is MVPUser:
+            from app.services import mvp_account
+
+            if mvp_account.available(db):
+                db.flush()
+                mvp_account.settings(db, user.id, write=True).email_verified = True
         db.commit()
     except HTTPException:
         db.rollback()

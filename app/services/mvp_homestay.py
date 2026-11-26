@@ -294,6 +294,9 @@ def book(db: Session, traveler: MVPUser, listing_id: int, start: datetime, end: 
     )]
     db.add(booking)
     try:
+        from app.services.mvp_account import booking_event
+
+        booking_event(db, booking)
         db.commit()
     except IntegrityError:
         db.rollback()

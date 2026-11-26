@@ -368,8 +368,8 @@ class AdminListingDecision(BaseModel):
 
 
 class AdminModerationRequest(BaseModel):
-    visibility: Literal["hidden", "deleted"]
-    reason: str = Field(..., max_length=500)
+    visibility: Literal["visible", "hidden", "deleted"]
+    reason: str = Field(..., min_length=3, max_length=500)
 
 
 class AdminAuditLogResponse(BaseModel):

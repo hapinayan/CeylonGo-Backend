@@ -6,6 +6,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.mvp import ListingResponse, ServiceCategory
 from app.schemas.mvp_activity import ActivityMetadata
+from app.schemas.mvp_artisan import ArtisanBusiness
 from app.schemas.mvp_guide import GuideProfile
 from app.schemas.mvp_rental import RentalMetadata
 from app.schemas.mvp_homestay import (
@@ -39,6 +40,7 @@ class ListingDraftUpdate(BaseModel):
     contact: str | None = Field(None, max_length=120)
     metadata: HomestayMetadata | None = None
     activity: ActivityMetadata | None = None
+    artisan: ArtisanBusiness | None = None
     guide: GuideProfile | None = None
     rental: RentalMetadata | None = None
 

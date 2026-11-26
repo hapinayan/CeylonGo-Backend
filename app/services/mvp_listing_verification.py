@@ -133,6 +133,19 @@ def review(db, listing):
             package.model_dump(mode="json") for unit in sorted(listing.units, key=lambda unit: unit.id)
             if (package := guide_package(unit)) is not None
         ]
+    if listing.category == "artisan":
+        content["products"] = [
+            {
+                "id": unit.id,
+                **meta["artisan_product"],
+                "is_active": unit.is_active,
+                "photo_ids": meta.get("photo_ids", []),
+                "created_at": meta.get("created_at"),
+                "updated_at": meta.get("updated_at"),
+            }
+            for unit in sorted(listing.units, key=lambda unit: unit.id)
+            if "artisan_product" in (meta := json.loads(unit.room_metadata or "{}"))
+        ]
     result = ListingResponse.model_validate(listing)
     visible = {photo.id for photo in visible_media(listing)}
     result.media = [item for item in result.media if item.id in visible]
@@ -141,7 +154,8 @@ def review(db, listing):
     )
     return ReviewListing(
         listing=result, details=content,
-        rooms=[room_details(unit) for unit in listing.units] if listing.category != "guide" else [],
+        rooms=[room_details(unit) for unit in listing.units]
+        if listing.category not in {"guide", "artisan"} else [],
         homestay_metadata=(
             HomestayMetadata.model_validate_json(listing.homestay_metadata or "{}")
             if listing.category == "homestay" else None
@@ -177,6 +191,7 @@ def update_draft(db, listing, payload):
         data.pop("activity", None)
         data.pop("guide", None)
         data.pop("rental", None)
+        data.pop("artisan", None)
         material = True
     for key in ("title", "description", "district", "locality", "latitude", "longitude", "price"):
         if key not in fields:
@@ -229,6 +244,13 @@ def update_draft(db, listing, payload):
         guide = payload.guide.model_dump(mode="json")
         material |= data.get("guide") != guide
         data["guide"] = guide
+    if "artisan" in fields:
+        if listing.category != "artisan" or payload.artisan is None:
+            raise HTTPException(422, "Business metadata requires an Artisan listing")
+        business = dict(data.get("artisan", {}))
+        business.update(payload.artisan.model_dump(mode="json", exclude_unset=True))
+        material |= data.get("artisan") != business
+        data["artisan"] = business
     if "rental" in fields:
         if listing.category not in {"bike", "bicycle"} or payload.rental is None:
             raise HTTPException(422, "Vehicle details require a rental listing")
@@ -246,7 +268,7 @@ def update_draft(db, listing, payload):
             data[key] = fields[key]
     if material:
         invalidate_review(listing)
-    if listing.approval_status == "approved" and listing.price == 0:
+    if listing.approval_status == "approved" and listing.price == 0 and listing.category != "artisan":
         if listing.category != "homestay" or any(
             not room_details(room).nightly_price for room in listing.units if room.is_active
         ):
@@ -345,7 +367,7 @@ def validate_submission(db, listing):
                 or not rooms or any(not (room_details(room).nightly_price or listing.price) for room in rooms)):
             raise HTTPException(422, "Complete homestay property details and add an active room")
     else:
-        if listing.price <= 0:
+        if listing.category != "artisan" and listing.price <= 0:
             raise HTTPException(422, "Set a positive LKR service price")
         if listing.category == "adventure":
             if not data.get("activity"):

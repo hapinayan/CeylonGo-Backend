@@ -74,6 +74,21 @@ UPGRADES = (
         "d58a794b9bf53402a0d1c535f0a292128bccdfe82758b50db9e992c02547faf6",
         "dbo.listing_verification",
     ),
+    SchemaVersion(
+        "1.0.5", SCRIPT_DIR / "mvp_upgrades" / "1.0.5_community_extensions.sql",
+        "4d02886aadc44b5231986a7e7884a00e1af5ab22fedc3350e74f62674f4f8c88",
+        "dbo.community_post_media",
+    ),
+    SchemaVersion(
+        "1.0.6", SCRIPT_DIR / "mvp_upgrades" / "1.0.6_ai_travel_planner.sql",
+        "e90fdf2ca597f027cac5253fcf735e1290a72d764c55a9f626f03ddc875eaadd",
+        "dbo.ai_saved_trips",
+    ),
+    SchemaVersion(
+        "1.0.7", SCRIPT_DIR / "mvp_upgrades" / "1.0.7_traveler_accounts.sql",
+        "48398527e73181345d82c577c4ece7a61b2f30bd3ab495702bc0aba54b9b6ea7",
+        "dbo.traveler_notifications",
+    ),
 )
 
 

@@ -499,6 +499,64 @@ class MVPCommunityPostLike(MVPBase):
     user: Mapped["MVPUser"] = relationship("MVPUser")
 
 
+class MVPCommunityPostMedia(MVPBase):
+    __tablename__ = "community_post_media"
+    __table_args__ = (
+        UniqueConstraint("storage_key", name="uq_community_post_media_storage_key"),
+        CheckConstraint("display_order >= 0", name="ck_community_post_media_order"),
+        CheckConstraint("media_type IN ('image')", name="ck_community_post_media_type"),
+    )
+
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    post_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("community_posts.id"), nullable=False, index=True)
+    storage_key: Mapped[str] = mapped_column(Unicode(450), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(20), default="image", server_default=text("'image'"), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(32), default="image/jpeg", server_default=text("'image/jpeg'"), nullable=False)
+    alt_text: Mapped[str | None] = mapped_column(Unicode(160), nullable=True)
+    display_order: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"), nullable=False)
+    is_visible: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    post: Mapped["MVPCommunityPost"] = relationship("MVPCommunityPost")
+
+
+class MVPCommunitySavedPost(MVPBase):
+    __tablename__ = "community_saved_posts"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
+    post_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("community_posts.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user: Mapped["MVPUser"] = relationship("MVPUser")
+    post: Mapped["MVPCommunityPost"] = relationship("MVPCommunityPost")
+
+
+class MVPCommunityReport(MVPBase):
+    __tablename__ = "community_reports"
+    __table_args__ = (
+        CheckConstraint("entity_type IN ('post', 'comment')", name="ck_community_reports_entity_type"),
+        CheckConstraint(
+            "status IN ('pending', 'reviewed', 'resolved', 'dismissed')",
+            name="ck_community_reports_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    reporter_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    entity_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(Unicode(100), nullable=False)
+    description: Mapped[str | None] = mapped_column(Unicode(1000), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", server_default=text("'pending'"), nullable=False, index=True)
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    review_notes: Mapped[str | None] = mapped_column(Unicode(500), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    reporter: Mapped["MVPUser"] = relationship("MVPUser", foreign_keys=[reporter_id])
+    reviewer: Mapped["MVPUser | None"] = relationship("MVPUser", foreign_keys=[reviewed_by])
+
+
 # ============================================================================
 # 17. admin_audit_logs
 # ============================================================================

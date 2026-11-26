@@ -47,9 +47,6 @@ from app.schemas.mvp import (
     BookingStatusUpdateRequest,
     CommentCreateRequest,
     InventoryUnitCreate,
-    ItineraryDayPlan,
-    ItineraryRequest,
-    ItineraryResponse,
     ListingCreateRequest,
     ListingMediaCreate,
     ListingUpdateRequest,
@@ -65,6 +62,7 @@ from app.services.mvp_provider_otp import PASSWORD_UNSET
 from app.services.tour_guide_sync import acquire_guide_booking_lock
 from app.services import mvp_activity, mvp_guide, mvp_homestay, mvp_rental
 from app.services import mvp_listing_verification as verification
+from app.services import mvp_account as account
 
 
 # ============================================================================
@@ -123,6 +121,7 @@ class MVPAuthService:
         user = db.query(MVPUser).filter(func.lower(MVPUser.email) == google_email).first()
         now = datetime.now(timezone.utc)
 
+        is_new = user is None
         if user:
             if user.role != "traveler":
                 raise HTTPException(403, "Google login is available for traveler accounts.")
@@ -146,8 +145,16 @@ class MVPAuthService:
                 updated_at=now,
             )
             db.add(user)
+            db.flush()
+
+        if account.available(db):
+            settings = account.settings(db, user.id, write=True)
+            settings.email_verified = True
+            if is_new:
+                settings.google_only = True
             db.commit()
-            db.refresh(user)
+        elif is_new:
+            db.commit()
 
         token = create_mvp_access_token(
             user_id=user.id,
@@ -177,6 +184,7 @@ class MVPAuthService:
             # Return demo/dummy token to prevent timing side-channels and account enumeration
             return secrets.token_urlsafe(32)
 
+        user = account.lock_user(db, user.id)
         raw_token = secrets.token_urlsafe(32)
         token_hash = hash_binary_token(raw_token)
         now = datetime.now(timezone.utc)
@@ -256,15 +264,25 @@ class MVPAuthService:
                 detail="Invalid, expired, or previously used password reset token.",
             )
 
-        user = db.query(MVPUser).filter(MVPUser.id == reset.user_id).first()
+        user = account.lock_user(db, reset.user_id)
         if not user:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        db.refresh(reset)
+        if reset.used_at is not None:
+            raise HTTPException(400, "Invalid, expired, or previously used password reset token.")
 
-        reset.used_at = now
+        db.query(MVPPasswordReset).filter(
+            MVPPasswordReset.user_id == user.id, MVPPasswordReset.used_at.is_(None),
+        ).update({MVPPasswordReset.used_at: now}, synchronize_session=False)
         user.hashed_password = hash_password(req.new_password)
         user.credential_version += 1
         user.auth_version += 1  # Invalidate existing sessions
         user.updated_at = now
+        if user.role == "traveler" and account.available(db):
+            db.flush()
+            account.settings(db, user.id, write=True).google_only = False
+            account.notify(db, user.id, "account", "password_reset", user.id,
+                           f"password:{user.id}:{user.credential_version}")
         db.commit()
 
 
@@ -409,6 +427,8 @@ class MVPListingService:
             raise HTTPException(422, "Configure capacity through the activity details")
         if listing.category == "guide":
             raise HTTPException(422, "Manage guide inventory through the packages endpoint")
+        if listing.category == "artisan":
+            raise HTTPException(422, "Manage artisan products through the products endpoint")
         if listing.category in mvp_rental.RENTAL_CATEGORIES and (
             req.capacity != 1 or len(listing.units) >= 100
         ):
@@ -433,6 +453,8 @@ class MVPListingService:
     ) -> MVPAvailabilitySlot:
         listing = verification.owned(db, actor, listing_id, lock=True)
         verification.require_editable(listing)
+        if listing.category == "artisan":
+            raise HTTPException(422, "Artisan showcase listings do not accept bookings")
         unit = db.query(MVPInventoryUnit).filter(MVPInventoryUnit.id == req.unit_id, MVPInventoryUnit.listing_id == listing_id).first()
         if not unit:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory unit not found for this listing.")
@@ -521,6 +543,8 @@ class MVPBookingService:
             if provider_id is not None:
                 acquire_guide_booking_lock(db, f"mvp_tour_guide_provider_{provider_id}")
         listing = verification.locked_listing(db, req.listing_id)
+        if listing.category == "artisan":
+            raise HTTPException(422, "Artisan showcase listings do not accept bookings")
         if listing.category == "homestay":
             return mvp_homestay.book(
                 db, traveler, listing.id, req.starts_at, req.ends_at, req.quantity, req.request_key,
@@ -650,6 +674,7 @@ class MVPBookingService:
             occurred_at=now,
         )
         db.add(hist)
+        account.booking_event(db, booking)
         db.commit()
         db.refresh(booking)
         return booking
@@ -731,6 +756,7 @@ class MVPBookingService:
             occurred_at=now,
         )
         db.add(hist)
+        account.booking_event(db, booking, actor)
         db.commit()
         db.refresh(booking)
         return booking
@@ -776,6 +802,7 @@ def _provider_confirmed_payment(db, booking, req, method, payment_status):
         resolved_at=now if method == "simulated" else None,
     )
     db.add(payment)
+    account.payment_event(db, booking, payment)
     db.commit()
     db.refresh(payment)
     return payment
@@ -838,6 +865,7 @@ class MVPPaymentService:
             )
             db.add(hist)
 
+        account.payment_event(db, booking, payment)
         db.commit()
         db.refresh(payment)
         return payment
@@ -890,6 +918,7 @@ class MVPPaymentService:
             )
             db.add(hist)
 
+        account.payment_event(db, booking, payment)
         db.commit()
         db.refresh(payment)
         return payment
@@ -1089,59 +1118,3 @@ class MVPAdminService:
         db.commit()
         db.refresh(post)
         return post
-
-
-# ============================================================================
-# 8. AI Itinerary Service
-# ============================================================================
-class MVPAIItineraryService:
-    @staticmethod
-    def generate_itinerary(req: ItineraryRequest) -> ItineraryResponse:
-        dest = req.destination.strip().title()
-        days = req.duration_days
-        budget = req.budget_level
-
-        cost_multiplier = {"budget": Decimal("3500.00"), "moderate": Decimal("8500.00"), "luxury": Decimal("22000.00")}.get(budget, Decimal("8500.00"))
-
-        day_plans: list[ItineraryDayPlan] = []
-        templates = [
-            ("Arrival & Local Orientation", "Check in to approved local homestay; enjoy Ceylon tea", "Explore town center and local craft shops", "Traditional Sri Lankan rice and curry dinner", ["homestay", "guide"]),
-            ("Nature & Scenic Exploration", "Early morning sunrise hike or nature walk", "Scenic cycle ride through countryside or tea estates", "Stargazing and relaxation by the garden", ["bike", "adventure"]),
-            ("Heritage & Cultural Immersion", "Visit historic temple or colonial fortress", "Participate in local village cooking demonstration", "Evening cultural performance or lakeside sunset", ["guide", "homestay"]),
-            ("Adventure & Active Discovery", "Whitewater rafting, zip-lining, or canyoning", "Picnic lunch by waterfall pool", "Casual dinner at eco-cafe", ["adventure", "bike"]),
-            ("Wildlife & Coastal Relaxation", "Morning wildlife safari or coastal beach stroll", "Snorkeling, lagoon boat safari, or surfing lesson", "Fresh seafood beachside dinner", ["adventure", "guide"]),
-        ]
-
-        for d in range(1, days + 1):
-            tmpl_idx = (d - 1) % len(templates)
-            title, morning, afternoon, evening, categories = templates[tmpl_idx]
-            day_cost = cost_multiplier + Decimal(d * 250)
-            day_plans.append(
-                ItineraryDayPlan(
-                    day=d,
-                    title=f"{dest}: {title}",
-                    morning=f"Morning: {morning} in {dest}.",
-                    afternoon=f"Afternoon: {afternoon}.",
-                    evening=f"Evening: {evening}.",
-                    recommended_categories=categories,
-                    estimated_day_cost_lkr=day_cost,
-                )
-            )
-
-        total_cost = sum(p.estimated_day_cost_lkr for p in day_plans)
-        tips = [
-            f"Always verify provider ratings and licensed guides for activities in {dest}.",
-            "Carry cash in LKR for local roadside stalls and tuk-tuks.",
-            "Stay hydrated and respect local dress codes at cultural sites.",
-        ]
-
-        return ItineraryResponse(
-            destination=dest,
-            duration_days=days,
-            budget_level=budget,
-            currency="LKR",
-            total_estimated_cost_lkr=total_cost,
-            days=day_plans,
-            tips=tips,
-            generated_at=datetime.now(timezone.utc),
-        )

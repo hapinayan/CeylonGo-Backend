@@ -28,10 +28,11 @@ from app.schemas.mvp import (
     TokenResponse,
     UserLoginRequest,
     TravelerRegisterRequest,
-    UserResponse,
     VerifyResetTokenResponse,
 )
+from app.schemas.mvp_account import Profile
 from app.services import traveler_email_verification as traveler_verification
+from app.services.mvp_account import profile
 from app.services.mvp_services import MVPAuthService
 
 router = APIRouter(prefix="/auth", tags=["MVP Authentication"], route_class=SensitiveInputRoute)
@@ -147,9 +148,12 @@ def login(req: UserLoginRequest, db: Session = Depends(get_mvp_db)):
     return {"access_token": token, "token_type": "bearer", "user": user}
 
 
-@router.get("/me", response_model=UserResponse)
-def get_current_profile(current_user: MVPUser = Depends(get_current_mvp_user)):
-    return current_user
+@router.get("/me", response_model=Profile)
+def get_current_profile(
+    current_user: MVPUser = Depends(get_current_mvp_user),
+    db: Session = Depends(get_mvp_db),
+):
+    return profile(db, current_user)
 
 
 @router.post("/logout", status_code=status.HTTP_200_OK)

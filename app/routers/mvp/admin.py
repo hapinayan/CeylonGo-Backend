@@ -25,6 +25,14 @@ from app.schemas.mvp import (
     ProviderResponse,
 )
 from app.services.mvp_services import MVPAdminService
+from app.services import mvp_community as community_service
+from app.schemas.mvp_community import (
+    AdminCommunityCommentModerationPatch,
+    AdminCommunityPostModerationPatch,
+    AdminCommunityReportDecision,
+    CommunityPage,
+    CommunityReportDetails,
+)
 from app.schemas.provider_registration import DraftResponse
 from app.services import mvp_provider_registration as registration
 from app.services.mvp_provider_otp import PASSWORD_UNSET
@@ -130,8 +138,70 @@ def moderate_post(
     admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
-    post = MVPAdminService.moderate_community_post(db, admin, post_id, req)
-    return {"message": f"Post visibility updated to {post.visibility}.", "post_id": post.id}
+    post = community_service.admin_moderate_post(
+        db, admin=admin, post_id=post_id, visibility=req.visibility, reason=req.reason,
+    )
+    return {"message": f"Post visibility updated to {post.visibility}.", "post_id": post.id, "visibility": post.visibility}
+
+
+@router.patch("/community/posts/{post_id}")
+def admin_patch_post_visibility(
+    post_id: int,
+    req: AdminCommunityPostModerationPatch,
+    admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    post = community_service.admin_moderate_post(
+        db, admin=admin, post_id=post_id, visibility=req.visibility, reason=req.reason,
+    )
+    return {"message": f"Post visibility updated to {post.visibility}.", "post_id": post.id, "visibility": post.visibility}
+
+
+@router.patch("/community/comments/{comment_id}")
+def admin_moderate_comment(
+    comment_id: int,
+    req: AdminCommunityCommentModerationPatch,
+    admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    comment = community_service.admin_moderate_comment(db, admin=admin, comment_id=comment_id, payload=req)
+    return {"message": f"Comment visibility updated to {comment.visibility}.", "comment_id": comment.id, "visibility": comment.visibility}
+
+
+@router.delete("/community/comments/{comment_id}")
+def admin_delete_comment(
+    comment_id: int,
+    reason: str = Query("Removed by moderator", min_length=3, max_length=500),
+    admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    patch = AdminCommunityCommentModerationPatch(visibility="deleted", reason=reason)
+    comment = community_service.admin_moderate_comment(db, admin=admin, comment_id=comment_id, payload=patch)
+    return {"message": f"Comment visibility updated to {comment.visibility}.", "comment_id": comment.id, "visibility": comment.visibility}
+
+
+@router.get("/community/reports", response_model=CommunityPage[CommunityReportDetails])
+def admin_list_community_reports(
+    report_status: Literal["pending", "reviewed", "resolved", "dismissed"] | None = Query(None, alias="status"),
+    entity_type: Literal["post", "comment"] | None = None,
+    page: int = Query(1, ge=1, le=100000),
+    page_size: int = Query(20, ge=1, le=50),
+    _admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    return community_service.admin_list_reports(
+        db, report_status=report_status, entity_type=entity_type, page=page, page_size=page_size,
+    )
+
+
+@router.patch("/community/reports/{report_id}", response_model=CommunityReportDetails)
+def admin_review_community_report(
+    report_id: int,
+    req: AdminCommunityReportDecision,
+    admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    return community_service.admin_review_report(db, admin=admin, report_id=report_id, decision=req)
 
 
 @router.get("/audit-logs", response_model=list[AdminAuditLogResponse])

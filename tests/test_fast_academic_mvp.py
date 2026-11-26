@@ -5,6 +5,7 @@ Validates the entire 17+1 unified schema, FastAPI routers, business services, an
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database.mvp_session import get_mvp_db
 from app.main_mvp import create_mvp_app
-from app.models.mvp import MVPBase
+from app.models.mvp import MVPBase, MVPUser
 
 # 1. Setup in-memory SQLite database
 test_engine = create_engine(
@@ -452,9 +453,29 @@ def test_07_community_feed_and_moderation():
     assert r_mod.status_code == 200
 
 
-def test_08_ai_itinerary_generation():
+def test_08_ai_itinerary_generation(monkeypatch):
+    from app.core.mvp_security import create_mvp_access_token
+    from app.services import mvp_gemini
+
+    with TestingSessionLocal() as db:
+        user = MVPUser(email="oneshot@example.com", full_name="One-shot test",
+                       role="traveler", hashed_password="unused")
+        db.add(user)
+        db.commit()
+        token = create_mvp_access_token(user.id, user.email, user.role)
+    plan = {
+        "title": "Ella", "summary": "Three days", "travelers": 1, "budget_lkr": 25500,
+        "days": [{"day": index, "destination": "Ella", "morning": "Walk",
+                  "afternoon": "Explore", "evening": "Dinner", "transport": "Walk",
+                  "estimated_food_lkr": 1000, "estimated_transport_lkr": 100,
+                  "estimated_other_lkr": 0} for index in range(1, 4)],
+    }
+    monkeypatch.setattr(mvp_gemini, "generate", lambda *args, **kwargs: {
+        "parts": [{"text": json.dumps({"message": "Suggested itinerary", "itinerary": plan})}],
+    })
     r_itin = client.post(
         "/api/itinerary/generate",
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "destination": "Ella",
             "duration_days": 3,

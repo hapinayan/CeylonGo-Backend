@@ -78,7 +78,23 @@ def get_current_mvp_user(
             detail="Authentication credentials required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    payload = decode_mvp_token(auth.credentials)
+    user = _resolve_user_from_token(auth.credentials, db)
+    if user.role == "provider":
+        require_approved_provider(db, user)
+    return user
+
+
+def get_optional_mvp_user(
+    auth: HTTPAuthorizationCredentials | None = Depends(http_bearer),
+    db: Session = Depends(get_mvp_db),
+) -> MVPUser | None:
+    if not auth or not auth.credentials:
+        return None
+    return _resolve_user_from_token(auth.credentials, db)
+
+
+def _resolve_user_from_token(token: str, db: Session) -> MVPUser:
+    payload = decode_mvp_token(token)
     user_id = int(payload.get("sub", 0))
     user = db.query(MVPUser).filter(MVPUser.id == user_id).first()
     if not user or not user.is_active:
@@ -100,8 +116,6 @@ def get_current_mvp_user(
             detail="Credentials have been updated. Please log in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if user.role == "provider":
-        require_approved_provider(db, user)
     return user
 
 def require_mvp_role(*allowed_roles: str):

@@ -27,9 +27,12 @@ from app.routers.mvp import (
 )
 from app.routers.mvp.homestays import router as homestays_router
 from app.routers.mvp.activities import router as activities_router
+from app.routers.mvp.planner import router as planner_router
+from app.routers.mvp.artisans import router as artisans_router
 from app.routers.mvp.tour_guides import router as tour_guides_router
 from app.routers.mvp.rentals import router as rentals_router
 from app.routers.mvp.listing_management import router as listing_management_router
+from app.routers.mvp.account import router as account_router
 
 
 @asynccontextmanager
@@ -81,11 +84,14 @@ def create_mvp_app() -> FastAPI:
     # Mount unified MVP routers under both /api and /api/v1 for 100% client compatibility
     for prefix_base in ["/api", "/api/v1"]:
         app.include_router(auth_router, prefix=prefix_base)
+        app.include_router(account_router, prefix=prefix_base)
         app.include_router(providers_router, prefix=prefix_base)
         app.include_router(listings_router, prefix=prefix_base)
         app.include_router(bookings_router, prefix=prefix_base)
         app.include_router(homestays_router, prefix=prefix_base)
         app.include_router(activities_router, prefix=prefix_base)
+        app.include_router(planner_router, prefix=prefix_base)
+        app.include_router(artisans_router, prefix=prefix_base)
         app.include_router(tour_guides_router, prefix=prefix_base)
         app.include_router(rentals_router, prefix=prefix_base)
         app.include_router(listing_management_router, prefix=prefix_base)

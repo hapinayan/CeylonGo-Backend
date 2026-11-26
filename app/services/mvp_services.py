@@ -62,7 +62,9 @@ from app.schemas.mvp import (
     UserLoginRequest,
 )
 from app.services.mvp_provider_otp import PASSWORD_UNSET
-from app.services import mvp_homestay, mvp_listing_verification as verification
+from app.services.tour_guide_sync import acquire_guide_booking_lock
+from app.services import mvp_activity, mvp_guide, mvp_homestay, mvp_rental
+from app.services import mvp_listing_verification as verification
 
 
 # ============================================================================
@@ -383,7 +385,7 @@ class MVPListingService:
     def add_media(db: Session, user: MVPUser, listing_id: int, req: ListingMediaCreate) -> MVPListingMedia:
         listing = verification.owned(db, user, listing_id, lock=True)
         verification.require_editable(listing)
-        if req.storage_key.startswith(verification.PHOTO_PREFIX):
+        if listing.category == "adventure" or req.storage_key.startswith(verification.PHOTO_PREFIX):
             raise HTTPException(422, "Hosted photos must use the multipart upload endpoint")
         now = datetime.now(timezone.utc)
         media = MVPListingMedia(
@@ -403,6 +405,14 @@ class MVPListingService:
     def add_inventory_unit(db: Session, user: MVPUser, listing_id: int, req: InventoryUnitCreate) -> MVPInventoryUnit:
         listing = verification.owned(db, user, listing_id, lock=True)
         verification.require_editable(listing)
+        if listing.category == "adventure":
+            raise HTTPException(422, "Configure capacity through the activity details")
+        if listing.category == "guide":
+            raise HTTPException(422, "Manage guide inventory through the packages endpoint")
+        if listing.category in mvp_rental.RENTAL_CATEGORIES and (
+            req.capacity != 1 or len(listing.units) >= 100
+        ):
+            raise HTTPException(422, "Add each vehicle individually, up to 100 vehicles")
         if not req.label.strip() or (listing.category == "homestay" and req.capacity > 50):
             raise HTTPException(422, "Invalid room label or capacity")
         unit = MVPInventoryUnit(
@@ -428,6 +438,16 @@ class MVPListingService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inventory unit not found for this listing.")
 
         starts_at, ends_at = req.starts_at, req.ends_at
+        if listing.category == "adventure":
+            starts_at, ends_at = map(mvp_activity.slot_time, (starts_at, ends_at))
+            mvp_activity.validate_calendar(db, listing, unit, req, starts_at, ends_at)
+        if listing.category == "guide":
+            verification.require_schema(db)
+            starts_at, ends_at = map(mvp_activity.slot_time, (starts_at, ends_at))
+            mvp_guide.validate_calendar(db, unit, req, starts_at, ends_at)
+        if listing.category in mvp_rental.RENTAL_CATEGORIES:
+            starts_at, ends_at = map(mvp_activity.slot_time, (starts_at, ends_at))
+            mvp_rental.validate_calendar(db, unit, req, starts_at, ends_at)
         if listing.category == "homestay":
             if req.capacity > unit.capacity or not unit.is_active:
                 raise HTTPException(422, "Slot capacity must fit an active room")
@@ -493,34 +513,80 @@ class MVPListingService:
 class MVPBookingService:
     @staticmethod
     def create_booking(db: Session, traveler: MVPUser, req: BookingCreateRequest) -> MVPBooking:
+        if db.get_bind().dialect.name == "mssql":
+            # Serialize assignments across all guide listings belonging to one provider.
+            provider_id = db.query(MVPListing.provider_id).filter_by(
+                id=req.listing_id, category="guide",
+            ).scalar()
+            if provider_id is not None:
+                acquire_guide_booking_lock(db, f"mvp_tour_guide_provider_{provider_id}")
         listing = verification.locked_listing(db, req.listing_id)
         if listing.category == "homestay":
             return mvp_homestay.book(
                 db, traveler, listing.id, req.starts_at, req.ends_at, req.quantity, req.request_key,
             )
+        adventure = listing.category == "adventure"
+        guide = listing.category == "guide"
+        rental = listing.category in mvp_rental.RENTAL_CATEGORIES
+        scheduled = adventure or guide or rental
+        if rental and req.slot_id is not None:
+            raise HTTPException(422, "Rental inventory is selected by the server")
+        if scheduled:
+            previous = db.query(MVPBooking).filter_by(
+                traveler_id=traveler.id, request_key=req.request_key,
+            ).first()
+            if previous:
+                if (previous.listing_id == listing.id and previous.quantity == req.quantity
+                        and previous.slot_id == req.slot_id
+                        and previous.total_amount == req.expected_total
+                        and previous.starts_at == mvp_activity.slot_time(req.starts_at)
+                        and previous.ends_at == mvp_activity.slot_time(req.ends_at)):
+                    return previous
+                raise HTTPException(409, "Request key was used for a different booking")
         if not listing.is_active or listing.approval_status != "approved" or not verification.provider_eligible(listing):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Listing is not available for booking.")
 
-        if req.ends_at <= req.starts_at:
+        if not scheduled and req.ends_at <= req.starts_at:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking ends_at must be later than starts_at.")
 
         # Find matching open slots for this listing that overlap the requested range
-        slots = (
-            db.query(MVPAvailabilitySlot)
-            .filter(
-                MVPAvailabilitySlot.listing_id == listing.id,
-                MVPAvailabilitySlot.is_open == True,
-                MVPAvailabilitySlot.starts_at < req.ends_at,
-                MVPAvailabilitySlot.ends_at > req.starts_at,
+        total_amount = listing.price * Decimal(req.quantity)
+        booking_start, booking_end = req.starts_at, req.ends_at
+        if rental:
+            slots, total_amount, booking_start, booking_end = mvp_rental.booking_selection(
+                db, listing, req,
             )
-            .all()
-        )
+        elif guide:
+            slot, total_amount = mvp_guide.booking_selection(db, listing, req)
+            slots = [slot]
+            booking_start, booking_end = slot.starts_at, slot.ends_at
+        elif adventure:
+            slot = mvp_activity.booking_slot(db, listing, req)
+            slots = [slot]
+            booking_start, booking_end = slot.starts_at, slot.ends_at
+        else:
+            slots = (
+                db.query(MVPAvailabilitySlot)
+                .filter(
+                    MVPAvailabilitySlot.listing_id == listing.id,
+                    MVPAvailabilitySlot.is_open == True,
+                    MVPAvailabilitySlot.starts_at < req.ends_at,
+                    MVPAvailabilitySlot.ends_at > req.starts_at,
+                )
+                .all()
+            )
+        if adventure and db.query(MVPBooking.id).join(MVPBookingAllocation).filter(
+            MVPBooking.traveler_id == traveler.id,
+            MVPBookingAllocation.slot_id == slots[0].id,
+            MVPBookingAllocation.released_at.is_(None),
+        ).first():
+            raise HTTPException(409, "You already have a reservation for this activity slot")
 
         # Capacity check across all overlapping slots
         if not slots:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No available availability slots for the requested dates.")
 
-        for slot in slots:
+        for slot in ([] if scheduled else slots):
             # Sum unreleased allocations on this slot
             allocated = (
                 db.query(func.coalesce(func.sum(MVPBookingAllocation.quantity), 0))
@@ -537,7 +603,6 @@ class MVPBookingService:
                 )
 
         now = datetime.now(timezone.utc)
-        total_amount = listing.price * Decimal(req.quantity)
         request_hash = hashlib.sha256(f"{traveler.id}:{req.request_key}".encode("utf-8")).digest()
 
         booking = MVPBooking(
@@ -545,8 +610,8 @@ class MVPBookingService:
             traveler_id=traveler.id,
             request_key=req.request_key,
             request_hash=request_hash,
-            starts_at=req.starts_at,
-            ends_at=req.ends_at,
+            starts_at=booking_start,
+            ends_at=booking_end,
             quantity=req.quantity,
             total_amount=total_amount,
             currency="LKR",
@@ -555,7 +620,13 @@ class MVPBookingService:
             updated_at=now,
         )
         db.add(booking)
-        db.flush()  # Obtain booking.id
+        try:
+            db.flush()
+        except IntegrityError:
+            if not scheduled:
+                raise
+            db.rollback()
+            raise HTTPException(409, "Booking request conflicts with an existing booking") from None
 
         # Create allocations for each slot
         for slot in slots:
@@ -563,7 +634,7 @@ class MVPBookingService:
                 booking_id=booking.id,
                 slot_id=slot.id,
                 listing_id=listing.id,
-                quantity=req.quantity,
+                quantity=1 if rental else req.quantity,
                 reserved_at=now,
                 released_at=None,
             )
@@ -585,6 +656,12 @@ class MVPBookingService:
 
     @staticmethod
     def update_booking_status(db: Session, actor: MVPUser, booking_id: int, req: BookingStatusUpdateRequest) -> MVPBooking:
+        scheduled_listing_id = db.query(MVPBooking.listing_id).join(MVPListing).filter(
+            MVPBooking.id == booking_id,
+            MVPListing.category.in_(("adventure", "guide", "bike", "bicycle")),
+        ).scalar()
+        if scheduled_listing_id is not None:
+            verification.locked_listing(db, scheduled_listing_id)
         booking = _locked_booking(db, booking_id)
         if not booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
@@ -595,17 +672,31 @@ class MVPBookingService:
             actor.role == "provider" and actor.provider_profile
             and actor.provider_profile.id == booking.listing.provider_id
         )
+        rental = booking.listing.category in mvp_rental.RENTAL_CATEGORIES
+        scheduled = rental or booking.listing.category in {"adventure", "guide"}
+        if scheduled and target in {"confirmed", "rejected", "completed"} and not owns_listing:
+            raise HTTPException(403, "Only the owning provider can decide this booking")
         if not (
             owns_listing or actor.role == "admin" or
             (actor.id == booking.traveler_id and target == "cancelled")
         ):
             raise HTTPException(403, "Only the host can decide this booking")
-        if booking.listing.category == "homestay":
+        if booking.listing.category == "homestay" or scheduled:
             if target == "confirmed" and not any(
                 payment.status in {"unpaid", "demo_succeeded"} for payment in booking.payments
             ):
                 raise HTTPException(409, "Traveler must select a payment method first")
-            if target == "confirmed":
+            if target == "confirmed" and scheduled:
+                if (not booking.listing.is_active or booking.listing.approval_status != "approved"
+                        or not verification.provider_eligible(booking.listing)
+                        or booking.starts_at <= verification.now()):
+                    raise HTTPException(409, "The reservation cannot be confirmed")
+                if rental:
+                    mvp_rental.validate_confirmation(booking)
+                elif (booking.slot_id is None or not booking.allocations[0].slot.is_open
+                      or booking.allocations[0].released_at is not None):
+                    raise HTTPException(409, "The reservation cannot be confirmed")
+            elif target == "confirmed":
                 mvp_homestay.validate_confirmation(db, booking)
 
         # Transition validation per ck_booking_status_history_transitions
@@ -649,12 +740,16 @@ class MVPBookingService:
 # 5. Payment Service
 # ============================================================================
 def _locked_booking(db: Session, booking_id: int) -> MVPBooking | None:
+    if db.get_bind().dialect.name == "sqlite":
+        db.query(MVPBooking).filter(MVPBooking.id == booking_id).update(
+            {MVPBooking.updated_at: MVPBooking.updated_at}, synchronize_session=False,
+        )
     return db.query(MVPBooking).with_hint(
         MVPBooking, "WITH (UPDLOCK, HOLDLOCK)", dialect_name="mssql"
     ).filter(MVPBooking.id == booking_id).first()
 
 
-def _homestay_payment(db, booking, req, method, payment_status):
+def _provider_confirmed_payment(db, booking, req, method, payment_status):
     attempt_no = getattr(req, "attempt_no", None)
     previous = sorted(booking.payments, key=lambda item: item.attempt_no)
     for payment in previous:
@@ -694,11 +789,11 @@ class MVPPaymentService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
         if booking.traveler_id != traveler.id:
             raise HTTPException(403, "Only the booking traveler can select payment")
-        if booking.listing.category == "homestay":
+        if booking.listing.category in {"homestay", "adventure", "guide", "bike", "bicycle"}:
             if "simulate_outcome" not in req.model_fields_set:
                 raise HTTPException(422, "Specify the simulated payment outcome")
             outcome = "demo_succeeded" if req.simulate_outcome == "success" else "demo_failed"
-            return _homestay_payment(db, booking, req, "simulated", outcome)
+            return _provider_confirmed_payment(db, booking, req, "simulated", outcome)
 
         # Check single succeeded demo payment constraint
         existing_succeeded = db.query(MVPBookingPayment).filter(
@@ -754,8 +849,8 @@ class MVPPaymentService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
         if booking.traveler_id != traveler.id:
             raise HTTPException(403, "Only the booking traveler can select payment")
-        if booking.listing.category == "homestay":
-            return _homestay_payment(db, booking, req, "at_location", "unpaid")
+        if booking.listing.category in {"homestay", "adventure", "guide", "bike", "bicycle"}:
+            return _provider_confirmed_payment(db, booking, req, "at_location", "unpaid")
 
         # Check single unpaid payment constraint
         existing_unpaid = db.query(MVPBookingPayment).filter(
@@ -949,10 +1044,9 @@ class MVPAdminService:
         listing.decided_at = now
         listing.decision_reason = reason or None
         listing.updated_at = now
-        if req.approval_status == "approved":
-            listing.is_active = True
-        else:
-            listing.is_active = False
+        listing.is_active = (
+            decision == "approved" and listing.category not in {"adventure", "bike", "bicycle"}
+        )
 
         # Audit log (single subject: subject_listing_id)
         audit = MVPAdminAuditLog(

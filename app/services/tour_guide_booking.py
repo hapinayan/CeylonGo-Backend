@@ -21,7 +21,7 @@ import math
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, or_, text, true
+from sqlalchemy import and_, or_, true
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
@@ -52,6 +52,7 @@ from app.schemas.tour_guide import (
     TravelerBookingBucket,
 )
 from app.services.tour_guide_public import get_public_guide_or_404
+from app.services.tour_guide_sync import acquire_guide_booking_lock, package_subtotal
 
 PENDING_REQUEST_EXPIRY_HOURS = 24
 ACTIVE_OCCUPYING_STATUSES = ("confirmed", "in_progress")
@@ -74,28 +75,7 @@ def _commit(db: Session) -> None:
 
 
 def _acquire_guide_booking_lock(db: Session, guide_id: int) -> None:
-    """Acquire an exclusive transaction-scoped lock per tour guide on SQL Server."""
-    if db.bind is not None and db.bind.dialect.name == "mssql":
-        lock_result = db.execute(
-            text(
-                """
-                DECLARE @result INT;
-                EXEC @result = sp_getapplock
-                    @Resource = :resource,
-                    @LockMode = 'Exclusive',
-                    @LockOwner = 'Transaction',
-                    @LockTimeout = 10000;
-                SELECT @result;
-                """
-            ),
-            {"resource": f"tour_guide_booking_{guide_id}"},
-        ).scalar()
-        if lock_result is None or lock_result < 0:
-            db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Booking schedule is busy. Please retry in a moment.",
-            )
+    acquire_guide_booking_lock(db, f"tour_guide_booking_{guide_id}")
 
 
 # =============================================================================
@@ -510,12 +490,7 @@ def create_tour_guide_booking(
             )
         end_dt = start_dt + timedelta(hours=float(package.duration_hours))
         currency = package.currency
-        if package.pricing_type == "per_person":
-            total_price = (package.price * Decimal(payload.number_of_people)).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            )
-        else:
-            total_price = package.price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_price = package_subtotal(package.price, package.pricing_type, payload.number_of_people)
 
     elif payload.rate_type == "hourly":
         if guide.hourly_rate is None:

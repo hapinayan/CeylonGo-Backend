@@ -175,6 +175,9 @@ def save_to_wishlist(listing_id: int, db: DB, traveler: Traveler):
 
 @router.delete("/{listing_id}/wishlist", status_code=204)
 def remove_from_wishlist(listing_id: int, db: DB, traveler: Traveler):
+    listing = db.get(MVPListing, listing_id)
+    if listing is None or listing.category != "homestay":
+        return Response(status_code=204)
     entry = db.get(MVPHomestayWishlist, (traveler.id, listing_id))
     if entry is not None:
         entry.is_saved = False

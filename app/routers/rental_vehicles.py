@@ -50,6 +50,7 @@ from app.schemas.rental_vehicle import (
     VehicleInsuranceSummary,
     VehicleType,
 )
+from app.core.rental_pricing import rental_days
 
 
 router = APIRouter(
@@ -360,7 +361,10 @@ def get_rental_vehicle_categories(
         .all()
     )
     count_map = {c[0]: c[1] for c in counts}
+    return rental_category_items(count_map)
 
+
+def rental_category_items(count_map: dict[str, int]) -> list[RentalCategoryItem]:
     categories = [
         RentalCategoryItem(
             category="bike",
@@ -911,7 +915,7 @@ def calculate_rental_quote(
 
     duration_seconds = (return_at - pickup_at).total_seconds()
     duration_hours = round(duration_seconds / 3600.0, 2)
-    duration_days = max(1, int(ceil(duration_seconds / 86400.0)))
+    duration_days = rental_days(pickup_at, return_at)
 
     # Fetch active rate plans
     rate_plans = (

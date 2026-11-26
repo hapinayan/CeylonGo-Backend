@@ -4,15 +4,18 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from app.models.mvp import (
-    MVPAvailabilitySlot, MVPBooking, MVPBookingAllocation, MVPListing, MVPListingMedia,
+    MVPAvailabilitySlot, MVPBooking, MVPBookingAllocation, MVPInventoryUnit, MVPListing,
+    MVPListingMedia,
     MVPListingVerification,
 )
 from app.routers.provider_registration import get_upload_directory, validate_and_save_image
 from app.schemas.mvp import ListingResponse
+from app.schemas.mvp_activity import ActivityMetadata
+from app.schemas.mvp_guide import GuidePackageDetails
 from app.schemas.mvp_homestay import HomestayMetadata
 from app.schemas.mvp_listing_verification import ReviewListing, RoomDetails
 
@@ -40,6 +43,11 @@ def require_schema(db):
 
 
 def locked_listing(db, listing_id):
+    if db.get_bind().dialect.name == "sqlite":
+        # SQLite has no row-lock hint. Acquire the write lock before reading capacity.
+        db.execute(update(MVPListing).where(MVPListing.id == listing_id).values(
+            updated_at=MVPListing.updated_at
+        ))
     listing = db.scalar(select(MVPListing).where(MVPListing.id == listing_id).with_hint(
         MVPListing, "WITH (UPDLOCK, HOLDLOCK)", dialect_name="mssql"
     ))
@@ -104,6 +112,15 @@ def room_details(room, enabled=True):
     )
 
 
+def guide_package(unit):
+    data = json.loads(unit.room_metadata or "{}").get("guide_package")
+    if data is None:
+        return None
+    return GuidePackageDetails(
+        **data, id=unit.id, title=unit.label, max_people=unit.capacity, is_active=unit.is_active,
+    )
+
+
 def review(db, listing):
     content = details(db, listing)
     # The object key never leaves the server.
@@ -111,6 +128,11 @@ def review(db, listing):
         {key: value for key, value in item.items() if key != "key"}
         for item in content.get("files", []) if not item.get("removed")
     ]
+    if listing.category == "guide":
+        content["packages"] = [
+            package.model_dump(mode="json") for unit in sorted(listing.units, key=lambda unit: unit.id)
+            if (package := guide_package(unit)) is not None
+        ]
     result = ListingResponse.model_validate(listing)
     visible = {photo.id for photo in visible_media(listing)}
     result.media = [item for item in result.media if item.id in visible]
@@ -118,7 +140,8 @@ def review(db, listing):
         "more_evidence_required" if listing.approval_status == "evidence" else listing.approval_status
     )
     return ReviewListing(
-        listing=result, details=content, rooms=[room_details(unit) for unit in listing.units],
+        listing=result, details=content,
+        rooms=[room_details(unit) for unit in listing.units] if listing.category != "guide" else [],
         homestay_metadata=(
             HomestayMetadata.model_validate_json(listing.homestay_metadata or "{}")
             if listing.category == "homestay" else None
@@ -151,6 +174,9 @@ def update_draft(db, listing, payload):
             raise HTTPException(409, "Category cannot change after inventory or bookings exist")
         listing.category = payload.category
         listing.homestay_metadata = None
+        data.pop("activity", None)
+        data.pop("guide", None)
+        data.pop("rental", None)
         material = True
     for key in ("title", "description", "district", "locality", "latitude", "longitude", "price"):
         if key not in fields:
@@ -173,6 +199,47 @@ def update_draft(db, listing, payload):
             raise HTTPException(422, "Cover photo must belong to this listing")
         material = True
         listing.homestay_metadata = payload.metadata.model_dump_json()
+    if "activity" in fields:
+        if listing.category != "adventure" or payload.activity is None:
+            raise HTTPException(422, "Activity details require an Adventure listing")
+        config = payload.activity
+        previous = data.get("activity", {})
+        material |= any(previous.get(key) != value for key, value in fields["activity"].items()
+                        if key not in {"min_participants", "max_participants"})
+        if len(listing.units) > 1:
+            raise HTTPException(409, "Activity scheduling requires one inventory unit")
+        if db.scalar(select(MVPAvailabilitySlot.id).where(
+            MVPAvailabilitySlot.listing_id == listing.id,
+            MVPAvailabilitySlot.starts_at > now(),
+            MVPAvailabilitySlot.capacity > config.max_participants,
+        ).limit(1)) is not None:
+            raise HTTPException(409, "Reduce future slot capacity before reducing group capacity")
+        if listing.units:
+            listing.units[0].capacity = config.max_participants
+            listing.units[0].is_active = True
+        else:
+            listing.units.append(MVPInventoryUnit(
+                provider_id=listing.provider_id, label="Activity group",
+                capacity=config.max_participants, is_active=True,
+            ))
+        data["activity"] = fields["activity"]
+    if "guide" in fields:
+        if listing.category != "guide" or payload.guide is None:
+            raise HTTPException(422, "Guide profile details require a Tour Guide listing")
+        guide = payload.guide.model_dump(mode="json")
+        material |= data.get("guide") != guide
+        data["guide"] = guide
+    if "rental" in fields:
+        if listing.category not in {"bike", "bicycle"} or payload.rental is None:
+            raise HTTPException(422, "Vehicle details require a rental listing")
+        motorized_subtype = payload.rental.subtype in {"motorcycle", "scooter"}
+        if motorized_subtype != (listing.category == "bike"):
+            raise HTTPException(422, "Vehicle subtype does not match the rental category")
+        if listing.category == "bicycle" and payload.rental.transmission == "automatic":
+            raise HTTPException(422, "Choose a supported bicycle transmission")
+        rental = payload.rental.model_dump(mode="json")
+        material |= data.get("rental") != rental
+        data["rental"] = rental
     for key in ("province", "address", "house_rules", "check_in_time", "check_out_time", "contact"):
         if key in fields:
             material |= data.get(key) != fields[key]
@@ -227,6 +294,8 @@ def upload_evidence(db, listing, file, kind, redacted):
         raise HTTPException(409, "Evidence file limit reached")
     if kind == "customer_feedback" and not redacted:
         raise HTTPException(422, "Confirm customer personal information has been redacted")
+    if kind in {"activity_photo", "vehicle_photo"} and file.content_type == "application/pdf":
+        raise HTTPException(422, "Photo evidence must be an image")
     media_type = "image"
     if kind == "video" or file.content_type == "application/pdf":
         limit = (25 if kind == "video" else 10) * 1024 * 1024
@@ -278,6 +347,23 @@ def validate_submission(db, listing):
     else:
         if listing.price <= 0:
             raise HTTPException(422, "Set a positive LKR service price")
+        if listing.category == "adventure":
+            if not data.get("activity"):
+                raise HTTPException(422, "Complete the activity category and scheduling details")
+            activity = ActivityMetadata.model_validate(data["activity"])
+            if not activity.safety_instructions:
+                raise HTTPException(422, "Provide activity safety instructions")
+        if listing.category == "guide" and (
+            not data.get("guide") or not any(
+                unit.is_active and guide_package(unit) is not None
+                for unit in listing.units
+            )
+        ):
+            raise HTTPException(422, "Complete the guide profile and add an active package")
+        if listing.category in {"bike", "bicycle"} and not (
+            data.get("rental") and any(unit.is_active and unit.capacity == 1 for unit in listing.units)
+        ):
+            raise HTTPException(422, "Complete rental details and add a vehicle to the fleet")
         expected = EVIDENCE_REQUIRED.get(listing.category, set())
         supplied = {item["kind"] for item in data.get("files", []) if not item.get("removed")}
         if expected and not supplied.intersection(expected) and not str(data.get("notes", "")).strip():

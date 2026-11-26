@@ -5,12 +5,18 @@ from typing import Literal
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.mvp import ListingResponse, ServiceCategory
-from app.schemas.mvp_homestay import HomestayMetadata, HomestayRoom as RoomDetails
+from app.schemas.mvp_activity import ActivityMetadata
+from app.schemas.mvp_guide import GuideProfile
+from app.schemas.mvp_rental import RentalMetadata
+from app.schemas.mvp_homestay import (
+    HomestayBookingDetails, HomestayMetadata, HomestayRoom as RoomDetails,
+)
 
 LinkKind = Literal["maps", "facebook", "instagram", "website", "booking_com", "airbnb", "video", "other"]
 FileKind = Literal[
     "customer_feedback", "business_certificate", "ownership", "authorization",
-    "video", "safety", "credentials", "license", "workshop", "other",
+    "video", "safety", "credentials", "license", "workshop", "activity_photo", "other",
+    "vehicle_registration", "insurance", "vehicle_photo",
 ]
 
 
@@ -32,6 +38,9 @@ class ListingDraftUpdate(BaseModel):
     check_out_time: time | None = None
     contact: str | None = Field(None, max_length=120)
     metadata: HomestayMetadata | None = None
+    activity: ActivityMetadata | None = None
+    guide: GuideProfile | None = None
+    rental: RentalMetadata | None = None
 
 
 class EvidenceLink(BaseModel):
@@ -96,3 +105,15 @@ class ListingDecisionHistory(BaseModel):
     reason: str
     occurred_at: datetime
     decision: str | None
+
+
+class TravelerContact(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    full_name: str
+    email: str
+    phone: str | None
+
+
+class ProviderBookingDetails(HomestayBookingDetails):
+    traveler_contact: TravelerContact | None = None

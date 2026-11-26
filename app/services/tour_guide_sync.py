@@ -18,11 +18,13 @@ import os
 import re
 import uuid
 from datetime import date, datetime, time
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
 from PIL import Image, UnidentifiedImageError
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.provider_profile import ProviderProfile
@@ -63,6 +65,34 @@ GUIDE_CATEGORIES: tuple[dict[str, str], ...] = (
 GUIDE_CATEGORY_BY_SLUG: dict[str, dict[str, str]] = {
     item["slug"]: item for item in GUIDE_CATEGORIES
 }
+
+
+def package_subtotal(price: Decimal, pricing_type: str, number_of_people: int) -> Decimal:
+    quantity = number_of_people if pricing_type == "per_person" else 1
+    return (price * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def acquire_guide_booking_lock(db: Session, resource: str) -> None:
+    """Serialize guide assignments for the lifetime of a SQL Server transaction."""
+    if db.get_bind().dialect.name != "mssql":
+        return
+    result = db.execute(
+        text(
+            """
+            DECLARE @result INT;
+            EXEC @result = sp_getapplock
+                @Resource = :resource,
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Transaction',
+                @LockTimeout = 10000;
+            SELECT @result;
+            """
+        ),
+        {"resource": resource},
+    ).scalar()
+    if result is None or result < 0:
+        db.rollback()
+        raise HTTPException(503, "Booking schedule is busy. Please retry in a moment.")
 
 # Accepted aliases (case-insensitive) mapped to canonical slug
 _CATEGORY_ALIAS_TO_SLUG: dict[str, str] = {}

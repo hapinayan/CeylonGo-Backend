@@ -345,6 +345,31 @@ class MVPBooking(MVPBase):
     status_history: Mapped[list["MVPBookingStatusHistory"]] = relationship("MVPBookingStatusHistory", back_populates="booking")
     payments: Mapped[list["MVPBookingPayment"]] = relationship("MVPBookingPayment", back_populates="booking")
 
+    @property
+    def booking_reference(self):
+        prefix = {
+            "adventure": "ACT", "guide": "GUIDE", "bike": "RENT", "bicycle": "RENT",
+        }.get(self.listing.category)
+        return f"{prefix}-{self.id}" if prefix else None
+
+    @property
+    def slot_id(self):
+        if self.listing.category in {"adventure", "guide"} and len(self.allocations) == 1:
+            return self.allocations[0].slot_id
+        return None
+
+    @property
+    def package_id(self):
+        if self.listing.category == "guide" and len(self.allocations) == 1:
+            return self.allocations[0].slot.unit_id
+        return None
+
+    @property
+    def rental_unit_ids(self):
+        if self.listing.category in {"bike", "bicycle"}:
+            return sorted({item.slot.unit_id for item in self.allocations})
+        return None
+
 
 # ============================================================================
 # 11. booking_allocations

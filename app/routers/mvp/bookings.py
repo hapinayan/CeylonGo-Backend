@@ -8,11 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.core.mvp_security import get_current_mvp_user, require_mvp_role
 from app.database.mvp_session import get_mvp_db
-from app.models.mvp import MVPBooking, MVPUser
+from app.models.mvp import MVPBooking, MVPListing, MVPUser
 from app.schemas.mvp import (
     BookingCreateRequest,
+    BookingDetailResponse,
     BookingResponse,
     BookingStatusUpdateRequest,
+    ServiceCategory,
 )
 from app.services.mvp_services import MVPBookingService
 
@@ -35,14 +37,17 @@ def get_my_bookings(
     db: Session = Depends(get_mvp_db),
     limit: int = Query(50, ge=1, le=100),
     before_id: int | None = Query(None, gt=0),
+    category: ServiceCategory | None = None,
 ):
     query = db.query(MVPBooking).filter(MVPBooking.traveler_id == current_user.id)
+    if category:
+        query = query.join(MVPListing).filter(MVPListing.category == category)
     if before_id is not None:
         query = query.filter(MVPBooking.id < before_id)
     return query.order_by(MVPBooking.id.desc()).limit(limit).all()
 
 
-@router.get("/{booking_id}", response_model=BookingResponse)
+@router.get("/{booking_id}", response_model=BookingDetailResponse)
 def get_booking(
     booking_id: int,
     current_user: MVPUser = Depends(get_current_mvp_user),

@@ -13,15 +13,18 @@ from app.models.mvp import (
     MVPUser,
 )
 from app.schemas.mvp import (
-    AvailabilitySlotCreate, AvailabilitySlotResponse, ListingCreateRequest, ListingMediaResponse,
-    ServiceCategory,
+    AvailabilitySlotCreate, AvailabilitySlotResponse, InventoryUnitCreate, InventoryUnitResponse,
+    ListingCreateRequest, ListingMediaResponse, ServiceCategory,
 )
 from app.schemas.mvp_homestay import HomestayBookingDetails
 from app.schemas.mvp_listing_verification import (
     AdminReviewListing, EvidenceFileResponse, EvidenceUpdate, FileKind, ListingDecisionHistory,
-    ListingDraftUpdate, ReviewListing, RoomDetails, RoomUpdate,
+    ListingDraftUpdate, ProviderBookingDetails, ReviewListing, RoomDetails, RoomUpdate,
+    TravelerContact,
 )
-from app.services import mvp_homestay, mvp_listing_verification as service
+from app.schemas.mvp_rental import RentalUnitUpdate
+from app.services import mvp_activity, mvp_guide, mvp_homestay, mvp_rental
+from app.services import mvp_listing_verification as service
 from app.services.mvp_services import MVPListingService
 
 router = APIRouter(tags=["MVP Listing Management and Verification"])
@@ -51,11 +54,14 @@ def create_listing(payload: ListingCreateRequest, db: DB, provider: Provider):
 
 @router.get("/provider/listings", response_model=list[ReviewListing])
 def provider_listings(db: DB, provider: Provider, limit: int = Query(25, ge=1, le=100),
-                      offset: int = Query(0, ge=0)):
+                      offset: int = Query(0, ge=0), category: ServiceCategory | None = None):
     service.require_schema(db)
-    items = db.scalars(select(MVPListing).where(
+    query = select(MVPListing).where(
         MVPListing.provider_id == provider.provider_profile.id
-    ).order_by(MVPListing.id.desc()).offset(offset).limit(limit))
+    )
+    if category:
+        query = query.where(MVPListing.category == category)
+    items = db.scalars(query.order_by(MVPListing.id.desc()).offset(offset).limit(limit))
     return [service.review(db, item) for item in items]
 
 
@@ -286,6 +292,34 @@ def update_room(listing_id: int, room_id: int, payload: RoomUpdate, db: DB, prov
     return _save_room(db, listing, payload, room)
 
 
+@router.post("/provider/listings/{listing_id}/units",
+             response_model=InventoryUnitResponse, status_code=201)
+def add_rental_unit(listing_id: int, payload: InventoryUnitCreate, db: DB, provider: Provider):
+    listing = _owned(db, provider, listing_id)
+    if listing.category not in mvp_rental.RENTAL_CATEGORIES:
+        raise HTTPException(404, "Rental listing not found")
+    return MVPListingService.add_inventory_unit(
+        db, user=provider, listing_id=listing_id, req=payload,
+    )
+
+
+@router.patch("/provider/listings/{listing_id}/units/{unit_id}",
+              response_model=InventoryUnitResponse)
+def update_rental_unit(listing_id: int, unit_id: int, payload: RentalUnitUpdate,
+                       db: DB, provider: Provider):
+    listing = _owned(db, provider, listing_id)
+    service.require_editable(listing)
+    unit = db.get(MVPInventoryUnit, unit_id)
+    if (listing.category not in mvp_rental.RENTAL_CATEGORIES
+            or unit is None or unit.listing_id != listing_id or unit.capacity != 1):
+        raise HTTPException(404, "Rental vehicle inventory unit not found")
+    if not payload.is_active and service.room_has_reservation(db, unit):
+        raise HTTPException(409, "Vehicle has an existing reservation")
+    unit.label, unit.is_active = payload.label, payload.is_active
+    service.commit(db)
+    return unit
+
+
 @router.get("/provider/listings/{listing_id}/availability", response_model=list[AvailabilitySlotResponse])
 def calendar(listing_id: int, db: DB, provider: Provider, limit: int = Query(50, ge=1, le=100),
              offset: int = Query(0, ge=0)):
@@ -309,10 +343,20 @@ def edit_slot(listing_id: int, slot_id: int, payload: AvailabilitySlotCreate, db
     slot = db.get(MVPAvailabilitySlot, slot_id)
     if not slot or slot.listing_id != listing_id:
         raise HTTPException(404, "Availability slot not found")
-    start, end = map(mvp_homestay.utc_naive, (payload.starts_at, payload.ends_at))
+    normalize = (
+        mvp_activity.slot_time if listing.category in {"adventure", "guide", "bike", "bicycle"}
+        else mvp_homestay.utc_naive
+    )
+    start, end = map(normalize, (payload.starts_at, payload.ends_at))
     if payload.unit_id != slot.unit_id or end <= start or payload.capacity > slot.unit.capacity:
         raise HTTPException(422, "Invalid calendar dates, room or capacity")
-    if ((start, end) != (slot.starts_at, slot.ends_at) or not payload.is_open or payload.capacity < slot.capacity) and (
+    if listing.category == "guide":
+        mvp_guide.validate_calendar(db, slot.unit, payload, start, end, slot)
+    if listing.category in mvp_rental.RENTAL_CATEGORIES:
+        mvp_rental.validate_calendar(db, slot.unit, payload, start, end, slot)
+    elif listing.category == "adventure":
+        mvp_activity.validate_calendar(db, listing, slot.unit, payload, start, end, slot)
+    elif ((start, end) != (slot.starts_at, slot.ends_at) or not payload.is_open or payload.capacity < slot.capacity) and (
         service.room_has_reservation(db, slot.unit, start=slot.starts_at, end=slot.ends_at)
         or (not payload.is_open and service.room_has_reservation(db, slot.unit, start=start, end=end))
     ):
@@ -325,23 +369,32 @@ def edit_slot(listing_id: int, slot_id: int, payload: AvailabilitySlotCreate, db
 @router.get("/provider/bookings", response_model=list[HomestayBookingDetails])
 def provider_bookings(db: DB, provider: Provider, status: Literal[
     "pending", "confirmed", "completed", "cancelled", "rejected"
-] | None = None, limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
+] | None = None, limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0),
+    category: ServiceCategory | None = None):
     query = select(MVPBooking).join(MVPListing).where(MVPListing.provider_id == provider.provider_profile.id)
     if status:
         query = query.where(MVPBooking.status == status)
+    if category:
+        query = query.where(MVPListing.category == category)
     return [mvp_homestay.booking_details(item) for item in db.scalars(
         query.order_by(MVPBooking.id.desc()).offset(offset).limit(limit)
     )]
 
 
-@router.get("/provider/bookings/{booking_id}", response_model=HomestayBookingDetails)
+@router.get("/provider/bookings/{booking_id}", response_model=ProviderBookingDetails)
 def provider_booking(booking_id: int, db: DB, provider: Provider):
     booking = db.scalar(select(MVPBooking).join(MVPListing).where(
         MVPBooking.id == booking_id, MVPListing.provider_id == provider.provider_profile.id
     ))
     if not booking:
         raise HTTPException(404, "Booking not found")
-    return mvp_homestay.booking_details(booking)
+    return ProviderBookingDetails(
+        **mvp_homestay.booking_details(booking).model_dump(),
+        traveler_contact=(TravelerContact.model_validate(booking.traveler)
+                          if booking.listing.category in {
+                              "adventure", "guide", "bike", "bicycle",
+                          } else None),
+    )
 
 
 @router.get("/admin/listings", response_model=list[ReviewListing])

@@ -228,6 +228,9 @@ def booking_details(booking: MVPBooking) -> HomestayBookingDetails:
         ends_at=utc_naive(booking.ends_at).replace(tzinfo=UTC),
         quantity=booking.quantity, total_amount=booking.total_amount, currency=booking.currency,
         status=booking.status, created_at=utc_naive(booking.created_at).replace(tzinfo=UTC),
+        booking_reference=booking.booking_reference, slot_id=booking.slot_id,
+        package_id=booking.package_id,
+        rental_unit_ids=booking.rental_unit_ids,
         room_ids=sorted({item.slot.unit_id for item in booking.allocations}),
         payments=sorted(booking.payments, key=lambda item: item.attempt_no),
     )

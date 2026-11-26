@@ -3,10 +3,10 @@ CeylonGo Academic MVP — Pydantic Request & Response Schemas
 Type-safe API contracts for Traveler, Provider, Admin, Listings, Bookings, Payments, Community, and AI Itinerary.
 """
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
 
 from app.schemas.auth import RegisterRequest
 
@@ -245,6 +245,10 @@ class BookingCreateRequest(BaseModel):
     ends_at: datetime
     quantity: int = Field(1, gt=0)
     request_key: str = Field(..., min_length=10, max_length=36)
+    slot_id: int | None = Field(None, gt=0)
+    expected_total: Decimal | None = Field(None, gt=0, max_digits=12, decimal_places=2)
+    motorcycle_license_confirmed: bool = False
+    license_valid_until: date | None = None
 
 
 class BookingStatusUpdateRequest(BaseModel):
@@ -266,12 +270,24 @@ class BookingResponse(BaseModel):
     currency: str
     status: str
     created_at: datetime
+    booking_reference: str | None = None
+    slot_id: int | None = None
+    package_id: int | None = None
+    rental_unit_ids: list[int] | None = None
+
+    @field_serializer("starts_at", "ends_at", "created_at")
+    def serialize_booking_time(self, value: datetime) -> datetime:
+        if self.booking_reference and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 # ============================================================================
 # 5. Payments
 # ============================================================================
 class SimulatedPaymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     booking_id: int
     request_key: str = Field(..., min_length=10, max_length=36)
     attempt_no: int = Field(1, ge=1)
@@ -279,6 +295,8 @@ class SimulatedPaymentRequest(BaseModel):
 
 
 class AtLocationPaymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     booking_id: int
     request_key: str = Field(..., min_length=10, max_length=36)
 
@@ -296,6 +314,10 @@ class PaymentResponse(BaseModel):
     currency: str
     created_at: datetime
     resolved_at: datetime | None = None
+
+
+class BookingDetailResponse(BookingResponse):
+    payments: list[PaymentResponse]
 
 
 # ============================================================================

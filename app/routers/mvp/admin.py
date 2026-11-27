@@ -108,14 +108,17 @@ def _review_profile(db, provider_id):
     return profile
 
 
-@router.get("/providers/{provider_id}", response_model=DraftResponse)
+@router.get("/providers/{provider_id}", response_model=AdminProviderApplication)
 def get_provider_details(
     provider_id: int,
     _admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
     profile = _review_profile(db, provider_id)
-    return registration.draft_response(profile.user.email, profile)
+    return AdminProviderApplication(
+        **registration.draft_response(profile.user.email, profile).model_dump(),
+        profile_change=registration.draft_data(profile).get("profile_change"),
+    )
 
 
 @router.get("/providers/{provider_id}/application", response_model=AdminProviderApplication)

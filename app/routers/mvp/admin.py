@@ -8,7 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, undefer
 
 from app.core.mvp_security import require_mvp_role
 from app.core.email import send_provider_approval_email
@@ -33,14 +33,15 @@ from app.schemas.mvp_community import (
     CommunityPage,
     CommunityReportDetails,
 )
-from app.schemas.provider_registration import DraftResponse
+from app.schemas.mvp_provider_account import AdminProviderApplication, AdminProviderSummary
 from app.services import mvp_provider_registration as registration
+from app.services import mvp_provider_account as provider_account
 from app.services.mvp_provider_otp import PASSWORD_UNSET
 
 router = APIRouter(prefix="/admin", tags=["MVP Admin Operations"])
 
 
-@router.get("/providers", response_model=list[ProviderResponse])
+@router.get("/providers", response_model=list[AdminProviderSummary])
 def list_provider_applications(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -51,7 +52,8 @@ def list_provider_applications(
     db: Session = Depends(get_mvp_db),
 ):
     try:
-        query = db.query(MVPProviderProfile)
+        registration.require_draft_storage(db)
+        query = db.query(MVPProviderProfile).options(undefer(MVPProviderProfile.registration_details))
         if status and status != "all":
             query = query.filter(MVPProviderProfile.verification_status == status)
         else:
@@ -66,7 +68,7 @@ def list_provider_applications(
             )
 
         profiles = query.order_by(MVPProviderProfile.id.desc()).offset(offset).limit(limit).all()
-        results: list[ProviderResponse] = []
+        results: list[AdminProviderSummary] = []
         for p in profiles:
             item = ProviderResponse.model_validate(p)
             if getattr(p, "user", None):
@@ -74,6 +76,7 @@ def list_provider_applications(
                 item.full_name = p.user.full_name
                 item.role = p.user.role
                 item.is_active = p.user.is_active
+            draft_info = {}
             try:
                 draft_info = registration.draft_data(p)
                 item.provider_type = draft_info.get("provider_type")
@@ -81,12 +84,17 @@ def list_provider_applications(
                 pass
             if category and category != "all" and item.provider_type != category:
                 continue
-            results.append(item)
+            summary_item = AdminProviderSummary(
+                **item.model_dump(),
+                profile_change_pending=(
+                    draft_info.get("profile_change", {}).get("status") == "pending"
+                ),
+            )
+            results.append(summary_item)
         return results
     except Exception as exc:
         db.rollback()
         msg = str(exc).lower()
-        # Fall back to empty list only if there's a schema mismatch in offline/hybrid test fixtures
         if any(pattern in msg for pattern in ["no such table", "no such column", "invalid column", "does not exist"]):
             return []
         raise HTTPException(status_code=500, detail="Database error retrieving provider applications")
@@ -110,14 +118,17 @@ def get_provider_details(
     return registration.draft_response(profile.user.email, profile)
 
 
-@router.get("/providers/{provider_id}/application", response_model=DraftResponse)
+@router.get("/providers/{provider_id}/application", response_model=AdminProviderApplication)
 def provider_application(
     provider_id: int,
     _admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
     profile = _review_profile(db, provider_id)
-    return registration.draft_response(profile.user.email, profile)
+    return AdminProviderApplication(
+        **registration.draft_response(profile.user.email, profile).model_dump(),
+        profile_change=registration.draft_data(profile).get("profile_change"),
+    )
 
 
 @router.get("/providers/{provider_id}/identity/{document}")
@@ -156,6 +167,10 @@ def decide_provider(
     admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
+    if req.profile_change_request_id is not None:
+        if req.verification_status not in {"approved", "rejected"}:
+            raise HTTPException(422, "Profile changes can only be approved or rejected")
+        return provider_account.review_change(db, admin, provider_id, req)
     candidate = db.get(MVPProviderProfile, provider_id)
     if not candidate:
         raise HTTPException(404, "Provider profile not found.")

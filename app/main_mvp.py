@@ -63,14 +63,27 @@ def create_mvp_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Configure CORS for Angular and Flutter clients
-    allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+    # Configure CORS for Angular and Flutter clients (no wildcard origins)
+    default_origins = (
+        "http://localhost:4200,"
+        "http://127.0.0.1:4200,"
+        "http://localhost:4201,"
+        "http://127.0.0.1:4201,"
+        "http://localhost:8420,"
+        "http://127.0.0.1:8420"
+    )
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", default_origins).split(",")
+        if origin.strip() and origin.strip() != "*"
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Wallet-Event", "Retry-After"],
     )
 
     # Health & Meta endpoints

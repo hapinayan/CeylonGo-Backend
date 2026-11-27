@@ -53,7 +53,8 @@ class PasswordChange(Input):
 
 Interest = Literal["culture", "adventure", "wildlife", "nature", "eco_tourism",
                    "local_food", "heritage", "beaches", "village_experiences",
-                   "artisan_handicrafts", "cycling"]
+                   "artisan_handicrafts", "cycling", "mountains_hiking",
+                   "photography", "relaxation"]
 Accommodation = Literal["homestay", "guesthouse", "hotel", "hostel", "other"]
 Transport = Literal["walking", "bicycle", "motorbike", "scooter", "public_transport", "other"]
 Style = Literal["budget", "adventure", "cultural", "family", "relaxation", "local_experiences"]

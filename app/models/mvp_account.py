@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Unicode, UnicodeText
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Unicode, UnicodeText, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.mvp import MVPBase
@@ -8,6 +8,7 @@ from app.models.mvp import MVPBase
 
 class TravelerSettings(MVPBase):
     __tablename__ = "traveler_settings"
+    __mapper_args__ = {"eager_defaults": False}
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     country: Mapped[str | None] = mapped_column(Unicode(80))
@@ -19,6 +20,9 @@ class TravelerSettings(MVPBase):
     payment_updates: Mapped[bool] = mapped_column(Boolean, default=True)
     community_activity: Mapped[bool] = mapped_column(Boolean, default=True)
     promotional_updates: Mapped[bool] = mapped_column(Boolean, default=False)
+    behavioral_personalization: Mapped[bool] = mapped_column(
+        Boolean, deferred=True, server_default=text("0"),
+    )
 
 
 class Notification(MVPBase):

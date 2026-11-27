@@ -36,6 +36,7 @@ from app.routers.mvp.account import router as account_router
 from app.routers.mvp.provider_account import router as provider_account_router
 from app.routers.mvp.wallet import router as wallet_router
 from app.routers.mvp.map import router as map_router
+from app.routers.mvp.recommendations import router as recommendations_router
 from app.routers.weather import router as weather_router
 
 
@@ -120,6 +121,7 @@ def create_mvp_app() -> FastAPI:
 
     app.include_router(wallet_router, prefix="/api/v1")
     app.include_router(map_router, prefix="/api/v1")
+    app.include_router(recommendations_router, prefix="/api/v1")
     app.include_router(weather_router)
 
     return app

@@ -3,7 +3,7 @@ CeylonGo Academic MVP — Unified Bookings Router
 Endpoints for Booking Creation with Atomic Slot Allocation, Status Transitions, and Traveler Booking History.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.mvp_security import get_current_mvp_user, require_mvp_role
@@ -67,8 +67,11 @@ def get_booking(
 def update_booking_status(
     booking_id: int,
     req: BookingStatusUpdateRequest,
+    response: Response,
     current_user: MVPUser = Depends(get_current_mvp_user),
     db: Session = Depends(get_mvp_db),
 ):
     booking = MVPBookingService.update_booking_status(db, current_user, booking_id, req)
+    if booking.wallet_event and current_user.role == "provider":
+        response.headers["X-Wallet-Event"] = booking.wallet_event
     return booking

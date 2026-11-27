@@ -58,11 +58,13 @@ from app.schemas.mvp import (
     SimulatedPaymentRequest,
     UserLoginRequest,
 )
+from app.schemas.provider_auth import validate_provider_password_strength
 from app.services.mvp_provider_otp import PASSWORD_UNSET
 from app.services.tour_guide_sync import acquire_guide_booking_lock
 from app.services import mvp_activity, mvp_guide, mvp_homestay, mvp_rental
 from app.services import mvp_listing_verification as verification
 from app.services import mvp_account as account
+from app.services import mvp_wallet as wallet_service
 
 
 # ============================================================================
@@ -270,6 +272,14 @@ class MVPAuthService:
         db.refresh(reset)
         if reset.used_at is not None:
             raise HTTPException(400, "Invalid, expired, or previously used password reset token.")
+
+        if user.role == "provider":
+            if not user.is_active or user.hashed_password == PASSWORD_UNSET:
+                raise HTTPException(400, "Password reset is unavailable for this account.")
+            try:
+                validate_provider_password_strength(req.new_password)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
 
         db.query(MVPPasswordReset).filter(
             MVPPasswordReset.user_id == user.id, MVPPasswordReset.used_at.is_(None),
@@ -681,12 +691,12 @@ class MVPBookingService:
 
     @staticmethod
     def update_booking_status(db: Session, actor: MVPUser, booking_id: int, req: BookingStatusUpdateRequest) -> MVPBooking:
-        scheduled_listing_id = db.query(MVPBooking.listing_id).join(MVPListing).filter(
+        locked_listing_id = db.query(MVPBooking.listing_id).join(MVPListing).filter(
             MVPBooking.id == booking_id,
-            MVPListing.category.in_(("adventure", "guide", "bike", "bicycle")),
+            MVPListing.category.in_(wallet_service.BOOKABLE),
         ).scalar()
-        if scheduled_listing_id is not None:
-            verification.locked_listing(db, scheduled_listing_id)
+        if locked_listing_id is not None:
+            verification.locked_listing(db, locked_listing_id)
         booking = _locked_booking(db, booking_id)
         if not booking:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
@@ -706,24 +716,6 @@ class MVPBookingService:
             (actor.id == booking.traveler_id and target == "cancelled")
         ):
             raise HTTPException(403, "Only the host can decide this booking")
-        if booking.listing.category == "homestay" or scheduled:
-            if target == "confirmed" and not any(
-                payment.status in {"unpaid", "demo_succeeded"} for payment in booking.payments
-            ):
-                raise HTTPException(409, "Traveler must select a payment method first")
-            if target == "confirmed" and scheduled:
-                if (not booking.listing.is_active or booking.listing.approval_status != "approved"
-                        or not verification.provider_eligible(booking.listing)
-                        or booking.starts_at <= verification.now()):
-                    raise HTTPException(409, "The reservation cannot be confirmed")
-                if rental:
-                    mvp_rental.validate_confirmation(booking)
-                elif (booking.slot_id is None or not booking.allocations[0].slot.is_open
-                      or booking.allocations[0].released_at is not None):
-                    raise HTTPException(409, "The reservation cannot be confirmed")
-            elif target == "confirmed":
-                mvp_homestay.validate_confirmation(db, booking)
-
         # Transition validation per ck_booking_status_history_transitions
         allowed_transitions = {
             "pending": ["confirmed", "rejected", "cancelled"],
@@ -734,6 +726,17 @@ class MVPBookingService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Illegal status transition from '{current}' to '{target}'.",
             )
+
+        wallet_event = None
+        if booking.listing.category in wallet_service.BOOKABLE:
+            if target == "confirmed":
+                profile = wallet_service.lock_profile(db, booking.listing.provider_id)
+                wallet_service.require_eligible(profile, actor)
+                validate_booking_confirmation(db, booking)
+                provider_wallet = wallet_service.initialize(db, profile.id)
+                wallet_event = wallet_service.charge(db, booking, provider_wallet)
+            elif current == "confirmed" and target == "cancelled":
+                wallet_event = wallet_service.refund(db, booking)
 
         now = datetime.now(timezone.utc)
         booking.status = target
@@ -759,7 +762,26 @@ class MVPBookingService:
         account.booking_event(db, booking, actor)
         db.commit()
         db.refresh(booking)
+        booking.wallet_event = wallet_event
         return booking
+
+
+def validate_booking_confirmation(db: Session, booking: MVPBooking, *, lock=True):
+    if not any(payment.status in {"unpaid", "demo_succeeded"} for payment in booking.payments):
+        raise HTTPException(409, "Traveler must select a payment method first")
+    listing = booking.listing
+    if listing.category == "homestay":
+        mvp_homestay.validate_confirmation(db, booking, lock=lock)
+        return
+    if (not listing.is_active or listing.approval_status != "approved"
+            or not verification.provider_eligible(listing)
+            or booking.starts_at <= verification.now()):
+        raise HTTPException(409, "The reservation cannot be confirmed")
+    if listing.category in mvp_rental.RENTAL_CATEGORIES:
+        mvp_rental.validate_confirmation(booking)
+    elif (booking.slot_id is None or not booking.allocations[0].slot.is_open
+          or booking.allocations[0].released_at is not None):
+        raise HTTPException(409, "The reservation cannot be confirmed")
 
 
 # ============================================================================
@@ -772,7 +794,7 @@ def _locked_booking(db: Session, booking_id: int) -> MVPBooking | None:
         )
     return db.query(MVPBooking).with_hint(
         MVPBooking, "WITH (UPDLOCK, HOLDLOCK)", dialect_name="mssql"
-    ).filter(MVPBooking.id == booking_id).first()
+    ).filter(MVPBooking.id == booking_id).populate_existing().first()
 
 
 def _provider_confirmed_payment(db, booking, req, method, payment_status):
@@ -1016,7 +1038,7 @@ class MVPCommunityService:
 class MVPAdminService:
     @staticmethod
     def decide_provider(db: Session, admin: MVPUser, provider_id: int, req: AdminProviderDecision) -> MVPProviderProfile:
-        profile = db.query(MVPProviderProfile).filter(MVPProviderProfile.id == provider_id).first()
+        profile = wallet_service.lock_profile(db, provider_id)
         if not profile:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider profile not found.")
         if profile.verification_status == "draft":
@@ -1041,6 +1063,10 @@ class MVPAdminService:
             occurred_at=now,
         )
         db.add(audit)
+        if (profile.verification_status == "approved" and profile.user.is_active
+                and profile.user.role == "provider"):
+            db.flush()
+            wallet_service.initialize(db, profile.id)
         db.commit()
         db.refresh(profile)
         return profile

@@ -13,6 +13,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.admin_roles import is_admin_role
 from app.core.security import hash_password, verify_password, get_jwt_secret_key, get_jwt_algorithm
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPProviderProfile, MVPUser
@@ -93,10 +94,20 @@ def get_optional_mvp_user(
     return _resolve_user_from_token(auth.credentials, db)
 
 
-def _resolve_user_from_token(token: str, db: Session) -> MVPUser:
+def _resolve_user_from_token(token: str, db: Session) -> Any:
     payload = decode_mvp_token(token)
     user_id = int(payload.get("sub", 0))
-    user = db.query(MVPUser).filter(MVPUser.id == user_id).first()
+    user = None
+    try:
+        user = db.query(MVPUser).filter(MVPUser.id == user_id).first()
+    except Exception:
+        db.rollback()
+    if not user:
+        try:
+            from app.models.user import User
+            user = db.query(User).filter(User.id == user_id).first()
+        except Exception:
+            db.rollback()
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -104,13 +115,13 @@ def _resolve_user_from_token(token: str, db: Session) -> MVPUser:
             headers={"WWW-Authenticate": "Bearer"},
         )
     # Check auth_version and credential_version (token invalidation upon logout / reset)
-    if payload.get("auth_version", 0) != user.auth_version:
+    if payload.get("auth_version", 0) != getattr(user, "auth_version", 0):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session has been invalidated. Please log in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if payload.get("credential_version", 0) != user.credential_version:
+    if payload.get("credential_version", 0) != getattr(user, "credential_version", 0):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credentials have been updated. Please log in again.",
@@ -119,7 +130,9 @@ def _resolve_user_from_token(token: str, db: Session) -> MVPUser:
     return user
 
 def require_mvp_role(*allowed_roles: str):
-    def role_checker(user: MVPUser = Depends(get_current_mvp_user)) -> MVPUser:
+    def role_checker(user: Any = Depends(get_current_mvp_user)) -> Any:
+        if "admin" in allowed_roles and is_admin_role(user.role):
+            return user
         if user.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

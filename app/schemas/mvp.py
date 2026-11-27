@@ -111,6 +111,11 @@ class ProviderResponse(BaseModel):
     decided_at: datetime | None = None
     decision_reason: str | None = None
     created_at: datetime
+    email: str | None = None
+    full_name: str | None = None
+    provider_type: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
 
 
 class ProviderDocumentUpload(BaseModel):

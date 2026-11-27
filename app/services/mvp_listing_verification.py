@@ -87,7 +87,10 @@ def invalidate_review(listing):
 
 
 def details(db, listing):
-    row = db.get(MVPListingVerification, listing.id)
+    return parse_details(db.get(MVPListingVerification, listing.id))
+
+
+def parse_details(row):
     return json.loads(row.details) if row else {}
 
 

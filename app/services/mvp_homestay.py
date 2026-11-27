@@ -99,7 +99,7 @@ def serialize(listing: MVPListing, enabled: bool = True) -> HomestayDetails:
         image["image_url"] = (
             f"/api/v1/listings/{listing.id}/photos/{image['id']}"
             if image["storage_key"].startswith(verification.PHOTO_PREFIX)
-            else _image_url(image["storage_key"], base)
+            else listing_image_url(image["storage_key"], base)
         )
     data["units"] = sorted(
         (verification.room_details(unit, enabled) for unit in listing.units if unit.is_active),
@@ -113,7 +113,7 @@ def serialize(listing: MVPListing, enabled: bool = True) -> HomestayDetails:
     )
 
 
-def _image_url(key: str, base: str) -> str | None:
+def listing_image_url(key: str, base: str) -> str | None:
     if _has_http_host(key):
         return key
     if _has_http_host(base) and not key.startswith("/") and not {"..", "."}.intersection(key.split("/")):
@@ -207,8 +207,8 @@ def quote(db: Session, listing: MVPListing, dates: StayDates, room_id=None) -> H
     )
 
 
-def validate_confirmation(db: Session, booking: MVPBooking) -> None:
-    listing = get_public(db, booking.listing_id, lock=True)
+def validate_confirmation(db: Session, booking: MVPBooking, *, lock=True) -> None:
+    listing = get_public(db, booking.listing_id, lock=lock)
     rooms = {
         allocation.slot.unit_id for allocation in booking.allocations
         if allocation.released_at is None

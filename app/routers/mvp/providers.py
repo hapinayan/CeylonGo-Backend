@@ -4,6 +4,9 @@ Endpoints for Provider Profile Registration, Document Uploads, and Email Verific
 """
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse
+from typing import Annotated
+
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -16,6 +19,12 @@ from app.core.rate_limiter import (
 from app.core.sensitive_route import SensitiveInputRoute
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPProviderProfile, MVPUser
+from app.routers.mvp.account import avatar_path, password_limit, remove_file, replace_password, store_avatar
+from app.schemas.mvp_account import PasswordChanged
+from app.schemas.mvp_provider_account import (
+    ProfilePatch, ProviderAccountProfile, ProviderPasswordChange,
+)
+from app.services import mvp_account, mvp_provider_account as provider_account
 from app.schemas.mvp import (
     EmailChallengeVerify,
     GenericMessageResponse,
@@ -75,15 +84,76 @@ def register_provider_profile(
     return profile
 
 
-@router.get("/me", response_model=ProviderResponse)
-def get_my_provider_profile(
-    current_user: MVPUser = Depends(require_mvp_role("provider")),
-    db: Session = Depends(get_mvp_db),
-):
-    profile = db.query(MVPProviderProfile).filter(MVPProviderProfile.user_id == current_user.id).first()
-    if not profile:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No provider profile registered.")
-    return profile
+Provider = Annotated[MVPUser, Depends(require_mvp_role("provider"))]
+DB = Annotated[Session, Depends(get_mvp_db)]
+
+
+@router.get("/me", response_model=ProviderAccountProfile)
+def get_my_provider_profile(db: DB, user: Provider):
+    return provider_account.profile_response(db, user, provider_account.own_profile(db, user))
+
+
+@router.patch("/me", response_model=ProviderAccountProfile)
+def update_my_provider_profile(payload: ProfilePatch, db: DB, user: Provider):
+    return provider_account.update_profile(db, user, payload)
+
+
+@router.get("/me/avatar", response_class=FileResponse)
+def get_provider_avatar(db: DB, user: Provider):
+    profile = provider_account.own_profile(db, user)
+    data = provider_account.details(db, profile)
+    path = avatar_path(data.get("account", {}).get("avatar"))
+    if path is None or not path.is_file():
+        raise HTTPException(404, "Avatar not found")
+    return FileResponse(path, media_type="image/jpeg", headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store",
+    })
+
+
+@router.post("/me/avatar", response_model=ProviderAccountProfile)
+def upload_provider_avatar(file: Annotated[UploadFile, File()], db: DB, user: Provider):
+    # Validate and write a new file before swapping the stored pointer.
+    provider_account.own_profile(db, user)
+    name = store_avatar(file)
+    try:
+        profile = provider_account.own_profile(db, user, write=True)
+        data = provider_account.details(db, profile)
+        media = data.setdefault("account", {})
+        previous = media.get("avatar")
+        media["avatar"] = name
+        provider_account.save(db, profile, data)
+    except Exception:
+        db.rollback()
+        remove_file(name)
+        raise
+    remove_file(previous)
+    return provider_account.profile_response(db, user, profile)
+
+
+@router.delete("/me/avatar", response_model=ProviderAccountProfile)
+def delete_provider_avatar(db: DB, user: Provider):
+    profile = provider_account.own_profile(db, user, write=True)
+    data = provider_account.details(db, profile)
+    previous = data.get("account", {}).pop("avatar", None)
+    if previous:
+        provider_account.save(db, profile, data)
+        remove_file(previous)
+    return provider_account.profile_response(db, user, profile)
+
+
+@router.post("/change-password", response_model=PasswordChanged)
+def change_provider_password(payload: ProviderPasswordChange, db: DB, user: Provider):
+    password_limit.check_identifier(str(user.id))
+    versions = user.auth_version, user.credential_version
+    user = mvp_account.lock_user(db, user.id)
+    if (
+        user is None or not user.is_active or user.role != "provider"
+        or versions != (user.auth_version, user.credential_version)
+    ):
+        raise HTTPException(401, "Sign in again")
+    replace_password(db, user, payload)
+    db.commit()
+    return PasswordChanged(message="Password changed. Please log in again.", login_required=True)
 
 
 @router.post("/logout", response_model=GenericMessageResponse)

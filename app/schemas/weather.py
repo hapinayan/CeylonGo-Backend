@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class WeatherModel(BaseModel):
@@ -69,6 +69,12 @@ class Forecast(WeatherMetadata):
     advisory_notice: str = (
         "Travel guidance is advisory. Check official warnings and local conditions."
     )
+
+    @computed_field
+    @property
+    def daily_forecast(self) -> list[DailyForecast]:
+        """Up to five local dates covered by the provider data."""
+        return self.days[:5]
 
 
 class Location(Coordinates):

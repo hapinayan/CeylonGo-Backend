@@ -8,7 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, undefer
 
 from app.core.mvp_security import require_mvp_role
 from app.core.email import send_provider_approval_email
@@ -33,24 +33,37 @@ from app.schemas.mvp_community import (
     CommunityPage,
     CommunityReportDetails,
 )
-from app.schemas.provider_registration import DraftResponse
+from app.schemas.mvp_provider_account import AdminProviderApplication, AdminProviderSummary
 from app.services import mvp_provider_registration as registration
+from app.services import mvp_provider_account as provider_account
 from app.services.mvp_provider_otp import PASSWORD_UNSET
 
 router = APIRouter(prefix="/admin", tags=["MVP Admin Operations"])
 
 
-@router.get("/providers", response_model=list[ProviderResponse])
+@router.get("/providers", response_model=list[AdminProviderSummary])
 def list_provider_applications(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     _admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
-    return (
-        db.query(MVPProviderProfile).filter(MVPProviderProfile.verification_status != "draft")
+    registration.require_draft_storage(db)
+    profiles = (
+        db.query(MVPProviderProfile).options(undefer(MVPProviderProfile.registration_details))
+        .filter(MVPProviderProfile.verification_status != "draft")
         .order_by(MVPProviderProfile.id.desc()).offset(offset).limit(limit).all()
     )
+    return [
+        AdminProviderSummary(
+            **ProviderResponse.model_validate(profile).model_dump(),
+            profile_change_pending=(
+                registration.draft_data(profile).get("profile_change", {}).get("status")
+                == "pending"
+            ),
+        )
+        for profile in profiles
+    ]
 
 
 def _review_profile(db, provider_id):
@@ -61,14 +74,17 @@ def _review_profile(db, provider_id):
     return profile
 
 
-@router.get("/providers/{provider_id}/application", response_model=DraftResponse)
+@router.get("/providers/{provider_id}/application", response_model=AdminProviderApplication)
 def provider_application(
     provider_id: int,
     _admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
     profile = _review_profile(db, provider_id)
-    return registration.draft_response(profile.user.email, profile)
+    return AdminProviderApplication(
+        **registration.draft_response(profile.user.email, profile).model_dump(),
+        profile_change=registration.draft_data(profile).get("profile_change"),
+    )
 
 
 @router.get("/providers/{provider_id}/identity/{document}")
@@ -97,6 +113,10 @@ def decide_provider(
     admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
+    if req.profile_change_request_id is not None:
+        if req.verification_status not in {"approved", "rejected"}:
+            raise HTTPException(422, "Profile changes can only be approved or rejected")
+        return provider_account.review_change(db, admin, provider_id, req)
     candidate = db.get(MVPProviderProfile, provider_id)
     notify = (
         candidate is not None

@@ -105,9 +105,7 @@ def avatar_bytes(file: UploadFile):
         raise HTTPException(422, "Avatar image is malformed") from None
 
 
-@router.post("/auth/me/avatar", response_model=Profile)
-def upload_avatar(db: DB, user: Traveler, file: Annotated[UploadFile, File()]):
-    account.require_schema(db)
+def store_avatar(file: UploadFile):
     content = avatar_bytes(file)
     name = uuid4().hex + ".jpg"
     path = avatar_path(name)
@@ -118,6 +116,13 @@ def upload_avatar(db: DB, user: Traveler, file: Annotated[UploadFile, File()]):
     except OSError:
         remove_file(name)
         raise HTTPException(503, "Avatar storage is unavailable") from None
+    return name
+
+
+@router.post("/auth/me/avatar", response_model=Profile)
+def upload_avatar(db: DB, user: Traveler, file: Annotated[UploadFile, File()]):
+    account.require_schema(db)
+    name = store_avatar(file)
     try:
         row = account.settings(db, user.id, write=True)
         previous = row.avatar
@@ -167,16 +172,7 @@ def retrieve_avatar(user_id: PositiveID, db: DB, viewer: Viewer):
     })
 
 
-@router.post("/auth/change-password", response_model=PasswordChanged)
-def change_password(payload: PasswordChange, db: DB, user: Traveler):
-    account.require_schema(db)
-    password_limit.check_identifier(str(user.id))
-    version = user.auth_version
-    row = account.settings(db, user.id, write=True)
-    if not user.is_active or user.auth_version != version:
-        raise HTTPException(401, "Sign in again")
-    if row.google_only:
-        raise HTTPException(400, "Use Forgot Password to set a password for this Google account")
+def replace_password(db, user, payload):
     current = payload.current_password.get_secret_value()
     new = payload.new_password.get_secret_value()
     if new != payload.confirm_password.get_secret_value():
@@ -192,6 +188,19 @@ def change_password(payload: PasswordChange, db: DB, user: Traveler):
     db.execute(update(MVPPasswordReset).where(
         MVPPasswordReset.user_id == user.id, MVPPasswordReset.used_at.is_(None),
     ).values(used_at=user.updated_at))
+
+
+@router.post("/auth/change-password", response_model=PasswordChanged)
+def change_password(payload: PasswordChange, db: DB, user: Traveler):
+    account.require_schema(db)
+    password_limit.check_identifier(str(user.id))
+    version = user.auth_version
+    row = account.settings(db, user.id, write=True)
+    if not user.is_active or user.auth_version != version:
+        raise HTTPException(401, "Sign in again")
+    if row.google_only:
+        raise HTTPException(400, "Use Forgot Password to set a password for this Google account")
+    replace_password(db, user, payload)
     account.notify(db, user.id, "account", "password_changed", user.id,
                    f"password:{user.id}:{user.credential_version}")
     db.commit()

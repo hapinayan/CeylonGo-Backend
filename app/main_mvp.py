@@ -33,6 +33,10 @@ from app.routers.mvp.tour_guides import router as tour_guides_router
 from app.routers.mvp.rentals import router as rentals_router
 from app.routers.mvp.listing_management import router as listing_management_router
 from app.routers.mvp.account import router as account_router
+from app.routers.mvp.provider_account import router as provider_account_router
+from app.routers.mvp.wallet import router as wallet_router
+from app.routers.mvp.map import router as map_router
+from app.routers.weather import router as weather_router
 
 
 @asynccontextmanager
@@ -53,14 +57,27 @@ def create_mvp_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Configure CORS for Angular and Flutter clients
-    allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+    # Configure CORS for Angular and Flutter clients (no wildcard origins)
+    default_origins = (
+        "http://localhost:4200,"
+        "http://127.0.0.1:4200,"
+        "http://localhost:4201,"
+        "http://127.0.0.1:4201,"
+        "http://localhost:8420,"
+        "http://127.0.0.1:8420"
+    )
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", default_origins).split(",")
+        if origin.strip() and origin.strip() != "*"
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Wallet-Event", "Retry-After"],
     )
 
     # Health & Meta endpoints
@@ -86,6 +103,7 @@ def create_mvp_app() -> FastAPI:
         app.include_router(auth_router, prefix=prefix_base)
         app.include_router(account_router, prefix=prefix_base)
         app.include_router(providers_router, prefix=prefix_base)
+        app.include_router(provider_account_router, prefix=prefix_base)
         app.include_router(listings_router, prefix=prefix_base)
         app.include_router(bookings_router, prefix=prefix_base)
         app.include_router(homestays_router, prefix=prefix_base)
@@ -99,6 +117,10 @@ def create_mvp_app() -> FastAPI:
         app.include_router(community_router, prefix=prefix_base)
         app.include_router(admin_router, prefix=prefix_base)
         app.include_router(itinerary_router, prefix=prefix_base)
+
+    app.include_router(wallet_router, prefix="/api/v1")
+    app.include_router(map_router, prefix="/api/v1")
+    app.include_router(weather_router)
 
     return app
 

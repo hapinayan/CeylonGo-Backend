@@ -1,5 +1,6 @@
 import json
 
+from anyio import from_thread
 from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy import select, text, update
 
@@ -13,6 +14,7 @@ from app.schemas.mvp_planner import (
 )
 from app.services import mvp_planner as planner, mvp_planner_tools as booking
 from app.services.mvp_listing_verification import now
+from app.services.mvp_planner_weather import itinerary_weather
 
 router = APIRouter(prefix="/ai/planner", tags=["MVP Smart Travel Planner"])
 limiter = SlidingWindowRateLimiter(max_requests=6, window_seconds=60)
@@ -128,6 +130,8 @@ def send_message(conversation_id: int, payload: Message, db: DB, traveler: Trave
     reply, itinerary, listings, quotes, bookings = planner.run_turn(
         db, traveler_id, planner.history_prompt(reversed(history)), payload.text,
     )
+    if itinerary is not None:
+        itinerary.weather = from_thread.run(itinerary_weather, itinerary.plan)
     row = _owned(db, Conversation, conversation_id, traveler_id)
     if row.revision != revision:
         raise HTTPException(409, "Conversation changed. Refresh and retry.")

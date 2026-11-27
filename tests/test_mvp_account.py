@@ -194,8 +194,8 @@ def test_account_routes_openapi_migration_and_mssql_queries():
     for prefix in ("/api", "/api/v1"):
         for path, methods in expected.items():
             assert methods <= app.openapi()["paths"][prefix + path].keys()
-    assert UPGRADES[-1].version == "1.0.7"
-    assert UPGRADES[-1].batches()
+    traveler_upgrade = next(item for item in UPGRADES if item.version == "1.0.7")
+    assert traveler_upgrade.batches()
     compiled = str(feed(1).compile(dialect=mssql.dialect()))
     assert "IS 1" not in compiled and "EXISTS" in compiled
 

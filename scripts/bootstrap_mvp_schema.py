@@ -34,6 +34,7 @@ class SchemaVersion:
     path: Path
     sha256: str
     creates_table: str | None = None
+    additional_tables: tuple[str, ...] = ()
 
     def batches(self) -> list[str]:
         # Keep the text hashing convention of the original MVP bootstrap runner.
@@ -88,6 +89,11 @@ UPGRADES = (
         "1.0.7", SCRIPT_DIR / "mvp_upgrades" / "1.0.7_traveler_accounts.sql",
         "48398527e73181345d82c577c4ece7a61b2f30bd3ab495702bc0aba54b9b6ea7",
         "dbo.traveler_notifications",
+    ),
+    SchemaVersion(
+        "1.0.8", SCRIPT_DIR / "mvp_upgrades" / "1.0.8_wallet_commission.sql",
+        "82000a11f50bb038694a6963f32f52daf38863098668cd10f0f89ee445db8b55",
+        "dbo.provider_wallets", ("dbo.wallet_transactions",),
     ),
 )
 
@@ -227,12 +233,10 @@ def run(
                 current = versions[applied - 1].version if applied else "uninitialized"
                 print(f"Current MVP schema version: {current}")
                 for index, item in enumerate(versions, start=1):
-                    if item.creates_table:
-                        exists = _table_exists(cursor, item.creates_table)
-                        if exists != (index <= applied):
-                            raise MigrationError(
-                                f"Ledger and schema disagree for {item.creates_table}"
-                            )
+                    tables = (item.creates_table, *item.additional_tables)
+                    for table in filter(None, tables):
+                        if _table_exists(cursor, table) != (index <= applied):
+                            raise MigrationError(f"Ledger and schema disagree for {table}")
 
                 if action == "status":
                     print("Pending:", ", ".join(v.version for v in versions[applied:]) or "none")
@@ -252,6 +256,9 @@ def run(
                 if positions[target] < applied:
                     raise MigrationError("MVP downgrades are unsupported")
                 pending = versions[applied:positions[target]]
+                if (database.casefold() == MAIN_DATABASE.casefold() and target == "1.0.8"
+                        and current not in {"1.0.7", "1.0.8"}):
+                    raise MigrationError("Wallet upgrade requires MVP schema 1.0.7 on CeylonGoDB")
                 print("Pending:", ", ".join(v.version for v in pending) or "none")
                 if dry_run or not pending:
                     return

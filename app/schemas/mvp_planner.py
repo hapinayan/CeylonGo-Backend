@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.weather import DailyForecast
+
 Service = Literal["homestay", "adventure", "guide", "bike", "bicycle", "artisan"]
 Money = Annotated[Decimal, Field(ge=0, le=9999999999, decimal_places=2)]
 Handle = Annotated[str, Field(pattern=r"^[sq][1-9][0-9]{0,2}$")]
@@ -161,6 +163,15 @@ class BookingStatus(Input):
     payment_method: str | None
 
 
+class ItineraryWeather(Input):
+    day: int
+    destination: str
+    source: str
+    fetched_at: datetime
+    stale: bool
+    forecast: DailyForecast
+
+
 class Itinerary(Input):
     plan: Plan
     listings: list[ListingResult]
@@ -169,6 +180,7 @@ class Itinerary(Input):
     estimated_other_lkr: Decimal
     estimated_total_lkr: Decimal
     remaining_budget_lkr: Decimal
+    weather: list[ItineraryWeather] = Field(default_factory=list)
 
 
 class ModelReply(Input):

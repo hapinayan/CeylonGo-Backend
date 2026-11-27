@@ -23,7 +23,9 @@ SYSTEM = (
     "Estimate food, transport and other expenses independently of quoted services. "
     "Use numeric LKR amounts. Include cheaper real alternatives when useful. "
     "Keep message text to follow-up questions and general planning commentary. "
-    "Use structured fields to communicate any service, price or booking fact."
+    "Use structured fields to communicate any service, price or booking fact. "
+    "Do not infer trip dates or invent forecasts. Leave start_date null unless the traveler "
+    "established dates. The application attaches verified weather separately."
 )
 
 

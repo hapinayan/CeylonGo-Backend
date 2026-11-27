@@ -3,6 +3,7 @@ CeylonGo Academic MVP — Pydantic Request & Response Schemas
 Type-safe API contracts for Traveler, Provider, Admin, Listings, Bookings, Payments, Community, and AI Itinerary.
 """
 
+from uuid import UUID
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -358,6 +359,7 @@ class PostResponse(BaseModel):
 # 7. Admin Moderation & Audit
 # ============================================================================
 class AdminProviderDecision(BaseModel):
+    profile_change_request_id: UUID | None = None
     verification_status: Literal["approved", "rejected", "suspended"]
     decision_reason: str | None = Field(None, max_length=500)
 

@@ -86,8 +86,8 @@ def get_weather_service() -> WeatherService:
         ) from None
 
 
-Latitude = Annotated[float, Query(ge=-90, le=90)]
-Longitude = Annotated[float, Query(ge=-180, le=180)]
+Latitude = Annotated[float | None, Query(ge=-90, le=90)]
+Longitude = Annotated[float | None, Query(ge=-180, le=180)]
 Service = Annotated[WeatherService, Depends(get_weather_service)]
 
 
@@ -104,27 +104,53 @@ async def weather_response(result):
         ) from None
 
 
-@router.get("/current", response_model=CurrentWeather)
-async def current_weather(lat: Latitude, lon: Longitude, service: Service):
-    return await weather_response(service.conditions("current", lat, lon))
-
-
-@router.get("/forecast", response_model=Forecast)
-async def weather_forecast(lat: Latitude, lon: Longitude, service: Service):
-    return await weather_response(service.conditions("forecast", lat, lon))
-
-
-@router.get("/locations", response_model=Locations)
-async def search_locations(q: Annotated[str, Query(max_length=120)], service: Service):
+def normalize_location_query(q: str) -> str:
     query = " ".join(unicodedata.normalize("NFC", q).split())
     if (
         not 2 <= len(query) <= 80
         or not any(char.isalpha() for char in query)
         or any(
-            char not in " .-'’"
+            char not in " .-'\u2019"
             and unicodedata.category(char)[0] not in ("L", "M", "N")
             for char in query
         )
     ):
         raise HTTPException(status_code=422, detail={"code": "invalid_location_query"})
-    return await weather_response(service.locations(query))
+    return query
+
+
+async def resolve_coordinates(service: WeatherService, lat, lon, location):
+    if location is None and lat is not None and lon is not None:
+        return lat, lon
+    if location is None or lat is not None or lon is not None:
+        raise HTTPException(422, detail={"code": "provide_coordinates_or_location"})
+    query = normalize_location_query(location)
+    matches = await weather_response(service.locations(query))
+    if not matches.locations:
+        raise HTTPException(404, detail={"code": "weather_location_not_found"})
+    match = matches.locations[0]
+    return match.latitude, match.longitude
+
+
+@router.get("/current", response_model=CurrentWeather)
+async def current_weather(
+    service: Service, lat: Latitude = None, lon: Longitude = None,
+    location: Annotated[str | None, Query(max_length=120)] = None,
+):
+    lat, lon = await resolve_coordinates(service, lat, lon, location)
+    return await weather_response(service.conditions("current", lat, lon))
+
+
+@router.get("/forecast", response_model=Forecast)
+async def weather_forecast(
+    service: Service, lat: Latitude = None, lon: Longitude = None,
+    location: Annotated[str | None, Query(max_length=120)] = None,
+):
+    lat, lon = await resolve_coordinates(service, lat, lon, location)
+    return await weather_response(service.conditions("forecast", lat, lon))
+
+
+@router.get("/search", response_model=Locations)
+@router.get("/locations", response_model=Locations)
+async def search_locations(q: Annotated[str, Query(max_length=120)], service: Service):
+    return await weather_response(service.locations(normalize_location_query(q)))

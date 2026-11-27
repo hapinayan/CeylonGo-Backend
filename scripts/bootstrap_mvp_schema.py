@@ -95,6 +95,11 @@ UPGRADES = (
         "82000a11f50bb038694a6963f32f52daf38863098668cd10f0f89ee445db8b55",
         "dbo.provider_wallets", ("dbo.wallet_transactions",),
     ),
+    SchemaVersion(
+        "1.0.9", SCRIPT_DIR / "mvp_upgrades" / "1.0.9_personalized_recommendations.sql",
+        "723239282de7a58743d25dc2ede0c7037f3063cda6db9987c3e95cbfaec5533b",
+        "dbo.traveler_activity_events",
+    ),
 )
 
 
@@ -259,6 +264,9 @@ def run(
                 if (database.casefold() == MAIN_DATABASE.casefold() and target == "1.0.8"
                         and current not in {"1.0.7", "1.0.8"}):
                     raise MigrationError("Wallet upgrade requires MVP schema 1.0.7 on CeylonGoDB")
+                if (database.casefold() == MAIN_DATABASE.casefold() and target == "1.0.9"
+                        and current not in {"1.0.8", "1.0.9"}):
+                    raise MigrationError("Recommendations require MVP schema 1.0.8 on CeylonGoDB")
                 print("Pending:", ", ".join(v.version for v in pending) or "none")
                 if dry_run or not pending:
                     return

@@ -380,7 +380,7 @@ def test_competing_confirmations_share_funds(harness):
 
 
 def test_mssql_decimal_uuid_and_filtered_index_contract():
-    version = UPGRADES[-1]
+    version = next(item for item in UPGRADES if item.version == "1.0.8")
     assert version.version == "1.0.8"
     sql = "\n".join(version.batches())
     table = WalletTransaction.__table__

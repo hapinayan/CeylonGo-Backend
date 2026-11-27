@@ -42,7 +42,7 @@ class MVPUser(MVPBase):
     __tablename__ = "users"
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
-        CheckConstraint("role IN ('traveler', 'provider', 'admin')", name="ck_users_role"),
+        CheckConstraint("role IN ('traveler', 'provider', 'admin', 'super_admin')", name="ck_users_role"),
         CheckConstraint("auth_version >= 0", name="ck_users_auth_version"),
         CheckConstraint("credential_version >= 0", name="ck_users_credential_version"),
     )

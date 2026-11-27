@@ -23,6 +23,7 @@ ALLOWED_TARGETS = {
     "CeylonGoDB_IntegrationTest",
     "CeylonGoDB_Rehearsal_V3",
     "CeylonGoDB_Test",
+    "CeylonGoDB_Academic_MVP_Seeder_Test",
 }
 SCRIPT_DIR = Path(__file__).resolve().parent
 OTP_TABLE = "dbo.traveler_email_challenges"
@@ -99,6 +100,11 @@ UPGRADES = (
         "1.0.9", SCRIPT_DIR / "mvp_upgrades" / "1.0.9_personalized_recommendations.sql",
         "723239282de7a58743d25dc2ede0c7037f3063cda6db9987c3e95cbfaec5533b",
         "dbo.traveler_activity_events",
+    ),
+    SchemaVersion(
+        "1.0.10", SCRIPT_DIR / "mvp_upgrades" / "1.0.10_admin_roles_and_invitations.sql",
+        "b87f2bbbec4f4e25ad0971e0e4f7d009fa49fcdf66e2d7aa5deda861f5c49c29",
+        "dbo.admin_invitations",
     ),
 )
 

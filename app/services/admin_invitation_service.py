@@ -10,7 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.admin_roles import APPROVED_ADMIN_ROLES, is_admin_role, resolve_canonical_admin_role
+from app.core.admin_roles import ADMIN_ROLES, is_admin_role, resolve_canonical_admin_role
 from app.core.security import hash_password
 from app.models.admin_invitation import AdminInvitation
 from app.schemas.admin_management import (
@@ -100,10 +100,10 @@ class AdminInvitationService:
         email_clean = payload.email.strip().lower()
 
         # 1. Verify role is one of the approved roles
-        if payload.role not in APPROVED_ADMIN_ROLES:
+        if payload.role not in ADMIN_ROLES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid admin role. Must be one of: {sorted(APPROVED_ADMIN_ROLES)}",
+                detail=f"Invalid admin role. Must be one of: {sorted(ADMIN_ROLES)}",
             )
 
         # 2. Check if active user already exists with this email

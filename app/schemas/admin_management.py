@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 
 AdminRoleType = Literal[
+    "admin",
     "super_admin",
     "operations_admin",
     "finance_admin",

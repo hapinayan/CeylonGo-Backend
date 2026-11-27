@@ -582,7 +582,7 @@ def test_mssql_activity_schema_and_migration():
     )
     assert "BIGINT NOT NULL IDENTITY" in ddl
     assert "FOREIGN KEY(traveler_id) REFERENCES users" in ddl
-    migration = UPGRADES[-1]
+    migration = next(item for item in UPGRADES if item.version == "1.0.9")
     assert migration.version == "1.0.9"
     assert "CREATE TABLE dbo.traveler_activity_events" in migration.batches()[0]
     assert "DEFAULT (0)" in migration.batches()[0]

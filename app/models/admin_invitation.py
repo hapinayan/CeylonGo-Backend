@@ -2,10 +2,10 @@ from datetime import datetime
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Unicode, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.user import Base
+from app.models.mvp import MVPBase
 
 
-class AdminInvitation(Base):
+class AdminInvitation(MVPBase):
     __tablename__ = "admin_invitations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

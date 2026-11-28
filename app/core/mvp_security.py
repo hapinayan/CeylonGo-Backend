@@ -13,7 +13,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
-from app.core.admin_roles import is_admin_role
+from app.core.admin_roles import MVP_ADMIN_ROLES
 from app.core.security import hash_password, verify_password, get_jwt_secret_key, get_jwt_algorithm
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPProviderProfile, MVPUser
@@ -131,7 +131,7 @@ def _resolve_user_from_token(token: str, db: Session) -> Any:
 
 def require_mvp_role(*allowed_roles: str):
     def role_checker(user: Any = Depends(get_current_mvp_user)) -> Any:
-        if "admin" in allowed_roles and is_admin_role(user.role):
+        if "admin" in allowed_roles and user.role in MVP_ADMIN_ROLES:
             return user
         if user.role not in allowed_roles:
             raise HTTPException(

@@ -7,6 +7,7 @@ APPROVED_ADMIN_ROLES: frozenset[str] = frozenset({
     "content_moderator",
     "support_admin",
 })
+MVP_ADMIN_ROLES = frozenset({"admin", "super_admin"})
 LEGACY_ADMIN_ROLE = "admin"
 ADMIN_ROLES: frozenset[str] = APPROVED_ADMIN_ROLES | {LEGACY_ADMIN_ROLE}
 

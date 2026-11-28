@@ -3,6 +3,9 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
+from app.schemas.admin_management import AdminRoleType
+
+
 class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1, description="Admin account password")
@@ -29,3 +32,11 @@ class AdminTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: AdminUserResponse
+
+class MVPAdminUserResponse(AdminUserResponse):
+    role: AdminRoleType
+    admin_role: AdminRoleType
+
+
+class MVPAdminTokenResponse(AdminTokenResponse):
+    user: MVPAdminUserResponse

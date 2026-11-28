@@ -1,9 +1,10 @@
-from typing import Annotated, Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_super_admin
+from app.core.mvp_security import require_mvp_role
+from app.core.sensitive_route import SensitiveInputRoute
 from app.database.connection import get_db
 from app.schemas.admin_management import (
     AdminAccountItem,
@@ -16,6 +17,9 @@ from app.schemas.admin_management import (
 )
 from app.services.admin_invitation_service import AdminInvitationService
 
+require_super_admin = require_mvp_role("super_admin")
+
+
 router = APIRouter(
     prefix="/api/v1/admin/management",
     tags=["Admin Management & Invitations"],
@@ -23,6 +27,7 @@ router = APIRouter(
 
 # Public router for activation flows without super admin credentials
 public_router = APIRouter(
+    route_class=SensitiveInputRoute,
     prefix="/api/v1/admin/auth/invitations",
     tags=["Admin Account Activation"],
 )
@@ -40,7 +45,7 @@ public_router = APIRouter(
     summary="List administrator accounts and pending invitations",
 )
 def list_admin_accounts(
-    role: Optional[str] = Query(None, description="Filter by admin role"),
+    role: Optional[Literal["admin", "super_admin", "all"]] = Query(None),
     status: Optional[str] = Query(None, description="Filter by status (active, inactive, invited)"),
     search: Optional[str] = Query(None, description="Search term for full name or email"),
     page: int = Query(1, ge=1),

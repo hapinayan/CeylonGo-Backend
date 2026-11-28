@@ -1,23 +1,16 @@
 from datetime import datetime
 from typing import Literal, Optional
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
-AdminRoleType = Literal[
-    "admin",
-    "super_admin",
-    "operations_admin",
-    "finance_admin",
-    "content_moderator",
-    "support_admin",
-]
+AdminRoleType = Literal["admin", "super_admin"]
 
 InvitationStatusType = Literal["pending", "accepted", "revoked", "expired"]
 
 
 class AdminInvitationCreate(BaseModel):
-    email: EmailStr
-    full_name: str = Field(..., min_length=2, max_length=150)
+    email: EmailStr = Field(..., max_length=254)
+    full_name: str = Field(..., min_length=2, max_length=120)
     role: AdminRoleType
     department: Optional[str] = Field(None, max_length=100)
     invitation_note: Optional[str] = Field(None, max_length=500)
@@ -27,7 +20,7 @@ class AdminInvitationResponse(BaseModel):
     id: int
     email: str
     full_name: str
-    role: str
+    role: AdminRoleType
     department: Optional[str] = None
     status: InvitationStatusType
     invitation_note: Optional[str] = None
@@ -44,12 +37,14 @@ class AdminInvitationVerifyResponse(BaseModel):
     valid: bool
     email: str
     full_name: str
-    role: str
+    role: AdminRoleType
     department: Optional[str] = None
     expires_at: datetime
 
 
 class AdminActivationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     token: str = Field(..., min_length=16)
     password: str = Field(..., min_length=8, max_length=128)
 
@@ -62,8 +57,8 @@ class AdminAccountItem(BaseModel):
     id: int
     full_name: str
     email: str
-    role: str
-    admin_role: str
+    role: AdminRoleType
+    admin_role: AdminRoleType
     is_active: bool
     status: Literal["active", "inactive", "invited"]
     department: Optional[str] = None

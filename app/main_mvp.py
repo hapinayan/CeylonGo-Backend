@@ -15,7 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path)
 
-from app.routers.admin_auth import router as admin_auth_router
+from app.routers.mvp.admin_directories import router as admin_directories_router
+from app.routers.admin_auth import mvp_router as admin_auth_router
 from app.routers.admin_management import (
     public_router as admin_invitations_public_router,
     router as admin_management_router,
@@ -125,6 +126,7 @@ def create_mvp_app() -> FastAPI:
         app.include_router(itinerary_router, prefix=prefix_base)
 
     # Mount admin authentication router (/api/v1/admin/auth)
+    app.include_router(admin_directories_router, prefix="/api/v1")
     app.include_router(admin_auth_router)
     app.include_router(admin_management_router)
     app.include_router(admin_invitations_public_router)

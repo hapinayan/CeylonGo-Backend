@@ -152,7 +152,20 @@ class ProviderDashboard(BaseModel):
 
 class AdminProviderSummary(ProviderResponse):
     profile_change_pending: bool = False
+    selfie_uploaded: bool = False
+    nic_front_uploaded: bool = False
+    nic_back_uploaded: bool = False
 
 
 class AdminProviderApplication(DraftResponse):
     profile_change: ProfileChange | None = None
+    id: int
+    user_id: int
+    role: str
+    is_active: bool
+    district: str
+    approval_status: str
+    created_at: datetime
+    reviewed_at: datetime | None = None
+    reviewed_by: int | None = None
+    rejection_reason: str | None = None

@@ -19,8 +19,8 @@ from app.services.mvp_homestay import SRI_LANKA
 PREFIX = "/api/v1"
 
 
-@pytest.fixture
-def managed(tmp_path, monkeypatch):
+@pytest.fixture(params=["admin", "super_admin"])
+def managed(tmp_path, monkeypatch, request):
     engine = create_engine(f"sqlite:///{tmp_path / 'management.sqlite'}")
     MVPBase.metadata.create_all(engine)
     monkeypatch.setenv("PROVIDER_UPLOAD_DIR", str(tmp_path))
@@ -35,7 +35,7 @@ def managed(tmp_path, monkeypatch):
         accounts = [
             MVPUser(email=f"management-{i}@example.com", role=role, full_name=f"User {i}",
                     is_active=True, hashed_password="unused")
-            for i, role in enumerate(("provider", "provider", "admin", "traveler"))
+            for i, role in enumerate(("provider", "provider", request.param, "traveler"))
         ]
         session.add_all(accounts)
         for account in accounts[:2]:

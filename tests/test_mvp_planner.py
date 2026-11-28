@@ -13,6 +13,7 @@ from app.models.mvp import (
     MVPAvailabilitySlot, MVPBooking, MVPInventoryUnit, MVPListing, MVPListingVerification,
     MVPProviderProfile, MVPUser,
 )
+from app.routers.mvp import planner as mvp_planner_router
 from app.services import mvp_gemini, mvp_homestay
 from tests.test_mvp_listing_management import managed
 
@@ -21,6 +22,7 @@ API = "/api/v1/ai/planner"
 
 @pytest.fixture
 def catalog_data(managed):
+    mvp_planner_router.limiter.reset()
     client, (_, _, _, traveler), _ = managed
     connection = client.app.dependency_overrides[get_mvp_db]()
     day = datetime.now(mvp_homestay.SRI_LANKA).date() + timedelta(days=10)

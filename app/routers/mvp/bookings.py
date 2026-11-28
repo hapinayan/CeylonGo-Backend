@@ -6,6 +6,7 @@ Endpoints for Booking Creation with Atomic Slot Allocation, Status Transitions, 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.core.admin_roles import MVP_ADMIN_ROLES
 from app.core.mvp_security import get_current_mvp_user, require_mvp_role
 from app.database.mvp_session import get_mvp_db
 from app.models.mvp import MVPBooking, MVPListing, MVPUser
@@ -57,7 +58,7 @@ def get_booking(
     if not booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Booking not found.")
     # Authorization: traveler or provider who owns the listing
-    if booking.traveler_id != current_user.id and current_user.role != "admin":
+    if booking.traveler_id != current_user.id and current_user.role not in MVP_ADMIN_ROLES:
         if not current_user.provider_profile or booking.listing.provider_id != current_user.provider_profile.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     return booking

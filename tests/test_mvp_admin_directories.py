@@ -111,3 +111,14 @@ def test_admin_directory_rejects_travelers_and_reserves_access_control(directory
     for path in ("/travelers", "/provider-directory", "/bookings", "/payments", "/listing-directory?category=activity"):
         assert client.get(base + path, headers=headers["traveler"]).status_code == 403
     assert client.get(base + "/management/invitations", headers=headers["admin"]).status_code == 403
+
+
+def test_super_admin_and_admin_can_read_mvp_booking_detail(directory):
+    client, headers = directory
+    bookings = client.get("/api/v1/admin/bookings", headers=headers["super_admin"]).json()["items"]
+    assert len(bookings) >= 1
+    booking_id = bookings[0]["id"]
+    for role in ("admin", "super_admin"):
+        res = client.get(f"/api/v1/bookings/{booking_id}", headers=headers[role])
+        assert res.status_code == 200
+        assert res.json()["id"] == booking_id

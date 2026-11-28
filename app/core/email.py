@@ -867,3 +867,39 @@ def send_eco_badge_decision_email(
             exc.__class__.__name__,
         )
         return False
+
+
+def send_admin_invitation_email(to_email: str, activation_url: str) -> bool:
+    msg = EmailMessage()
+    msg["Subject"] = "Your CeylonGo administrator invitation"
+    msg["From"] = f"{get_smtp_from_name()} <{get_smtp_from_email()}>"
+    msg["To"] = to_email
+    msg.set_content(
+        f"Set your CeylonGo administrator password using this link:\n{activation_url}\n\n"
+        "The link expires in 48 hours and can be used once. "
+        "If you did not expect this invitation, contact your CeylonGo administrator."
+    )
+    html_content = f"""<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333333; margin: 0; padding: 20px;">
+    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+        <div style="background-color: #082B5C; padding: 24px; text-align: center;">
+            <h1 style="color: #ffffff; margin: 0; font-size: 24px;">CeylonGo</h1>
+            <p style="color: #FF9F1C; margin: 5px 0 0 0; font-size: 14px;">Administrator Portal Invitation</p>
+        </div>
+        <div style="padding: 30px;">
+            <p>You have been invited to join the <strong>CeylonGo</strong> administration portal.</p>
+            <p>Click the button below to set your password and activate your administrator account:</p>
+            <p style="text-align: center; margin: 30px 0;">
+                <a href="{activation_url}" style="background-color: #FF9F1C; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                    Activate Admin Account
+                </a>
+            </p>
+            <p style="font-size: 14px; color: #666666;">This link expires in <strong>48 hours</strong> and can only be used once.</p>
+            <p style="font-size: 14px; color: #666666;">If you did not expect this invitation, please contact your CeylonGo Super Administrator.</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    msg.add_alternative(html_content, subtype="html")
+    return _send_verification_email(msg)

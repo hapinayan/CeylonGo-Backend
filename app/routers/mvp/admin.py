@@ -8,6 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session, undefer
 
 from app.core.mvp_security import require_mvp_role
@@ -51,6 +52,20 @@ def list_provider_applications(
     _admin: MVPUser = Depends(require_mvp_role("admin")),
     db: Session = Depends(get_mvp_db),
 ):
+    return _provider_directory(db, limit, offset, status, search, category)["items"]
+
+
+@router.get("/provider-directory")
+def provider_directory(
+    limit: int = Query(20, ge=1, le=100), page: int = Query(1, ge=1, le=100000),
+    status: str | None = None, search: str | None = None, category: str | None = None,
+    _admin: MVPUser = Depends(require_mvp_role("admin")),
+    db: Session = Depends(get_mvp_db),
+):
+    return _provider_directory(db, limit, (page - 1) * limit, status, search, category)
+
+
+def _provider_directory(db, limit, offset, status, search, category):
     try:
         registration.require_draft_storage(db)
         query = db.query(MVPProviderProfile).options(undefer(MVPProviderProfile.registration_details))
@@ -67,6 +82,13 @@ def list_provider_applications(
                 | (MVPUser.email.ilike(term))
             )
 
+        if category and category != "all":
+            json_field = (func.json_value if db.get_bind().dialect.name == "mssql"
+                          else func.json_extract)
+            query = query.filter(json_field(
+                MVPProviderProfile.registration_details, "$.provider_type"
+            ) == category)
+        total = query.count()
         profiles = query.order_by(MVPProviderProfile.id.desc()).offset(offset).limit(limit).all()
         results: list[AdminProviderSummary] = []
         for p in profiles:
@@ -82,22 +104,22 @@ def list_provider_applications(
                 item.provider_type = draft_info.get("provider_type")
             except Exception:
                 pass
-            if category and category != "all" and item.provider_type != category:
-                continue
             summary_item = AdminProviderSummary(
                 **item.model_dump(),
+                **{f"{name}_uploaded": bool(draft_info.get("documents", {}).get(name))
+                   for name in ("selfie", "nic_front", "nic_back")},
                 profile_change_pending=(
                     draft_info.get("profile_change", {}).get("status") == "pending"
                 ),
             )
             results.append(summary_item)
-        return results
+        return {"items": results, "total": total, "page": offset // limit + 1,
+                "limit": limit, "total_pages": (total + limit - 1) // limit}
+    except HTTPException:
+        raise
     except Exception as exc:
         db.rollback()
-        msg = str(exc).lower()
-        if any(pattern in msg for pattern in ["no such table", "no such column", "invalid column", "does not exist"]):
-            return []
-        raise HTTPException(status_code=500, detail="Database error retrieving provider applications")
+        raise HTTPException(500, "Database error retrieving provider applications") from exc
 
 
 def _review_profile(db, provider_id):
@@ -108,6 +130,22 @@ def _review_profile(db, provider_id):
     return profile
 
 
+def _provider_application(profile):
+    data = registration.draft_response(profile.user.email, profile).model_dump()
+    data.update({
+        "full_name": data.get("full_name") or profile.user.full_name,
+        "business_name": data.get("business_name") or profile.business_name,
+        "phone": data.get("phone") or profile.phone,
+    })
+    return AdminProviderApplication(
+        **data, id=profile.id, user_id=profile.user_id, role=profile.user.role,
+        is_active=profile.user.is_active, district=profile.district, created_at=profile.created_at,
+        approval_status=profile.verification_status, reviewed_at=profile.decided_at,
+        reviewed_by=profile.decided_by, rejection_reason=profile.decision_reason,
+        profile_change=registration.draft_data(profile).get("profile_change"),
+    )
+
+
 @router.get("/providers/{provider_id}", response_model=AdminProviderApplication)
 def get_provider_details(
     provider_id: int,
@@ -115,10 +153,7 @@ def get_provider_details(
     db: Session = Depends(get_mvp_db),
 ):
     profile = _review_profile(db, provider_id)
-    return AdminProviderApplication(
-        **registration.draft_response(profile.user.email, profile).model_dump(),
-        profile_change=registration.draft_data(profile).get("profile_change"),
-    )
+    return _provider_application(profile)
 
 
 @router.get("/providers/{provider_id}/application", response_model=AdminProviderApplication)
@@ -128,10 +163,7 @@ def provider_application(
     db: Session = Depends(get_mvp_db),
 ):
     profile = _review_profile(db, provider_id)
-    return AdminProviderApplication(
-        **registration.draft_response(profile.user.email, profile).model_dump(),
-        profile_change=registration.draft_data(profile).get("profile_change"),
-    )
+    return _provider_application(profile)
 
 
 @router.get("/providers/{provider_id}/identity/{document}")
@@ -396,17 +428,16 @@ def get_mvp_admin_dashboard(
         "pending_approvals": {
             "homestay_listings": pending_homestays,
             "activity_listings": pending_activities,
-            "eco_experience_listings": 0,
             "artisan_listings": pending_artisans,
             "rental_vehicles": pending_rentals,
             "tour_guide_profiles": pending_guides,
         },
         "bookings": {
+            "activity": db.query(func.count(MVPBooking.id)).join(MVPListing).filter(
+                MVPListing.category == "adventure"
+            ).scalar() or 0,
             "homestay": homestay_bookings,
             "rental_vehicle": rental_bookings,
             "tour_guide": guide_bookings,
-        },
-        "traveler_eligibility": {
-            "pending_rental_checks": 0,
         },
     }

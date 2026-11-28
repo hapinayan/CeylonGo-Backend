@@ -1,155 +1,33 @@
-# Admin Management & Invitations API (Academic MVP V1.0.10)
+# Academic MVP Admin management and invitations
 
-## Overview
+The Academic MVP supports two administrative roles. **Admin** retains the existing verification, management, wallet and commission functions. **Super Admin** also manages administrator invitations and account status. The existing traveler and provider roles are unaffected.
 
-The Admin Management and Invitations subsystem provides secure, role-based administration for the CeylonGo Academic MVP platform. It enforces:
-1. **Super Admin Exclusivity:** Only users with `role = 'super_admin'` can create, view, resend, or revoke administrative invitations.
-2. **Cryptographic Token Security:** High-entropy 256-bit activation tokens generated via `secrets.token_urlsafe(32)`. Raw tokens are never stored in the database; only SHA-256 digests (`token_hash`) are persisted.
-3. **Single-Use and Time-Limited Lifecycle:** Invitations expire after 48-72 hours. Activation transitions the invitation status to `accepted` within the same transaction that provisions the user account, preventing replay attacks.
-4. **Persistent SQL Server Storage (V1.0.10):** All invitation operations in production and live development require persistent database storage in `dbo.admin_invitations`. In-memory fallback is strictly restricted to isolated automated unit tests.
+## V1.0.10 schema
 
----
+The [migration](../../scripts/mvp_upgrades/1.0.10_admin_roles_and_invitations.sql) adds `super_admin` to the `dbo.users.role` check and creates `dbo.admin_invitations`. The invitation role check allows `admin` and `super_admin`. The table has a `BIGINT` identity primary key, a nullable foreign key from `invited_by_id` to `dbo.users.id`, a unique token hash, and indexes on `(email, status)` and `token_hash`. The expected upgrade is from V1.0.9 with 32 tables to V1.0.10 with 33 tables.
 
-## Schema Version 1.0.10 Migration
+## API
 
-### Additive Changes
-- **Target Database:** `CeylonGoDB` / `CeylonGoDB_Academic_MVP_Seeder_Test`
-- **Script Path:** `scripts/mvp_upgrades/1.0.10_admin_roles_and_invitations.sql`
-- **SHA-256 Checksum:** `b87f2bbbec4f4e25ad0971e0e4f7d009fa49fcdf66e2d7aa5deda861f5c49c29`
-- **Ledger Version:** `1.0.10`
+| Method and path | Authorization |
+| --- | --- |
+| `POST /api/v1/admin/auth/login` | Active Admin or Super Admin credentials |
+| `GET /api/v1/admin/auth/me` | Active Admin or Super Admin |
+| `GET /api/v1/admin/management/admins` | Active Super Admin |
+| `GET /api/v1/admin/management/invitations` | Active Super Admin |
+| `POST /api/v1/admin/management/invitations` | Active Super Admin |
+| `POST /api/v1/admin/management/invitations/{id}/resend` | Active Super Admin |
+| `POST /api/v1/admin/management/invitations/{id}/revoke` | Active Super Admin |
+| `POST /api/v1/admin/management/admins/{id}/status` | Active Super Admin |
+| `GET /api/v1/admin/auth/invitations/verify?token=…` | Valid invitation from an active Super Admin |
+| `POST /api/v1/admin/auth/invitations/activate` | Valid invitation from an active Super Admin |
 
-### 1. Extended Role Check Constraint
-The constraint `ck_users_role` on `dbo.users` is updated:
-```sql
-ALTER TABLE dbo.users DROP CONSTRAINT ck_users_role;
-ALTER TABLE dbo.users ADD CONSTRAINT ck_users_role
-CHECK (role IN ('traveler', 'provider', 'admin', 'super_admin'));
-```
+Invitation creation accepts `email`, `full_name`, `role` (`admin` or `super_admin`), and optional `department` and `invitation_note`. Configure SMTP and set `ADMIN_INVITATION_ACTIVATION_URL` to the Angular Admin activation page over HTTPS, for example `https://admin.example.com/admin/activate`. Creation and resend report `delivery_status` as `sent`, `failed` or `unconfigured`. The activation link is delivered by email and expires after 48 hours. The database stores only its SHA-256 hash. Resending invalidates the prior link and records the authorizing Super Admin.
 
-### 2. New Table: `dbo.admin_invitations`
-Adds one table to the 32-table V1.0.9 baseline, bringing the unified table count to **33 Base Tables**.
+The invitee submits `token` and `password`. Activation uses the role assigned by the issuing Super Admin, rejects any existing account with the same email, and consumes the invitation in the same transaction that creates the account. The status endpoint accepts `{"is_active": false}` or `{"is_active": true}` for existing administrators. It protects the last active Super Admin and blocks self-deactivation. A status change revokes existing sessions for that account.
 
-```sql
-CREATE TABLE dbo.admin_invitations (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    email NVARCHAR(255) NOT NULL,
-    full_name NVARCHAR(255) NOT NULL,
-    role NVARCHAR(50) NOT NULL,
-    department NVARCHAR(100) NULL,
-    token_hash NVARCHAR(64) NOT NULL UNIQUE,
-    status NVARCHAR(20) NOT NULL DEFAULT 'pending',
-    invitation_note NVARCHAR(MAX) NULL,
-    invited_by_id INT NOT NULL,
-    invited_by_email NVARCHAR(255) NULL,
-    expires_at DATETIME2 NOT NULL,
-    created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-    accepted_at DATETIME2 NULL,
-    revoked_at DATETIME2 NULL,
-    CONSTRAINT fk_admin_invitations_invited_by FOREIGN KEY (invited_by_id) REFERENCES dbo.users(id),
-    CONSTRAINT ck_admin_invitations_status CHECK (status IN ('pending', 'accepted', 'revoked', 'expired')),
-    CONSTRAINT ck_admin_invitations_role CHECK (role IN ('super_admin', 'operations_admin', 'finance_admin', 'content_moderator', 'support_admin', 'admin'))
-);
+## Provision the first Super Admin after the approved migration
 
-CREATE NONCLUSTERED INDEX ix_admin_invitations_token_hash ON dbo.admin_invitations(token_hash);
-CREATE NONCLUSTERED INDEX ix_admin_invitations_email ON dbo.admin_invitations(email);
-CREATE NONCLUSTERED INDEX ix_admin_invitations_status ON dbo.admin_invitations(status);
-```
-
-### Execution via Migration Runner
-Dry-run verification:
-```powershell
-.venv\Scripts\python.exe scripts/bootstrap_mvp_schema.py CeylonGoDB upgrade --server '.\SQLEXPRESS' --target 1.0.10 --dry-run
-```
-Apply upgrade:
-```powershell
-.venv\Scripts\python.exe scripts/bootstrap_mvp_schema.py CeylonGoDB upgrade --server '.\SQLEXPRESS' --target 1.0.10 --yes
-```
-
----
-
-## API Endpoints
-
-### 1. Issue Admin Invitation
-- **Endpoint:** `POST /api/v1/admin/invitations`
-- **Authorization:** `Bearer <JWT>` (Requires `super_admin`)
-- **Request Body:**
-  ```json
-  {
-    "email": "candidate@ceylongo.com",
-    "full_name": "Operations Lead",
-    "role": "operations_admin",
-    "department": "Platform Operations",
-    "invitation_note": "Approved for Academic MVP Operations"
-  }
-  ```
-- **Response (201 Created):**
-  ```json
-  {
-    "id": 1,
-    "email": "candidate@ceylongo.com",
-    "full_name": "Operations Lead",
-    "role": "operations_admin",
-    "department": "Platform Operations",
-    "status": "pending",
-    "invitation_note": "Approved for Academic MVP Operations",
-    "invited_by_email": "superadmin@ceylongo.com",
-    "expires_at": "2026-11-29T18:00:00",
-    "created_at": "2026-11-27T18:00:00",
-    "raw_token": null,
-    "invitation_url": null,
-    "email_delivered": true,
-    "delivery_status": "sent"
-  }
-  ```
-  *(Note: `raw_token` and `invitation_url` are strictly `null` in live environments to prevent token leakage).*
-
-### 2. List Admin Invitations
-- **Endpoint:** `GET /api/v1/admin/invitations?status_filter=all`
-- **Authorization:** `Bearer <JWT>` (Requires `super_admin`)
-- **Response (200 OK):** Array of `AdminInvitationResponse`.
-
-### 3. Resend Invitation
-- **Endpoint:** `POST /api/v1/admin/invitations/{id}/resend`
-- **Authorization:** `Bearer <JWT>` (Requires `super_admin`)
-- **Behavior:** Generates a new raw token and updates `token_hash` and `expires_at`. Invalidates previous token.
-
-### 4. Revoke Invitation
-- **Endpoint:** `POST /api/v1/admin/invitations/{id}/revoke`
-- **Authorization:** `Bearer <JWT>` (Requires `super_admin`)
-- **Behavior:** Sets `status = 'revoked'`, `revoked_at = SYSUTCDATETIME()`. Subsequent activation attempts return 400.
-
-### 5. Verify Activation Token (Public / Invitee)
-- **Endpoint:** `GET /api/v1/admin/auth/activate/verify?token=<raw_token>`
-- **Authorization:** Public
-- **Response (200 OK):**
-  ```json
-  {
-    "valid": true,
-    "email": "candidate@ceylongo.com",
-    "full_name": "Operations Lead",
-    "role": "operations_admin",
-    "department": "Platform Operations",
-    "expires_at": "2026-11-29T18:00:00"
-  }
-  ```
-
-### 6. Activate Account (Public / Invitee)
-- **Endpoint:** `POST /api/v1/admin/auth/activate`
-- **Authorization:** Public
-- **Request Body:**
-  ```json
-  {
-    "token": "<raw_token>",
-    "password": "SecurePassword123!@#"
-  }
-  ```
-- **Response (200 OK):**
-  ```json
-  {
-    "success": true,
-    "message": "Administrator account successfully activated. You may now log in.",
-    "email": "candidate@ceylongo.com"
-  }
-  ```
-- **Replay Protection:** Re-submitting the same token yields `HTTP 400 Bad Request: "This invitation has already been accepted."`.
-- **Expiration Protection:** Submitting an expired token yields `HTTP 410 Gone: "This invitation link has expired."`.
+1. Obtain separate written authorization for the account promotion. Record the approver, the verified owner, the exact account ID and normalized email, and the maintenance window. Pause application writes, verify a full backup with checksum, and confirm that `CeylonGoDB` on the intended SQL Server instance has applied V1.0.10.
+2. Have an authorized DBA start a transaction with `XACT_ABORT ON`. Lock `dbo.users` for the duration of the transaction, confirm there are zero active Super Admins, and verify the approved ID and email identify one active `admin`. Roll back if either condition fails.
+3. Update just that account, guarded by its ID, email, active flag and current `admin` role. Set `role = 'super_admin'`, increment `auth_version` and `credential_version`, and update `updated_at` in UTC. Confirm exactly one row was affected and that exactly one active Super Admin exists before committing. Record the outcome in the change record.
+4. Have the account owner sign in again through the Admin Website and confirm that the profile identifies them as `super_admin` and that they can open Admin Management. Verify normal Admin operational access and restore application traffic. Create subsequent Super Admin accounts through the invitation workflow.

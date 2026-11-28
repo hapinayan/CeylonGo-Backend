@@ -217,7 +217,7 @@ def test_admin_me_rejects_traveler_token(db: Session):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 403
-    assert "admin role required" in res.json()["detail"].lower()
+    assert "admin" in res.json()["detail"].lower()
 
 
 def test_admin_auth_never_exposes_secrets(db: Session):

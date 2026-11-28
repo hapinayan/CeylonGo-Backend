@@ -11,6 +11,7 @@ from sqlalchemy import and_, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.admin_roles import MVP_ADMIN_ROLES
 from app.models.mvp import (
     MVPAdminAuditLog,
     MVPCommunityComment,
@@ -101,7 +102,7 @@ def require_reports_schema(db: Session) -> None:
 def _author_type(role: str) -> str:
     if role == "provider":
         return "provider"
-    if role == "admin":
+    if role in MVP_ADMIN_ROLES:
         return "admin"
     return "traveler"
 
@@ -319,7 +320,7 @@ def _post_for_viewer_or_404(db: Session, post_id: int, viewer: MVPUser | None) -
     )
     if post is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community post not found.")
-    is_admin = viewer is not None and viewer.role == "admin"
+    is_admin = viewer is not None and viewer.role in MVP_ADMIN_ROLES
     is_owner = viewer is not None and viewer.id == post.author_id
     if post.visibility == "visible" and post.author and post.author.is_active:
         return post
@@ -462,7 +463,7 @@ def delete_post(
     post = db.get(MVPCommunityPost, post_id)
     if post is None or post.visibility == "deleted":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community post not found.")
-    is_admin = user.role == "admin"
+    is_admin = user.role in MVP_ADMIN_ROLES
     if post.author_id != user.id and not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete this post.")
     if not is_admin and post.visibility == "hidden":
@@ -624,7 +625,7 @@ def delete_post_photo(
     post = db.get(MVPCommunityPost, post_id)
     if post is None or post.visibility == "deleted":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community post not found.")
-    if post.author_id != user.id and user.role != "admin":
+    if post.author_id != user.id and user.role not in MVP_ADMIN_ROLES:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete this photo.")
 
     media = db.scalar(
@@ -792,7 +793,7 @@ def delete_comment(
     comment = db.get(MVPCommunityComment, comment_id)
     if comment is None or comment.visibility == "deleted":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Comment not found.")
-    is_admin = user.role == "admin"
+    is_admin = user.role in MVP_ADMIN_ROLES
     if comment.author_id != user.id and not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have permission to delete this comment.")
 

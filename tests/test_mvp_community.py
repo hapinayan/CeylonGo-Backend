@@ -66,7 +66,11 @@ def community_env(tmp_path, monkeypatch):
             email="admin@example.com", role="admin", full_name="System Admin",
             is_active=True, hashed_password="unused",
         )
-        db.add_all([traveler1, traveler2, provider_ok, provider_pending, admin])
+        super_admin = MVPUser(
+            email="superadmin@example.com", role="super_admin", full_name="Super Admin",
+            is_active=True, hashed_password="unused",
+        )
+        db.add_all([traveler1, traveler2, provider_ok, provider_pending, admin, super_admin])
         db.flush()
 
         db.add_all([
@@ -101,6 +105,7 @@ def community_env(tmp_path, monkeypatch):
             "provider_ok": {"Authorization": f"Bearer {create_mvp_access_token(provider_ok.id, provider_ok.email, provider_ok.role)}"},
             "provider_pending": {"Authorization": f"Bearer {create_mvp_access_token(provider_pending.id, provider_pending.email, provider_pending.role)}"},
             "admin": {"Authorization": f"Bearer {create_mvp_access_token(admin.id, admin.email, admin.role)}"},
+            "super_admin": {"Authorization": f"Bearer {create_mvp_access_token(super_admin.id, super_admin.email, super_admin.role)}"},
         }
         ids = {
             "traveler1": traveler1.id,
@@ -443,3 +448,28 @@ def test_graceful_degradation_when_extension_tables_absent(community_env, monkey
         headers=tokens["traveler2"],
         json={"entity_type": "post", "entity_id": ids["seeded_last_id"], "reason": "Test reason"},
     ).status_code == 503
+
+
+def test_super_admin_can_moderate_and_delete_community_posts(community_env):
+    client, tokens, *_ = community_env
+    post_res = client.post(
+        f"{API}/community/posts",
+        headers=tokens["traveler1"],
+        json={"body": "Post for super admin moderation regression check."},
+    )
+    assert post_res.status_code == 201
+    post_id = post_res.json()["id"]
+
+    hide_res = client.patch(
+        f"{API}/admin/community/posts/{post_id}",
+        headers=tokens["super_admin"],
+        json={"visibility": "hidden", "reason": "Super admin moderation check"},
+    )
+    assert hide_res.status_code == 200
+    assert hide_res.json()["visibility"] == "hidden"
+
+    view_res = client.get(f"{API}/community/posts/{post_id}", headers=tokens["super_admin"])
+    assert view_res.status_code == 200
+
+    del_res = client.delete(f"{API}/community/posts/{post_id}", headers=tokens["super_admin"])
+    assert del_res.status_code == 200

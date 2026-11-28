@@ -15,6 +15,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.admin_roles import MVP_ADMIN_ROLES
 from app.core.mvp_security import (
     create_mvp_access_token, hash_binary_token, hash_password,
     require_approved_provider, verify_password,
@@ -712,7 +713,7 @@ class MVPBookingService:
         if scheduled and target in {"confirmed", "rejected", "completed"} and not owns_listing:
             raise HTTPException(403, "Only the owning provider can decide this booking")
         if not (
-            owns_listing or actor.role == "admin" or
+            owns_listing or actor.role in MVP_ADMIN_ROLES or
             (actor.id == booking.traveler_id and target == "cancelled")
         ):
             raise HTTPException(403, "Only the host can decide this booking")
@@ -1073,7 +1074,7 @@ class MVPAdminService:
 
     @staticmethod
     def decide_listing(db: Session, admin: MVPUser, listing_id: int, req: AdminListingDecision) -> MVPListing:
-        if admin.role != "admin":
+        if admin.role not in MVP_ADMIN_ROLES:
             raise HTTPException(403, "Administrator required")
         verification.require_schema(db)
         listing = verification.locked_listing(db, listing_id)

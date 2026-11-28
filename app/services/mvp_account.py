@@ -62,9 +62,9 @@ def profile(db, user):
             challenge.sent_at <= user.created_at,
         )) is not None
     return Profile(
-        id=user.id, email=user.email, full_name=user.full_name, phone=user.phone,
-        role=user.role, is_active=user.is_active, auth_version=user.auth_version,
-        created_at=user.created_at, updated_at=user.updated_at,
+        id=user.id, email=user.email, full_name=user.full_name, phone=getattr(user, "phone", None),
+        role=user.role, is_active=user.is_active, auth_version=getattr(user, "auth_version", 0),
+        created_at=user.created_at, updated_at=getattr(user, "updated_at", getattr(user, "created_at", None)),
         country=row.country if row else None,
         avatar_url=avatar_url(user.id, row.avatar) if row else None,
         email_verified=verified or password_evidence,

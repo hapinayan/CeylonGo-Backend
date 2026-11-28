@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func
@@ -31,13 +31,14 @@ def rate_limit_admin_login(request: Request) -> None:
     admin_login_limiter.check_peer(request, "admin-login")
 
 
-def _serialize_admin_user(user: User) -> AdminUserResponse:
+def _serialize_admin_user(user: Any) -> AdminUserResponse:
+    canonical = resolve_canonical_admin_role(user.role) if is_admin_role(user.role) else user.role
     return AdminUserResponse(
         id=user.id,
         full_name=user.full_name,
         email=user.email,
         role=user.role,
-        admin_role=resolve_canonical_admin_role(user.role),
+        admin_role=canonical,
         is_active=user.is_active,
         created_at=user.created_at,
     )
@@ -64,20 +65,27 @@ def admin_login(
     """
     normalized_email = payload.email.strip().lower()
 
-    user = (
-        db.query(User)
-        .filter(func.lower(User.email) == normalized_email)
-        .first()
-    )
+    user = None
+    try:
+        from app.models.mvp import MVPUser
+        user = db.query(MVPUser).filter(func.lower(MVPUser.email) == normalized_email).first()
+    except Exception:
+        db.rollback()
+    if not user:
+        try:
+            user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+        except Exception:
+            db.rollback()
 
-    password_matches = verify_admin_password(payload.password, user.password_hash if user else None)
+    stored_hash = getattr(user, "hashed_password", None) or getattr(user, "password_hash", None)
+    password_matches = verify_admin_password(payload.password, stored_hash)
     if not user or not password_matches or not user.is_active or not is_admin_role(user.role):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
 
-    token = create_access_token(data={"sub": str(user.id), "auth_method": ADMIN_AUTH_METHOD})
+    token = create_access_token(data={"sub": str(user.id), "auth_method": ADMIN_AUTH_METHOD, "role": user.role})
 
     return AdminTokenResponse(
         access_token=token,

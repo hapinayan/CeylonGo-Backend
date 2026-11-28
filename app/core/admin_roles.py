@@ -1,3 +1,5 @@
+import os
+
 APPROVED_ADMIN_ROLES: frozenset[str] = frozenset({
     "super_admin",
     "operations_admin",
@@ -19,16 +21,20 @@ def is_admin_role(role: str | None) -> bool:
     return role.strip().lower() in ADMIN_ROLES
 
 
-def resolve_canonical_admin_role(role: str | None) -> str:
+def resolve_canonical_admin_role(role: str | None, *, legacy_compat: bool | None = None) -> str:
     """
-    Resolve an admin user's stored role into one of the five canonical admin role
-    identifiers. Maps legacy 'admin' to 'super_admin'.
+    Resolve an admin user's stored role.
+    In legacy compatibility mode (USE_LEGACY_RUNTIME=true), legacy 'admin' maps to 'super_admin'.
+    In active Academic MVP runtime, ordinary 'admin' remains 'admin' to prevent
+    automatic privilege escalation to super_admin.
     """
     if not role or not isinstance(role, str):
         raise ValueError("Invalid admin role")
     cleaned = role.strip().lower()
-    if cleaned == LEGACY_ADMIN_ROLE:
-        return "super_admin"
     if cleaned in APPROVED_ADMIN_ROLES:
         return cleaned
+    if cleaned == LEGACY_ADMIN_ROLE:
+        if legacy_compat is None:
+            legacy_compat = os.getenv("USE_LEGACY_RUNTIME", "false").lower() == "true"
+        return "super_admin" if legacy_compat else "admin"
     raise ValueError(f"Unrecognized admin role '{role}'")
